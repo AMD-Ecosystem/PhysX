@@ -23,6 +23,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 // Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 
@@ -200,6 +201,16 @@ __device__ static inline void scanWarp(unsigned int scanIdx, volatile T* sdata)
 // The 5-bit SHFL mask for logically splitting warps into sub-segments starts 8-bits up
 #define SHFL_MASK ((-1 << STEPS) & 31) << 8
 
+// Full-warp inclusive prefix-sum (scan). The CUDA path uses hand-written PTX
+// (shfl.up.b32 with a predicate that adds only when the source lane is in the
+// SHFL_MASK segment; here SHFL_MASK == 0, so the segment is the whole 32-lane
+// warp). NVIDIA PTX is invalid on AMD CDNA, so the ROCm/HIP path expresses the
+// SAME algorithm with the width-pinned __shfl_up_sync compat wrapper: at each
+// step read from (lane - delta) and add only when that source lane exists
+// (laneInWarp >= delta) -- the exact semantics of the PTX predicate `p`. Lane
+// index is scanIdx & (WARP_SIZE-1). Width-pinned to 32 == the logical warp the
+// whole PhysX stack assumes, so this is wave32/wave64 unified. (KB
+// ptx-shfl-up-scan-to-shfl-up-sync-hip.)
 template <>
 __device__ inline void scanWarp<PxU32, AddOP<PxU32> >(unsigned int scanIdx, volatile PxU32 * sdata)
 {
@@ -209,6 +220,12 @@ __device__ inline void scanWarp<PxU32, AddOP<PxU32> >(unsigned int scanIdx, vola
 	#pragma unroll
 	for (int STEP = 0; STEP < STEPS; STEP++)
 	{
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+		const PxU32 delta = 1u << STEP;
+		const PxU32 n = __shfl_up_sync(0xffffffffu, input, delta);
+		if ((scanIdx & (WARP_SIZE - 1)) >= delta)
+			input += n;
+#else
 		asm(
 			"{"
 			"  .reg .u32 r0;"
@@ -218,6 +235,7 @@ __device__ inline void scanWarp<PxU32, AddOP<PxU32> >(unsigned int scanIdx, vola
 			"  mov.u32 %0, r0;"
 			"}"
 			: "=r"(input) : "r"(input), "r"(1 << STEP), "r"(SHFL_MASK), "r"(input));
+#endif
 	}
 	sdata[scanIdx] = input;
 }
@@ -231,6 +249,12 @@ __device__ inline void scanWarp<int, AddOP<int> >(unsigned int scanIdx, volatile
 	#pragma unroll
 	for (int STEP = 0; STEP < STEPS; STEP++)
 	{
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+		const PxU32 delta = 1u << STEP;
+		const PxU32 n = __shfl_up_sync(0xffffffffu, input, delta);
+		if ((scanIdx & (WARP_SIZE - 1)) >= delta)
+			input += n;
+#else
 		asm(
 			"{"
 			"  .reg .u32 r0;"
@@ -240,6 +264,7 @@ __device__ inline void scanWarp<int, AddOP<int> >(unsigned int scanIdx, volatile
 			"  mov.u32 %0, r0;"
 			"}"
 			: "=r"(input) : "r"(input), "r"(1 << STEP), "r"(SHFL_MASK), "r"(input));
+#endif
 	}
 	sdata[scanIdx] = input;
 }

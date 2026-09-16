@@ -45,15 +45,18 @@
 namespace physx
 {
 
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 static __device__ PX_FORCE_INLINE PxU32 articulationLowestSetBit(ArticulationBitField val)
 {
-	return val == 0 ? 0 : __ffsll(val) - 1;
+	// ROCm: PxU64 is 'unsigned long' on Linux, ambiguous against HIP's
+	// __ffsll(unsigned int)/(unsigned long long) overloads -- cast explicitly.
+	return val == 0 ? 0 : __ffsll((unsigned long long)val) - 1;
 }
 
 
 static __device__ PX_FORCE_INLINE PxU32 articulationHighestSetBit(ArticulationBitField val)
 {
-	const PxU32 nbZeros = __clzll(val);
+	const PxU32 nbZeros = __clzll((unsigned long long)val);
 	return 63 - nbZeros;
 }
 

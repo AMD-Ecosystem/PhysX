@@ -23,6 +23,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 // Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
 
@@ -52,11 +53,14 @@ struct EpaScratch
 };
 
 
-__constant__ __device__ schlock::Vec3I8 sStartVertices4[4] =		{	MAKE_Vec3I8(0,1,2),	MAKE_Vec3I8(3,1,0),	MAKE_Vec3I8(3,2,1),	MAKE_Vec3I8(3,0,2) };
-__constant__ __device__ schlock::Vec3I8 sStartAdjacencies4[4] =	{	MAKE_Vec3I8(2,3,1),	MAKE_Vec3I8(0,3,2),	MAKE_Vec3I8(0,1,3),	MAKE_Vec3I8(0,2,1) };
+// static: per-TU internal linkage so the multiple GPU TUs that include epa.cuh
+// do not collide with "duplicate symbol" on the ROCm/HIP host link (matches the
+// CUDA per-TU __constant__ behaviour). KB header-defined-constant-device-static-hip.
+static __constant__ __device__ schlock::Vec3I8 sStartVertices4[4] =		{	MAKE_Vec3I8(0,1,2),	MAKE_Vec3I8(3,1,0),	MAKE_Vec3I8(3,2,1),	MAKE_Vec3I8(3,0,2) };
+static __constant__ __device__ schlock::Vec3I8 sStartAdjacencies4[4] =	{	MAKE_Vec3I8(2,3,1),	MAKE_Vec3I8(0,3,2),	MAKE_Vec3I8(0,1,3),	MAKE_Vec3I8(0,2,1) };
 
-__constant__ __device__ schlock::Vec3I8 sStartVertices3[2] =		{	MAKE_Vec3I8(0,1,2),	MAKE_Vec3I8(1,0,2) };
-__constant__ __device__ schlock::Vec3I8 sStartAdjacency3[2] =	{	MAKE_Vec3I8(1,1,1),	MAKE_Vec3I8(0,0,0)	};
+static __constant__ __device__ schlock::Vec3I8 sStartVertices3[2] =		{	MAKE_Vec3I8(0,1,2),	MAKE_Vec3I8(1,0,2) };
+static __constant__ __device__ schlock::Vec3I8 sStartAdjacency3[2] =	{	MAKE_Vec3I8(1,1,1),	MAKE_Vec3I8(0,0,0)	};
 
 
 

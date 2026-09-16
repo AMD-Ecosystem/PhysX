@@ -1,19 +1,19 @@
 ## Redistribution and use in source and binary forms, with or without
 ## modification, are permitted provided that the following conditions
 ## are met:
-##  * Redistributions of source code must retain the above copyright
-##    notice, this list of conditions and the following disclaimer.
-##  * Redistributions in binary form must reproduce the above copyright
-##    notice, this list of conditions and the following disclaimer in the
-##    documentation and/or other materials provided with the distribution.
-##  * Neither the name of NVIDIA CORPORATION nor the names of its
-##    contributors may be used to endorse or promote products derived
-##    from this software without specific prior written permission.
+## * Redistributions of source code must retain the above copyright
+## notice, this list of conditions and the following disclaimer.
+## * Redistributions in binary form must reproduce the above copyright
+## notice, this list of conditions and the following disclaimer in the
+## documentation and/or other materials provided with the distribution.
+## * Neither the name of NVIDIA CORPORATION nor the names of its
+## contributors may be used to endorse or promote products derived
+## from this software without specific prior written permission.
 ##
 ## THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
 ## EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
 ## IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-## PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+## PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
 ## CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
 ## EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
 ## PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
@@ -26,8 +26,22 @@
 
 cmake_minimum_required(VERSION 3.21)
 
-# PROJECT(CUDA) will enable building CUDA files ( .cu )
-PROJECT(PhysX C CXX CUDA)
+# ROCm/HIP option -- must be set before project() so the right GPU language is enabled.
+# PX_USE_HIP=ON: build the GPU stack against AMD ROCm/HIP instead of NVIDIA CUDA.
+# The HIP language is enabled below in the linux/CMakeLists.txt include; here we just
+# choose which language to pass to project() so the CUDA language is never probed on
+# a machine that has no CUDA toolkit.
+OPTION(PX_USE_HIP "Build the PhysX GPU stack for AMD ROCm/HIP instead of NVIDIA CUDA" OFF)
+
+IF(PX_USE_HIP)
+	# HIP language: project() without CUDA so CMake does not search for nvcc/cudart.
+	# enable_language(HIP) is called in the platform CMakeLists.txt after the HIP
+	# compiler is located in the venv.
+	PROJECT(PhysX C CXX)
+ELSE()
+	# PROJECT(CUDA) will enable building CUDA files ( .cu )
+	PROJECT(PhysX C CXX CUDA)
+ENDIF()
 
 IF(DEFINED ENV{PM_winsdk_PATH} AND NOT "$ENV{PM_winsdk_PATH}" STREQUAL "" AND DEFINED ENV{PM_msvc_PATH} AND NOT "$ENV{PM_msvc_PATH}" STREQUAL "")
 	SET(CMAKE_VS_SDK_INCLUDE_DIRECTORIES "$ENV{PM_winsdk_PATH}/include/ucrt;$ENV{PM_winsdk_PATH}/include/um;$ENV{PM_winsdk_PATH}/include/shared")
@@ -57,8 +71,16 @@ IF(NOT EXISTS ${PHYSX_ROOT_DIR})
 	MESSAGE(FATAL_ERROR "PHYSX_ROOT_DIR variable was invalid.")
 ENDIF()
 
+# Make NvidiaBuildOptions and SetCudaArch findable via INCLUDE() even when this
+# CMakeLists.txt is the cmake source root (standalone GPU-only configure, as opposed
+# to being pulled in as a subdirectory of physx/CMakeLists.txt which already appended
+# this path to CMAKE_MODULE_PATH).
+LIST(APPEND CMAKE_MODULE_PATH "${PHYSX_ROOT_DIR}/source/compiler/cmake/modules")
+
 INCLUDE(NvidiaBuildOptions)
-INCLUDE(SetCudaArch)
+IF(NOT PX_USE_HIP)
+	INCLUDE(SetCudaArch)
+ENDIF()
 
 SET(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -84,30 +106,33 @@ ENDIF()
 
 SET(SOURCE_DISTRO_FILE_LIST "")
 
-# CUDA Flags that are common to all platforms:
-# Note: We need to compile to sass for all architectures we want to support.
-# However, to enable forward compatibility with new architectures,
-# we need to compile ptx for the latest arch supported by the cuda toolkit.
-# This will allow the jit compiler in the driver to compile ptx to sass of the newer arch.
+IF(NOT PX_USE_HIP)
+	# CUDA Flags that are common to all platforms:
+	# Note: We need to compile to sass for all architectures we want to support.
+	# However, to enable forward compatibility with new architectures,
+	# we need to compile ptx for the latest arch supported by the cuda toolkit.
+	# This will allow the jit compiler in the driver to compile ptx to sass of the newer arch.
 
-# No need to set --generate-code=arch=compute_75,code=[compute_75,sm_75]
-# since that's the default set in: compiler\internal\CMakeLists.txt (using CMAKE_CUDA_ARCHITECTURES)
-# see policy CMP0104
-IF(PX_GENERATE_GPU_REDUCED_ARCHITECTURES)
-	GENERATE_ARCH_CODE_LIST(SASS "80,86,89,90,100,120" PTX "120")
-ELSE()
-	# Volta is the minimum compute arch required because NGC supports V100
-	GENERATE_ARCH_CODE_LIST(SASS "70,80,86,89,90,100,120" PTX "120")
+	# No need to set --generate-code=arch=compute_75,code=[compute_75,sm_75]
+	# since that's the default set in: compiler\internal\CMakeLists.txt (using CMAKE_CUDA_ARCHITECTURES)
+	# see policy CMP0104
+	IF(PX_GENERATE_GPU_REDUCED_ARCHITECTURES)
+		GENERATE_ARCH_CODE_LIST(SASS "80,86,89,90,100,120" PTX "120")
+	ELSE()
+		# Volta is the minimum compute arch required because NGC supports V100
+		GENERATE_ARCH_CODE_LIST(SASS "70,80,86,89,90,100,120" PTX "120")
+	ENDIF()
+
+	# Force response files off because clangd does not parse them
+	set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
+	set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_LIBRARIES 0)
+	set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_OBJECTS 0)
+
+	# Cuda setup that is the same for all platforms and sub-projects
+	SET(PHYSX_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Werror=all-warnings -use_fast_math -ftz=true -prec-div=false -prec-sqrt=false -t0 -D_CONSOLE" CACHE INTERNAL "PhysX CUDA")
 ENDIF()
 
-# Force response files off because clangd does not parse them
-set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
-set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_LIBRARIES 0)
-set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_OBJECTS 0)
-
-# Cuda setup that is the same for all platforms and sub-projects
-SET(PHYSX_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Werror=all-warnings -use_fast_math -ftz=true -prec-div=false -prec-sqrt=false -t0 -D_CONSOLE" CACHE INTERNAL "PhysX CUDA")
-# Include the platform specific CMakeLists (The other CUDA flags that are specific to each platform are defined there)
+# Include the platform specific CMakeLists (The other flags that are specific to each platform are defined there)
 INCLUDE(${PHYSX_ROOT_DIR}/${PROJECT_CMAKE_FILES_DIR}/${TARGET_BUILD_PLATFORM}/CMakeLists.txt)
 
 IF(PX_GENERATE_SOURCE_DISTRO)

@@ -80,7 +80,12 @@ Compiler defines, see http://sourceforge.net/p/predef/wiki/Compilers/
 #endif
 
 // not treated as its own compiler because clang, for example, can, in theory, compile CUDA code too
-#if defined(__CUDACC__)
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// __HIPCC__ (amdclang++ -x hip) is the ROCm/HIP peer of __CUDACC__; treat it
+// as a CUDA-callable compiler so PX_CUDA_CALLABLE expands to __host__ __device__
+// (empty otherwise makes every PxVec3/PxTransform method host-only and every
+// device-side use fails "call to __host__ function from __device__ function").
+#if defined(__CUDACC__) || defined(__HIPCC__)
 	#define PX_CUDA_COMPILER 1
 #else
 	#define PX_CUDA_COMPILER 0

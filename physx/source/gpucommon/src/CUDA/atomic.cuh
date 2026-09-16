@@ -23,6 +23,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 // Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
 
@@ -148,7 +149,16 @@ PX_FORCE_INLINE static __device__ void AtomicOr(PxU64* address, const PxU64 mask
  * adds 20% performance in FLIP P2G compared to atomicAdd() or plain red.add.f32 */
 PX_FORCE_INLINE __device__ void PxRedAddGlobal(float* addr, const float val)
 {
-#if __CUDA_ARCH__ >= 350
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+	// ROCm/HIP: the CUDA .global-qualified `red.add.f32` PTX (an L2-cache
+	// reduction with no return) has no portable inline-asm spelling on CDNA;
+	// the return-discarding atomicAdd is the exact functional equivalent (the
+	// hardware coalesces it into an L2 atomic). __CUDA_ARCH__ is undefined on
+	// HIP so the CUDA branches below would otherwise fall through to the no-op
+	// PX_UNUSED path -- a SILENT dropped-atomic correctness bug. (KB
+	// ptx-red-global-add-to-atomicadd-hip.)
+	atomicAdd(addr, val);
+#elif __CUDA_ARCH__ >= 350
 	asm volatile ("red.global.add.f32 [%0], %1;" :: __STG_PTR(addr) , "f"(val));
 #else
 #if __CUDA_ARCH__ >= 200

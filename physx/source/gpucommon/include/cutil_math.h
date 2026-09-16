@@ -35,6 +35,7 @@
     The syntax is modelled on the Cg standard library.
 */
 
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 #ifndef CUTIL_MATH_H
 #define CUTIL_MATH_H
 
@@ -101,42 +102,56 @@ inline __device__ __host__ float clamp(float f, float a, float b)
 ////////////////////////////////////////////////////////////////////////////////
 
 // addition
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ int2 operator+(int2 a, int2 b)
 {
     return make_int2(a.x + b.x, a.y + b.y);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator+=(int2 &a, int2 b)
 {
     a.x += b.x; a.y += b.y;
 }
+#endif
 
 // subtract
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ int2 operator-(int2 a, int2 b)
 {
     return make_int2(a.x - b.x, a.y - b.y);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator-=(int2 &a, int2 b)
 {
     a.x -= b.x; a.y -= b.y;
 }
+#endif
 
 // multiply
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ int2 operator*(int2 a, int2 b)
 {
     return make_int2(a.x * b.x, a.y * b.y);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ int2 operator*(int2 a, int s)
 {
     return make_int2(a.x * s, a.y * s);
 }
+#endif
 inline __host__ __device__ int2 operator*(int s, int2 a)
 {
     return make_int2(a.x * s, a.y * s);
 }
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator*=(int2 &a, int s)
 {
     a.x *= s; a.y *= s;
 }
+#endif
 
 // float2 functions
 ////////////////////////////////////////////////////////////////////////////////
@@ -152,63 +167,83 @@ inline __host__ __device__ float2 make_float2(int2 a)
 }
 
 // addition
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float2 operator+(float2 a, float2 b)
 {
     return make_float2(a.x + b.x, a.y + b.y);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator+=(float2 &a, float2 b)
 {
     a.x += b.x; a.y += b.y;
 }
+#endif
 
 // subtract
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float2 operator-(float2 a, float2 b)
 {
     return make_float2(a.x - b.x, a.y - b.y);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator-=(float2 &a, float2 b)
 {
     a.x -= b.x; a.y -= b.y;
 }
+#endif
 
 // multiply
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float2 operator*(float2 a, float2 b)
 {
     return make_float2(a.x * b.x, a.y * b.y);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float2 operator*(float2 a, float s)
 {
     return make_float2(a.x * s, a.y * s);
 }
+#endif
 inline __host__ __device__ float2 operator*(float s, float2 a)
 {
     return make_float2(a.x * s, a.y * s);
 }
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator*=(float2 &a, float s)
 {
     a.x *= s; a.y *= s;
 }
+#endif
 
 // divide
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float2 operator/(float2 a, float2 b)
 {
     return make_float2(a.x / b.x, a.y / b.y);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float2 operator/(float2 a, float s)
 {
     float inv = 1.0f / s;
     return a * inv;
 }
+#endif
 inline __host__ __device__ float2 operator/(float s, float2 a)
 {
     float inv = 1.0f / s;
     return a * inv;
 }
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator/=(float2 &a, float s)
 {
     float inv = 1.0f / s;
     a *= inv;
 }
+#endif
 
 // lerp
 inline __device__ __host__ float2 lerp(float2 a, float2 b, float t)
@@ -297,63 +332,83 @@ static __inline__ __host__ __device__ float3 fmaxf(float3 a, float3 b)
 }
 
 // addition
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float3 operator+(float3 a, float3 b)
 {
     return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator+=(float3 &a, float3 b)
 {
     a.x += b.x; a.y += b.y; a.z += b.z;
 }
+#endif
 
 // subtract
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float3 operator-(float3 a, float3 b)
 {
     return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator-=(float3 &a, float3 b)
 {
     a.x -= b.x; a.y -= b.y; a.z -= b.z;
 }
+#endif
 
 // multiply
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float3 operator*(float3 a, float3 b)
 {
     return make_float3(a.x * b.x, a.y * b.y, a.z * b.z);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float3 operator*(float3 a, float s)
 {
     return make_float3(a.x * s, a.y * s, a.z * s);
 }
+#endif
 inline __host__ __device__ float3 operator*(float s, float3 a)
 {
     return make_float3(a.x * s, a.y * s, a.z * s);
 }
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator*=(float3 &a, float s)
 {
     a.x *= s; a.y *= s; a.z *= s;
 }
+#endif
 
 // divide
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float3 operator/(float3 a, float3 b)
 {
     return make_float3(a.x / b.x, a.y / b.y, a.z / b.z);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float3 operator/(float3 a, float s)
 {
     float inv = 1.0f / s;
     return a * inv;
 }
+#endif
 inline __host__ __device__ float3 operator/(float s, float3 a)
 {
     float inv = 1.0f / s;
     return a * inv;
 }
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator/=(float3 &a, float s)
 {
     float inv = 1.0f / s;
     a *= inv;
 }
+#endif
 
 // lerp
 inline __device__ __host__ float3 lerp(float3 a, float3 b, float t)
@@ -444,59 +499,77 @@ static __inline__ __host__ __device__ float4 fmaxf(float4 a, float4 b)
 }
 
 // addition
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float4 operator+(float4 a, float4 b)
 {
     return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator+=(float4 &a, float4 b)
 {
     a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w;
 }
+#endif
 
 // subtract
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float4 operator-(float4 a, float4 b)
 {
     return make_float4(a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator-=(float4 &a, float4 b)
 {
     a.x -= b.x; a.y -= b.y; a.z -= b.z; a.w -= b.w;
 }
+#endif
 
 // multiply
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float4 operator*(float4 a, float s)
 {
     return make_float4(a.x * s, a.y * s, a.z * s, a.w * s);
 }
+#endif
 inline __host__ __device__ float4 operator*(float s, float4 a)
 {
     return make_float4(a.x * s, a.y * s, a.z * s, a.w * s);
 }
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator*=(float4 &a, float s)
 {
     a.x *= s; a.y *= s; a.z *= s; a.w *= s;
 }
+#endif
 
 // divide
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float4 operator/(float4 a, float4 b)
 {
     return make_float4(a.x / b.x, a.y / b.y, a.z / b.z, a.w / b.w);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ float4 operator/(float4 a, float s)
 {
     float inv = 1.0f / s;
     return a * inv;
 }
+#endif
 inline __host__ __device__ float4 operator/(float s, float4 a)
 {
     float inv = 1.0f / s;
     return a * inv;
 }
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator/=(float4 &a, float s)
 {
     float inv = 1.0f / s;
     a *= inv;
 }
+#endif
 
 // lerp
 inline __device__ __host__ float4 lerp(float4 a, float4 b, float t)
@@ -572,61 +645,81 @@ inline __host__ __device__ int3 max(int3 a, int3 b)
 }
 
 // addition
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ int3 operator+(int3 a, int3 b)
 {
     return make_int3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator+=(int3 &a, int3 b)
 {
     a.x += b.x; a.y += b.y; a.z += b.z;
 }
+#endif
 
 // subtract
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ int3 operator-(int3 a, int3 b)
 {
     return make_int3(a.x - b.x, a.y - b.y, a.z - b.z);
 }
+#endif
 
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator-=(int3 &a, int3 b)
 {
     a.x -= b.x; a.y -= b.y; a.z -= b.z;
 }
+#endif
 
 // multiply
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ int3 operator*(int3 a, int3 b)
 {
     return make_int3(a.x * b.x, a.y * b.y, a.z * b.z);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ int3 operator*(int3 a, int s)
 {
     return make_int3(a.x * s, a.y * s, a.z * s);
 }
+#endif
 inline __host__ __device__ int3 operator*(int s, int3 a)
 {
     return make_int3(a.x * s, a.y * s, a.z * s);
 }
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator*=(int3 &a, int s)
 {
     a.x *= s; a.y *= s; a.z *= s;
 }
+#endif
 
 // divide
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ int3 operator/(int3 a, int3 b)
 {
     return make_int3(a.x / b.x, a.y / b.y, a.z / b.z);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ int3 operator/(int3 a, int s)
 {
     return make_int3(a.x / s, a.y / s, a.z / s);
 }
+#endif
 inline __host__ __device__ int3 operator/(int s, int3 a)
 {
     return make_int3(a.x / s, a.y / s, a.z / s);
 }
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator/=(int3 &a, int s)
 {
     a.x /= s; a.y /= s; a.z /= s;
 }
+#endif
 
 // clamp
 inline __device__ __host__ int clamp(int f, int a, int b)
@@ -682,61 +775,81 @@ inline __host__ __device__ uint3 max(uint3 a, uint3 b)
 }
 
 // addition
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ uint3 operator+(uint3 a, uint3 b)
 {
     return make_uint3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator+=(uint3 &a, uint3 b)
 {
     a.x += b.x; a.y += b.y; a.z += b.z;
 }
+#endif
 
 // subtract
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ uint3 operator-(uint3 a, uint3 b)
 {
     return make_uint3(a.x - b.x, a.y - b.y, a.z - b.z);
 }
+#endif
 
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator-=(uint3 &a, uint3 b)
 {
     a.x -= b.x; a.y -= b.y; a.z -= b.z;
 }
+#endif
 
 // multiply
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ uint3 operator*(uint3 a, uint3 b)
 {
     return make_uint3(a.x * b.x, a.y * b.y, a.z * b.z);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ uint3 operator*(uint3 a, uint s)
 {
     return make_uint3(a.x * s, a.y * s, a.z * s);
 }
+#endif
 inline __host__ __device__ uint3 operator*(uint s, uint3 a)
 {
     return make_uint3(a.x * s, a.y * s, a.z * s);
 }
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator*=(uint3 &a, uint s)
 {
     a.x *= s; a.y *= s; a.z *= s;
 }
+#endif
 
 // divide
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ uint3 operator/(uint3 a, uint3 b)
 {
     return make_uint3(a.x / b.x, a.y / b.y, a.z / b.z);
 }
+#endif
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ uint3 operator/(uint3 a, uint s)
 {
     return make_uint3(a.x / s, a.y / s, a.z / s);
 }
+#endif
 inline __host__ __device__ uint3 operator/(uint s, uint3 a)
 {
     return make_uint3(a.x / s, a.y / s, a.z / s);
 }
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: HIP_vector_type provides this operator
 inline __host__ __device__ void operator/=(uint3 &a, uint s)
 {
     a.x /= s; a.y /= s; a.z /= s;
 }
+#endif
 
 
 // clamp

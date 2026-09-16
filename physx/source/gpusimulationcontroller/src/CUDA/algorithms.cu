@@ -25,6 +25,7 @@
 // Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 #include "foundation/PxSimpleTypes.h"
 #include "foundation/PxVec3.h"
@@ -34,6 +35,16 @@
 #include "stdio.h"
 
 using namespace physx;
+
+// The PhysX GPU stack is built around a LOGICAL warp width of 32 lanes. On
+// CDNA (gfx942/gfx950) the hardware wave is 64 lanes, so the compiler builtin
+// warpSize is 64 -- using it here for lane/warp bookkeeping in the block-scan
+// primitives would drop half the logical-warp sums on wave64 (host scratch is
+// sized blockDim/32 in PxgAlgorithms.cpp while the device would index
+// blockDim/64). Pin the width to the logical 32-lane subgroup, matching the
+// width-32-pinned shfl_up_sync/warpScan used just below and the compat header's
+// PXG_LOGICAL_WARP_WIDTH. (KB warp-size-literal-32-not-builtin-wave64.)
+static const int PXG_LOGICAL_WARP_SIZE = 32;
 
 extern "C" __host__ void initAlgorithmsKernels0() {}
 
@@ -127,9 +138,9 @@ __device__ T scanPerBlock(
 {
 	extern __shared__ PxU32 sumsMemory[];
 	T* sums = reinterpret_cast<T*>(sumsMemory);
-	int lane_id = id % warpSize;
+	int lane_id = id % PXG_LOGICAL_WARP_SIZE;
 	// determine a warp_id within a block
-	int warp_id = threadIdx.x / warpSize;
+	int warp_id = threadIdx.x / PXG_LOGICAL_WARP_SIZE;
 
 	// Now accumulate in log steps up the chain
 	// compute sums, with another thread's value who is
@@ -146,7 +157,7 @@ __device__ T scanPerBlock(
 	__syncthreads(); //Required before accessing shared memory because this function can be called inside loops
 
 	// write the sum of the warp to smem
-	if (threadIdx.x % warpSize == warpSize - 1)
+	if (threadIdx.x % PXG_LOGICAL_WARP_SIZE == PXG_LOGICAL_WARP_SIZE - 1)
 	{
 		sums[warp_id] = value;
 	}
@@ -157,14 +168,14 @@ __device__ T scanPerBlock(
 	// scan sum the warp sums
 	// the same shfl scan operation, but performed on warp sums
 	//
-	if (warp_id == 0 && lane_id < (blockDim.x / warpSize))
+	if (warp_id == 0 && lane_id < (blockDim.x / PXG_LOGICAL_WARP_SIZE))
 	{
 		T warp_sum = sums[lane_id];
 
-		int mask = (1 << (blockDim.x / warpSize)) - 1;
-		for (int i = 1; i <= (blockDim.x / warpSize); i *= 2)
+		int mask = (1 << (blockDim.x / PXG_LOGICAL_WARP_SIZE)) - 1;
+		for (int i = 1; i <= (blockDim.x / PXG_LOGICAL_WARP_SIZE); i *= 2)
 		{
-			T n = shfl_up_sync(mask, warp_sum, i, (blockDim.x / warpSize));
+			T n = shfl_up_sync(mask, warp_sum, i, (blockDim.x / PXG_LOGICAL_WARP_SIZE));
 
 			if (lane_id >= i)
 				warp_sum = warp_sum + n;
@@ -239,7 +250,7 @@ __device__ void exclusiveSumInt16(int4x4* values)
 	__syncthreads();
 	PxU32* ptr = reinterpret_cast<PxU32*>(values);
 	PxU32 value = threadIdx.x < 16 ? ptr[threadIdx.x] : 0;
-	warpScan(value, threadIdx.x % warpSize);
+	warpScan(value, threadIdx.x % PXG_LOGICAL_WARP_SIZE);
 	__syncthreads();
 	if (threadIdx.x < 15)
 		ptr[threadIdx.x + 1] = value;

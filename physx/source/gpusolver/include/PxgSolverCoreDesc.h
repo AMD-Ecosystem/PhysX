@@ -32,7 +32,12 @@
 #include "PxgBucket.h"
 #include "DyCpuGpuBiasCoefficient.h"
 
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// On a ROCm/HIP build float4 is HIP_vector_type<float,4> (already provided via
+// the compat header), so this CUDA-style forward declaration conflicts.
+#if !defined(__HIP_PLATFORM_AMD__)
 struct float4;
+#endif
 
 namespace physx
 {

@@ -59,7 +59,10 @@ struct PxsParticleMaterialData
 
 #if PX_SUPPORT_GPU_PHYSX
 
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+#if !defined(__HIP_PLATFORM_AMD__) // ROCm: floatN etc. are HIP_vector_type aliases
 struct float4;
+#endif
 
 PX_CUDA_CALLABLE inline physx::PxU32 PxGetGroup(physx::PxU32 phase) { return phase & physx::PxParticlePhaseFlag::eParticlePhaseGroupMask; }
 PX_CUDA_CALLABLE inline bool PxGetFluid(physx::PxU32 phase) { return (phase & physx::PxParticlePhaseFlag::eParticlePhaseFluid) != 0; }

@@ -23,6 +23,7 @@
 ## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ##
 ## Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+## Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 #
 # Build PhysXGpu common
@@ -138,6 +139,27 @@ ENDIF()
 TARGET_COMPILE_DEFINITIONS(PhysXGpu
 	PRIVATE ${PHYSXGPU_COMPILE_DEFS}
 )
+
+# ROCm/HIP build: the aggregator TU (PxgPhysXGpu.cpp) is plain C++ but pulls
+# CudaKernelWrangler.h, which #includes <cuda.h>. Give it the same host-seam
+# treatment as the other GPU modules: the hip_compat shim dir (provides a
+# cuda.h passthrough), the ROCm headers, and the force-included compat header
+# under -D__HIP_PLATFORM_AMD__. (No .cu sources here, so only the CXX path.)
+IF(PX_USE_HIP)
+	TARGET_INCLUDE_DIRECTORIES(PhysXGpu PRIVATE
+		${PHYSX_SOURCE_DIR}/gpucommon/include/hip_compat
+		${PHYSX_SOURCE_DIR}/gpucommon/include
+		${PX_HIP_INCLUDE_DIR})
+	TARGET_COMPILE_OPTIONS(PhysXGpu PRIVATE
+		$<$<COMPILE_LANGUAGE:CXX>:-D__HIP_PLATFORM_AMD__ -include cuda_to_hip.h>)
+	# Runtime RPATH to the amdhip64 dir (computed in linux/PhysXGpu.cmake before
+	# the target existed), so libPhysXGpu_64.so resolves the HIP runtime.
+	IF(PX_HIP_RUNTIME_RPATH_DIR)
+		SET_TARGET_PROPERTIES(PhysXGpu PROPERTIES
+			INSTALL_RPATH "${PX_HIP_RUNTIME_RPATH_DIR}"
+			BUILD_WITH_INSTALL_RPATH TRUE)
+	ENDIF()
+ENDIF(PX_USE_HIP)
 
 SET_TARGET_PROPERTIES(PhysXGpu PROPERTIES
 	LINK_FLAGS ${PHYSXGPU_LINK_FLAGS}

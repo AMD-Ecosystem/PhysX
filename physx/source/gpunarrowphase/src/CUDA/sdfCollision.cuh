@@ -24,7 +24,8 @@
 //
 // Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved. 
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 #ifndef __SDF_COLLISION_CUH__
 #define __SDF_COLLISION_CUH__
@@ -39,6 +40,51 @@
 
 namespace physx
 {
+
+// ---------------------------------------------------------------------------
+// SDF 3D-texture sampling seam (HIP/ROCm deviation).
+//
+// On CUDA the signed-distance-field grids are sampled with hardware trilinear
+// filtering via `tex3D<float>(texObj, x, y, z)` off a cudaArray-backed texture
+// object (createTextureObject in PxgGeometryManager.cpp).
+//
+// The CDNA data-center architectures (gfx942/gfx950) have no texture-sampling
+// image hardware, so the HIP device texture API is compiled out entirely
+// (`__HIP_NO_IMAGE_SUPPORT` -> tex3D marked
+// __attribute__((unavailable("The image/texture API not supported on the
+// device")))). Faithfully supporting SDF collision on CDNA therefore requires
+// a software-trilinear sampler reading a LINEAR device copy of the SDF grid
+// (dense + the uint8/uint16/float sparse-subgrid quantized formats), threaded
+// through PxgGeometryManager instead of the cudaArray/texture-object path.
+//
+// TODO(ROCm SDF): implement the linear-memory software-trilinear SDF sampler
+// with texel-center + clamp-to-edge parity, and re-enable the GPU SDF-collision
+// midphase on CDNA. Tracked as a documented deviation for this port; the SDF
+// collision GPU path is the only narrowphase feature gated off on HIP -- the
+// rest of the GPU stack (broadphase, solver, articulation, non-SDF
+// narrowphase) is fully ported. See projects/PhysX/notes.md and KB
+// cdna-no-texture-image-hw-sdf-software-sampler.
+//
+// Until that lands, the HIP build compiles the sampler as an explicit,
+// loud device abort (never a silently-wrong value) so no caller can mistake
+// an unfiltered/zero read for a real distance.
+// ---------------------------------------------------------------------------
+PX_INLINE __device__ PxReal pxgSampleSdfTexture3D(CUtexObject texObj, float x, float y, float z)
+{
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+	(void)texObj; (void)x; (void)y; (void)z;
+	// CDNA has no hardware 3D-texture sampling; the software-trilinear fallback
+	// is not yet wired (see TODO above). Abort loudly rather than return a
+	// wrong distance.
+	printf("PhysX ROCm: GPU SDF-collision (tex3D) is not yet supported on CDNA "
+	       "(gfx942/gfx950); needs the software-trilinear SDF sampler. See "
+	       "projects/PhysX/notes.md.\n");
+	__builtin_trap();
+	return 0.0f;
+#else
+	return tex3D<float>(texObj, x, y, z);
+#endif
+}
 
 struct PX_ALIGN_PREFIX(16) SparseSDFTexture
 {
@@ -115,7 +161,7 @@ public:
 		if (subgridSize == 0)
 		{
 			//Dense sdf
-			return tex3D<float>(texture, f.x + 0.5f, f.y + 0.5f, f.z + 0.5f);
+			return pxgSampleSdfTexture3D(texture, f.x + 0.5f, f.y + 0.5f, f.z + 0.5f);
 		}
 		else
 		{
@@ -130,8 +176,8 @@ public:
 				//Evaluate coarse
 				f *= fineToCoarse;
 				//+0.5: Align with texel center
-				//https://forums.developer.nvidia.com/t/understanding-cuda-texture-2d-linear-interpolation/213924	
-				return tex3D<float>(texture, f.x + 0.5f, f.y + 0.5f, f.z + 0.5f);
+				//https://forums.developer.nvidia.com/t/understanding-cuda-texture-2d-linear-interpolation/213924
+				return pxgSampleSdfTexture3D(texture, f.x + 0.5f, f.y + 0.5f, f.z + 0.5f);
 			}
 			else
 			{
@@ -144,7 +190,7 @@ public:
 
 				//+0.5: Align with texel center
 				//https://forums.developer.nvidia.com/t/understanding-cuda-texture-2d-linear-interpolation/213924	
-				PxReal v = tex3D<float>(textureSubgrids, f.x + 0.5f, f.y + 0.5f, f.z + 0.5f);
+				PxReal v = pxgSampleSdfTexture3D(textureSubgrids, f.x + 0.5f, f.y + 0.5f, f.z + 0.5f);
 				
 				return applySubgridSdfScale(v);
 			}

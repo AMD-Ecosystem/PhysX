@@ -23,6 +23,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 // Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
 
@@ -367,13 +368,20 @@ __device__ inline static PxReal maxTransformPositionDelta(const PxVec3& curP, co
 }
 
 
-__constant__ __device__ PxF32 local_invalidateThresholdsConvex[5] = {	0.5f, 0.125f, 0.25f, 0.375f, 0.375f	};
-__constant__ __device__ PxF32 local_invalidateQuatThresholdsConvex[5] = {	0.9998f, 0.9999f, 0.9999f, 0.9999f, 0.9999f	};
+// These read-only __constant__ tables are DEFINED in a header included by many
+// GPU translation units. On CUDA nvcc gives each TU its own device copy; on
+// ROCm/HIP amdclang emits a HOST-visible symbol per TU, so N TUs collide with
+// "duplicate symbol" at link. Mark them `static` (internal linkage) so each TU
+// owns its own copy on both toolchains -- semantically identical to the CUDA
+// per-TU __constant__ behaviour, no cross-TU sharing was ever relied on.
+// (KB header-defined-constant-device-static-hip.)
+static __constant__ __device__ PxF32 local_invalidateThresholdsConvex[5] = {	0.5f, 0.125f, 0.25f, 0.375f, 0.375f	};
+static __constant__ __device__ PxF32 local_invalidateQuatThresholdsConvex[5] = {	0.9998f, 0.9999f, 0.9999f, 0.9999f, 0.9999f	};
 
-__constant__ __device__ PxF32 local_invalidateThresholdsSphere[3] = { 0.5f, 0.1f, 0.75f };
-__constant__ __device__ PxF32 local_invalidateQuatThresholdsSphere[3] = { 0.9995f, 0.9999f, 0.9997f };
+static __constant__ __device__ PxF32 local_invalidateThresholdsSphere[3] = { 0.5f, 0.1f, 0.75f };
+static __constant__ __device__ PxF32 local_invalidateQuatThresholdsSphere[3] = { 0.9995f, 0.9999f, 0.9997f };
 
-__constant__ __device__ PxF32 local_invalidateQuatThresholdsConvexPlane[5] = { 0.99996f, 0.99996f, 0.99996f, 0.99996f, 0.99996f };
+static __constant__ __device__ PxF32 local_invalidateQuatThresholdsConvexPlane[5] = { 0.99996f, 0.99996f, 0.99996f, 0.99996f, 0.99996f };
 	
 __device__ inline static
 PxU32 invalidate_BoxConvex(const PxVec3& curRelPos, const PxQuat& curQuatA, const PxQuat& curQuatB, 

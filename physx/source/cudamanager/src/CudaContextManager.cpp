@@ -23,6 +23,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 // Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 #include "foundation/PxAssert.h"
 #include "foundation/PxAtomic.h"
@@ -648,7 +649,7 @@ CudaCtxMgr::CudaCtxMgr(const PxCudaContextManagerDesc& desc, PxErrorCallback& er
 	mContextRefCountTls = PxTlsAlloc();
 	mIsValid = true;
 
-	// Formally load the CUDA modules, get CUmodule handles
+	// Formally load the CUDA/HIP modules, get CUmodule/hipModule_t handles
 	{
 		PxScopedCudaLock lock(*this);
 		const PxU32 moduleTableSize = PxGpuGetCudaModuleTableSize();
@@ -656,24 +657,72 @@ CudaCtxMgr::CudaCtxMgr(const PxCudaContextManagerDesc& desc, PxErrorCallback& er
 		mCuModules.resize(moduleTableSize, NULL);
 		for (PxU32 i = 0 ; i < moduleTableSize ; ++i)
 		{
-			CUresult ret = CUDA_ERROR_UNKNOWN;
-
 			// Make sure that moduleTable[i] is not null
-			if (moduleTable[i])
+			if (!moduleTable[i]) continue;
+
+#if defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+			// ROCm/HIP module loading.
+			//
+			// moduleTable[i] is the __hip_fatbin_wrapper pointer that amdclang
+			// passed to __hipRegisterFatBinary for each TU. Its layout:
+			//   struct { uint32_t magic(0x48495046); uint32_t version(1);
+			//            const void* binary; void* reserved; }
+			// where `binary` points to the actual __CLANG_OFFLOAD_BUNDLE__ data
+			// in the .hip_fatbin section.
+			//
+			// hipModuleLoadData() accepts a __CLANG_OFFLOAD_BUNDLE__ offload
+			// bundle and extracts the gfx942 HSACO to load -- the HIP analogue
+			// of cuModuleLoadDataEx on CUDA. We must unwrap the outer wrapper
+			// to get the inner bundle pointer before calling it.
+			struct PxHipFatbinWrapper {
+				PxU32       magic;
+				PxU32       version;
+				const void* binary;
+				void*       reserved;
+			};
+			const PxHipFatbinWrapper* wrap =
+			    (const PxHipFatbinWrapper*) moduleTable[i];
+			const void* loadPtr = moduleTable[i];
+			if (wrap->magic == 0x48495046u && wrap->binary)
 			{
-				ret = mCudaCtx->moduleLoadDataEx(&mCuModules[i], moduleTable[i], 0, NULL, NULL);
+				loadPtr = wrap->binary; // unwrap to __CLANG_OFFLOAD_BUNDLE__
 			}
 
+			hipModule_t hipMod = NULL;
+			hipError_t  hipRet = hipModuleLoadData(&hipMod, loadPtr);
+			if (hipRet == hipSuccess)
+			{
+				mCuModules[i] = (CUmodule) hipMod;
+			}
+			else if (hipRet != (hipError_t)209 /* hipErrorNoBinaryForGpu */)
+			{
+				char errorMsg[256];
+				physx::Pxsnprintf(errorMsg, 256,
+				    "Failed to load HIP module (hipModuleLoadData error %d).\n",
+				    (int)hipRet);
+				PxGetErrorCallback()->reportError(PxErrorCode::eINTERNAL_ERROR, errorMsg, PX_FL);
+				mCuModules[i] = NULL;
+			}
+#else
+			CUresult ret = mCudaCtx->moduleLoadDataEx(&mCuModules[i], moduleTable[i], 0, NULL, NULL);
 			if (ret != CUDA_SUCCESS && ret != CUDA_ERROR_NO_BINARY_FOR_GPU)
 			{
 				const size_t bufferSize = 256;
 				char errorMsg[bufferSize];
 				physx::Pxsnprintf(errorMsg, bufferSize, "Failed to load CUDA module data. Cuda error code %i.\n", ret);
-
 				PxGetErrorCallback()->reportError(PxErrorCode::eINTERNAL_ERROR, errorMsg, PX_FL);
 				mCuModules[i] = NULL;
 			}
+#endif // __HIP_PLATFORM_AMD__
 		}
+#if defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+		// ROCm/HIP: a TOLERATED module-load failure above (hipErrorNoBinaryForGpu
+		// -- a TU that shipped no gfx942 code object) leaves a STICKY error
+		// latched on the HIP runtime. If left undrained, the very next unrelated
+		// hip* call would (mis)report it. Drain it here so a tolerated startup
+		// skip never masquerades as a later runtime error. (plan Risk #3.)
+		hipGetLastError();
+#endif
 	}
 }
 
@@ -683,6 +732,20 @@ CudaCtxMgr::CudaCtxMgr(const PxCudaContextManagerDesc& desc, PxErrorCallback& er
  */
 bool CudaCtxMgr::safeDelayImport(PxErrorCallback& errorCallback)
 {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+	// ROCm/HIP: the NVIDIA-driver delay-import + version gate below is
+	// NVIDIA-specific (loads libcuda.so.1, checks the NVIDIA driver and CUDA
+	// toolkit version). The HIP runtime IS the driver (linked as -lamdhip64),
+	// so there is no separate driver library to dlopen and no CUDA-toolkit
+	// version to assert. Query the HIP driver version and proceed.
+	hipError_t hipStatus = hipDriverGetVersion(&mDriverVersion);
+	if (hipStatus != hipSuccess)
+	{
+		errorCallback.reportError(PxErrorCode::eINTERNAL_ERROR, "Retrieving HIP/ROCm driver version failed.", PX_FL);
+		return false;
+	}
+	return true;
+#else
 #if PX_WIN32 || PX_WIN64
 	HMODULE hCudaDriver = LoadLibrary("nvcuda.dll");
 #elif PX_LINUX
@@ -744,6 +807,7 @@ bool CudaCtxMgr::safeDelayImport(PxErrorCallback& errorCallback)
 #endif
 
 	return true;
+#endif // __HIP_PLATFORM_AMD__
 }
 
 void addRef(PxCudaContextManager* cudaContextManager)

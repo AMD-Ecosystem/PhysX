@@ -23,6 +23,7 @@
 ## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ##
 ## Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+## Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 #
 # Build PhysXCudaContextManager common
@@ -90,6 +91,11 @@ TARGET_COMPILE_DEFINITIONS(PhysXCudaContextManager
 	PRIVATE ${CUDACONTEXTMANAGER_COMPILE_DEFS}
 )
 
+# ROCm/HIP: link dl for dlsym(RTLD_NEXT) used in the __hipRegisterFatBinary interceptors.
+IF(PX_USE_HIP)
+	TARGET_LINK_LIBRARIES(PhysXCudaContextManager PRIVATE dl)
+ENDIF()
+
 SET_TARGET_PROPERTIES(PhysXCudaContextManager PROPERTIES
 	OUTPUT_NAME PhysXCudaContextManager
 )
@@ -123,6 +129,19 @@ IF(PX_GENERATE_SOURCE_DISTRO)
 	LIST(APPEND SOURCE_DISTRO_FILE_LIST ${CUDACONTEXTMANAGER_KERNELS})
 	LIST(APPEND SOURCE_DISTRO_FILE_LIST ${CUDACONTEXTMANAGER_PLATFORM_SOURCES})
 ENDIF()
+
+# ROCm/HIP build: CudaContextManager and CudaKernelWrangler are host-seam files.
+# They must NOT be compiled with -x hip (that would define __HIPCC__ and flip
+# PX_CUDA_COMPILER=1, hiding host-only class bodies).  Compile as plain C++ with
+# only the HIP platform macro exposed so the #include "hip/hip_runtime.h" paths work.
+IF(PX_USE_HIP)
+	TARGET_COMPILE_OPTIONS(PhysXCudaContextManager PRIVATE
+		$<$<COMPILE_LANGUAGE:CXX>:-D__HIP_PLATFORM_AMD__ -include cuda_to_hip.h>)
+	TARGET_INCLUDE_DIRECTORIES(PhysXCudaContextManager PRIVATE
+		${PHYSX_SOURCE_DIR}/gpucommon/include/hip_compat
+		${PHYSX_SOURCE_DIR}/gpucommon/include
+		${PX_HIP_INCLUDE_DIR})
+ENDIF(PX_USE_HIP)
 
 # enable -fPIC so we can link static libs with the editor
 SET_TARGET_PROPERTIES(PhysXCudaContextManager PROPERTIES

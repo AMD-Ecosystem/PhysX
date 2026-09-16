@@ -23,6 +23,7 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 // Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 
@@ -512,14 +513,16 @@ static __device__ void crossAdd(const PxVec3& inA,
 //
 //
 //ind is the index into mat
-__constant__ int ind[16] = { 3,	12,	9,	6,
+// static: per-TU internal linkage to avoid a duplicate-symbol host link error
+// across GPU TUs on ROCm/HIP (KB header-defined-constant-device-static-hip).
+static __constant__ int ind[16] = { 3,	12,	9,	6,
 7,	13,	2,	8,
 11,	14,	4,	1,
 15,	0,	5,	10 };
 
 
 //sign is the sign into mat
-__constant__ float sign[16] = { -1.f, 1.f, -1.f, 1.f,
+static __constant__ float sign[16] = { -1.f, 1.f, -1.f, 1.f,
 -1.f, -1.f, 1.f, 1.f,
 1.f, -1.f, -1.f, 1.f,
 1.f, 1.f, 1.f, 1.f };

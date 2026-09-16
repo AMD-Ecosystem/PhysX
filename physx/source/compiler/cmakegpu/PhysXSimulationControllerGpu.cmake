@@ -23,6 +23,7 @@
 ## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ##
 ## Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+## Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 #
 # Build PhysXSimulationControllerGpu common
@@ -222,11 +223,34 @@ TARGET_COMPILE_DEFINITIONS(PhysXSimulationControllerGpu
 
 # Since we are setting the C++ standard explicitly for Linux
 # we need to do this for CUDA as well.
-IF(TARGET_BUILD_PLATFORM STREQUAL "linux")
+IF(TARGET_BUILD_PLATFORM STREQUAL "linux" AND NOT PX_USE_HIP)
 	TARGET_COMPILE_FEATURES(PhysXSimulationControllerGpu PRIVATE cuda_std_11)
 ENDIF()
 
 TARGET_COMPILE_OPTIONS(PhysXSimulationControllerGpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${ARCH_CODE_LIST}>)
+
+# ROCm/HIP build: retarget .cu kernel TUs to the HIP front-end.
+IF(PX_USE_HIP)
+	SET_SOURCE_FILES_PROPERTIES(${PHYXGPU_SIMCONTROLLER_CUDA_KERNELS} PROPERTIES LANGUAGE HIP)
+	TARGET_COMPILE_OPTIONS(PhysXSimulationControllerGpu PRIVATE
+		$<$<COMPILE_LANGUAGE:HIP>:
+			--offload-arch=${CMAKE_HIP_ARCHITECTURES}
+			-ffp-contract=on
+			# -fgpu-rdc removed: PhysX loads each kernel as an independent runtime
+			# module (driver-API), so no cross-TU device link is needed; non-RDC
+			# matches the CUDA per-.cu fatbin model and avoids the shared-lib HIP
+			# device-link seam (undefined __hip_gpubin_handle_*). KB hip-drop-fgpu-rdc-independent-kernel-modules.
+			-include cuda_to_hip.h
+			-Wno-unused-function
+			-Wno-inconsistent-missing-override>)
+	TARGET_INCLUDE_DIRECTORIES(PhysXSimulationControllerGpu PRIVATE
+		${PHYSX_SOURCE_DIR}/gpucommon/include/hip_compat
+		${PHYSX_SOURCE_DIR}/gpucommon/include
+		${PX_HIP_INCLUDE_DIR})
+	# Host seam .cpp files: compile as plain C++ but expose HIP platform macro
+	TARGET_COMPILE_OPTIONS(PhysXSimulationControllerGpu PRIVATE
+		$<$<COMPILE_LANGUAGE:CXX>:-D__HIP_PLATFORM_AMD__ -include cuda_to_hip.h>)
+ENDIF(PX_USE_HIP)
 
 IF(PX_GENERATE_SOURCE_DISTRO)
 	LIST(APPEND SOURCE_DISTRO_FILE_LIST ${PHYXGPU_SIMCONTROLLER_HEADERS})

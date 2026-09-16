@@ -25,6 +25,7 @@
 // Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 #include "PxgGeometryManager.h"
 
@@ -169,6 +170,10 @@ void PxgGeometryManager::removeGeometry(PxU32 idx)
 
 	if (pair)
 	{
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
+		// On HIP the SDF cudaArray/texture-object path is not created (CDNA has
+		// no image hardware; see createTextureObject) so there is nothing to
+		// destroy -- the handles are always null.
 		cuArrayDestroy(pair->second.cuArray);
 		cuTexObjectDestroy(pair->second.cuTexRef);
 
@@ -177,7 +182,7 @@ void PxgGeometryManager::removeGeometry(PxU32 idx)
 			cuArrayDestroy(pair->second.cuArraySubgrids);
 			cuTexObjectDestroy(pair->second.cuTexRefSubgrids);
 		}
-
+#endif
 		mMeshToTextureMap.erase(geometryToRemove.mDeviceMemPointer);
 	}
 
@@ -739,6 +744,20 @@ static void createTextureObject(CUarray_format format, CUtexObject*& texture, CU
 		return;
 	}
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+	// HIP/ROCm deviation: the CDNA data-center arches have no texture-sampling
+	// image hardware, so the device-side tex3D SDF sampler is compiled out and
+	// GPU SDF collision is a documented-unsupported feature on this port (see
+	// sdfCollision.cuh + projects/PhysX/notes.md, KB
+	// cdna-no-texture-image-hw-sdf-software-sampler). Skip creating the
+	// cudaArray/texture-object (no HIP array/texture-desc mapping needed) --
+	// SDF meshes simply carry a null texture handle on HIP; any attempt to
+	// sample it device-side aborts loudly rather than reading garbage.
+	(void)format; (void)data; (void)stream;
+	texture = 0;
+	cuArray = 0;
+	return;
+#else
 	CUDA_ARRAY3D_DESCRIPTOR_st arrDesc;
 	arrDesc.Format = format;
 	arrDesc.NumChannels = 1;
@@ -779,4 +798,5 @@ static void createTextureObject(CUarray_format format, CUtexObject*& texture, CU
 	
 	r = cuTexObjectCreate(texture, &resDesc, &texDesc, NULL);
 	PX_ASSERT(r == CUDA_SUCCESS);
+#endif // __HIP_PLATFORM_AMD__
 }
