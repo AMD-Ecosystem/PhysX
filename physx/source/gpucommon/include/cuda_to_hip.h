@@ -45,10 +45,6 @@
 //      independent 32-lane logical warps: every __shfl_*_sync is forced to
 //      width=32 so a shuffle stays inside its 32-lane subgroup, and the
 //      sync mask is widened to the wave-portable 64-bit ~0ull.
-//
-// See projects/PhysX/plan.md Risk #1 (the WIDTH-PIN-to-32 wave64 decision)
-// and KB slugs: hip-shfl-sync-64bit-mask-rocm7, launch-bounds-second-param-
-// hip-vs-cuda, cuda-driver-api-to-hip-driver, hip7-sticky-driver-error-drain.
 // ---------------------------------------------------------------------------
 
 #ifndef PXG_CUDA_TO_HIP_H
@@ -91,8 +87,7 @@
 // is `void*`, on which none of that integer arithmetic is legal. So we alias
 // CUdeviceptr to the CUDA-faithful integer type and cast to hipDeviceptr_t
 // only at the driver-API boundary (the cuMem*/cuMemcpy* wrappers below), which
-// is where the HIP runtime actually wants a void*. (KB
-// cudeviceptr-integer-address-type-hip.)
+// is where the HIP runtime actually wants a void*.
 typedef unsigned long long CUdeviceptr;
 typedef hipModule_t      CUmodule;
 typedef hipFunction_t    CUfunction;
@@ -260,8 +255,7 @@ typedef hipArray_Format   CUarray_format;
 // PxgKernelWrangler call the CUDA driver API directly (cuModuleLoadDataEx,
 // cuLaunchKernel, cuMemAlloc, cuCtx*, cuStream*, cuEvent*, ...). The HIP
 // driver API is a 1:1 peer; remap the 43 cu* symbols PhysX uses to their hip*
-// names so the host seam links against -lamdhip64 (KB cuda-driver-api-to-hip-
-// driver). Names that are NOT a straight cu->hip rename are given explicitly.
+// names so the host seam links against -lamdhip64. Names that are NOT a straight cu->hip rename are given explicitly.
 // ---------------------------------------------------------------------------
 #define cuInit                       hipInit
 #define cuDriverGetVersion           hipDriverGetVersion
@@ -315,8 +309,7 @@ typedef hipArray_Format   CUarray_format;
 // we provide inline wrappers for the handful of driver entry points that take
 // or return a device pointer, casting integer<->void* exactly at this one
 // boundary. Names match the CUDA driver spellings so CudaContextManager.cpp /
-// PxgKernelWrangler compile unchanged. (KB cudeviceptr-integer-address-type-
-// hip, cuda-driver-api-to-hip-driver.)
+// PxgKernelWrangler compile unchanged.
 //
 // Plain host inline functions (they call host runtime entry points). They are
 // `inline` and never ODR-used from device code, so a .cu's device pass simply
@@ -422,7 +415,7 @@ static inline hipError_t cuMemsetD32Async(CUdeviceptr dst, unsigned int v, size_
 // Implemented as inline function templates in an internal namespace + macros
 // that redirect the call sites, so we do NOT redeclare the native _sync
 // intrinsics (which would collide with the amd_hip_bf16.h default-argument
-// overloads -- see KB hip-shfl-sync-64bit-mask-rocm7).
+// overloads).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -435,7 +428,7 @@ static inline hipError_t cuMemsetD32Async(CUdeviceptr dst, unsigned int v, size_
 // __HIP_DEVICE_COMPILE__), so it is ABSENT when these structs are compiled in
 // the host .cpp. Map both to the portable Clang/GCC aligned-type attribute so
 // PhysX's alignment contract (e.g. __builtin_align__(16) PxgMaterialContactData)
-// holds on both paths. (KB builtin-align-host-cpp-not-defined-hip.)
+// holds on both paths.
 #ifndef __align__
 #define __align__(n) __attribute__((aligned(n)))
 #endif
@@ -496,7 +489,6 @@ __device__ __forceinline__ T shflDownSync(unsigned long long, T v, unsigned int 
 // Without this AND, partial-mask callers (e.g. cudaBox.cu groupMask=0xf<<k,
 // gjk.cuh mask_bestDist, reduction.cuh syncMask) would silently get votes from
 // ALL 32 subgroup lanes instead of just the designated ones.
-// (KB anysync-allsync-subgroup-ballot-wave64 / ballot-sync-mask-partial.)
 __device__ __forceinline__ unsigned int ballotSync(unsigned long long mask, int pred)
 {
 	unsigned long long b = __ballot(pred);
@@ -515,7 +507,6 @@ __device__ __forceinline__ unsigned int ballotSync(unsigned long long mask, int 
 // For FULL_MASK sites the mask AND is a no-op; for partial masks (e.g. a
 // 4-lane group mask in cudaBox.cu, or a bestDist result mask in gjk.cuh)
 // only the named lanes count -- matching CUDA semantics.
-// (KB anysync-allsync-subgroup-ballot-wave64.)
 __device__ __forceinline__ int anySync(unsigned long long mask, int pred)
 {
 	const unsigned int vote = ballotSync(mask, pred);
@@ -573,9 +564,8 @@ __device__ __forceinline__ void syncWarp(unsigned long long)
 // type name '__launch_bounds__'"). The CUDA min-blocks value carried through
 // is only an occupancy HINT (never a correctness contract -- the hard bound
 // is the first arg, max-threads-per-block); an incorrect hint at most costs
-// occupancy and is re-tuned in the later perf-improvement stage with the
-// correct MIN_WARPS_PER_EU = (MIN_BLOCKS * MAX_THREADS) / (warpSize * 2)
-// formula (KB launch-bounds-second-param-hip-vs-cuda).
+// occupancy. The HIP equivalent of a CUDA min-blocks value is
+// MIN_WARPS_PER_EU = (MIN_BLOCKS * MAX_THREADS) / (warpSize * 2).
 
 #endif // __HIPCC__
 

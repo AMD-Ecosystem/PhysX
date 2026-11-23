@@ -132,8 +132,7 @@ PX_FORCE_INLINE __device__ void PxRedAddGlobal(float* addr, const float val)
 	// the return-discarding atomicAdd is the exact functional equivalent (the
 	// hardware coalesces it into an L2 atomic). __CUDA_ARCH__ is undefined on
 	// HIP so the CUDA branches below would otherwise fall through to the no-op
-	// PX_UNUSED path -- a SILENT dropped-atomic correctness bug. (KB
-	// ptx-red-global-add-to-atomicadd-hip.)
+	// PX_UNUSED path -- a SILENT dropped-atomic correctness bug.
 	atomicAdd(addr, val);
 #elif __CUDA_ARCH__ >= 350
 	asm volatile ("red.global.add.f32 [%0], %1;" :: __STG_PTR(addr) , "f"(val));

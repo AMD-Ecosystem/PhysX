@@ -15,8 +15,7 @@
 // equivalent for "the whole block waits here" is the workgroup barrier
 // __syncthreads() (the numbered form is an NVIDIA partial-barrier optimization;
 // collapsing every named barrier to the full block barrier is a functional
-// superset -- never fewer threads than the code assumed). (KB
-// ptx-bar-sync-numbered-to-syncthreads-hip.)
+// superset -- never fewer threads than the code assumed).
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #define PX_NAMED_BAR_SYNC(n) __syncthreads()
 #else

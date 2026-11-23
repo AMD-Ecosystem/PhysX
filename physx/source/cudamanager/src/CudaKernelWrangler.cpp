@@ -113,9 +113,8 @@ KernelWrangler::KernelWrangler(PxCudaContextManager& cudaContextManager, PxError
 					// Drain the sticky HIP error latched by each module MISS
 					// (hipErrorNotFound). With 61 modules x ~396 functions the
 					// ctor exits with a stale hipErrorNotFound that would be
-					// misattributed to the next unrelated hip* call -- same
-					// fault class as the module-load loop drain in
-					// CudaContextManager.cpp. (plan Risk #3.)
+					// misattributed to the next unrelated hip* call, as with
+					// the module-load loop drain in CudaContextManager.cpp.
 					hipGetLastError();
 #else
 					PxCUresult ret = mCudaContext->moduleGetFunction(&mCuFunctions[i], cuModules[cuFunctionTable[j].moduleIndex], funcNames[i]);
@@ -161,7 +160,6 @@ KernelWrangler::KernelWrangler(PxCudaContextManager& cudaContextManager, PxError
 // (hipModuleLoadDataEx in CudaContextManager). So the whole cudart-intercept
 // block is dead code on HIP and is compiled out (it would otherwise need the
 // full cudart type set: cudaError_t, cudaChannelFormatDesc, CUDARTAPI, ...).
-// See projects/PhysX/notes.md and KB cudart-fatbin-abi-stubs-nvcc-only.
 #if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
 
 #include <driver_types.h>
@@ -376,7 +374,6 @@ void __hipRegisterFunction(
 	// KernelWrangler resolves the handle by scanning ALL loaded modules with
 	// hipModuleGetFunction (see the __HIP_PLATFORM_AMD__ branch in this file's
 	// PxgKernelWrangler ctor). The moduleIndex is intentionally unused on HIP.
-	// (KB hip-kernel-resolve-scan-all-modules-no-fgpu-rdc.)
 	PxGpuCudaRegisterFunction(-1, deviceName);
 }
 

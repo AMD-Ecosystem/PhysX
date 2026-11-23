@@ -43,7 +43,7 @@
 //   0---- x
 
 // static: per-TU internal linkage to avoid duplicate-symbol host link errors
-// across GPU TUs on ROCm/HIP (KB header-defined-constant-device-static-hip).
+// across GPU TUs on ROCm/HIP.
 static __constant__ int marchingCubeCorners[8][3] = { {0,0,0}, {1,0,0},{1,1,0},{0,1,0}, {0,0,1}, {1,0,1},{1,1,1},{0,1,1} };
 
 static __constant__ int firstMarchingCubesId[257] = {

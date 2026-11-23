@@ -808,8 +808,7 @@ static void createTextureObject(CUarray_format format, CUtexObject*& texture, CU
 	// HIP/ROCm deviation: the CDNA data-center arches have no texture-sampling
 	// image hardware, so the device-side tex3D SDF sampler is compiled out and
 	// GPU SDF collision is a documented-unsupported feature on this port (see
-	// sdfCollision.cuh + projects/PhysX/notes.md, KB
-	// cdna-no-texture-image-hw-sdf-software-sampler). Skip creating the
+	// sdfCollision.cuh). Skip creating the
 	// cudaArray/texture-object (no HIP array/texture-desc mapping needed) --
 	// SDF meshes simply carry a null texture handle on HIP; any attempt to
 	// sample it device-side aborts loudly rather than reading garbage.

@@ -32,7 +32,7 @@ struct EpaScratch
 
 // static: per-TU internal linkage so the multiple GPU TUs that include epa.cuh
 // do not collide with "duplicate symbol" on the ROCm/HIP host link (matches the
-// CUDA per-TU __constant__ behaviour). KB header-defined-constant-device-static-hip.
+// CUDA per-TU __constant__ behaviour).
 static __constant__ __device__ schlock::Vec3I8 sStartVertices4[4] =		{	MAKE_Vec3I8(0,1,2),	MAKE_Vec3I8(3,1,0),	MAKE_Vec3I8(3,2,1),	MAKE_Vec3I8(3,0,2) };
 static __constant__ __device__ schlock::Vec3I8 sStartAdjacencies4[4] =	{	MAKE_Vec3I8(2,3,1),	MAKE_Vec3I8(0,3,2),	MAKE_Vec3I8(0,1,3),	MAKE_Vec3I8(0,2,1) };
 

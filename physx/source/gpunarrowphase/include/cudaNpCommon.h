@@ -351,7 +351,6 @@ __device__ inline static PxReal maxTransformPositionDelta(const PxVec3& curP, co
 // "duplicate symbol" at link. Mark them `static` (internal linkage) so each TU
 // owns its own copy on both toolchains -- semantically identical to the CUDA
 // per-TU __constant__ behaviour, no cross-TU sharing was ever relied on.
-// (KB header-defined-constant-device-static-hip.)
 static __constant__ __device__ PxF32 local_invalidateThresholdsConvex[5] = {	0.5f, 0.125f, 0.25f, 0.375f, 0.375f	};
 static __constant__ __device__ PxF32 local_invalidateQuatThresholdsConvex[5] = {	0.9998f, 0.9999f, 0.9999f, 0.9999f, 0.9999f	};
 

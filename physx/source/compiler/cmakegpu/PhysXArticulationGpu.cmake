@@ -127,7 +127,7 @@ IF(PX_USE_HIP)
 			# -fgpu-rdc removed: PhysX loads each kernel as an independent runtime
 			# module (driver-API), so no cross-TU device link is needed; non-RDC
 			# matches the CUDA per-.cu fatbin model and avoids the shared-lib HIP
-			# device-link seam (undefined __hip_gpubin_handle_*). KB hip-drop-fgpu-rdc-independent-kernel-modules.
+			# device-link seam (undefined __hip_gpubin_handle_*).
 			-include cuda_to_hip.h
 			-Wno-unused-function
 			-Wno-inconsistent-missing-override>)

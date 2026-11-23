@@ -20,7 +20,7 @@ using namespace physx;
 // sized blockDim/32 in PxgAlgorithms.cpp while the device would index
 // blockDim/64). Pin the width to the logical 32-lane subgroup, matching the
 // width-32-pinned shfl_up_sync/warpScan used just below and the compat header's
-// PXG_LOGICAL_WARP_WIDTH. (KB warp-size-literal-32-not-builtin-wave64.)
+// PXG_LOGICAL_WARP_WIDTH.
 static const int PXG_LOGICAL_WARP_SIZE = 32;
 
 extern "C" __host__ void initAlgorithmsKernels0() {}

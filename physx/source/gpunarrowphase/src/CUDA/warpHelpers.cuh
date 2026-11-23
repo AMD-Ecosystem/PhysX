@@ -186,8 +186,7 @@ __device__ static inline void scanWarp(unsigned int scanIdx, volatile T* sdata)
 // step read from (lane - delta) and add only when that source lane exists
 // (laneInWarp >= delta) -- the exact semantics of the PTX predicate `p`. Lane
 // index is scanIdx & (WARP_SIZE-1). Width-pinned to 32 == the logical warp the
-// whole PhysX stack assumes, so this is wave32/wave64 unified. (KB
-// ptx-shfl-up-scan-to-shfl-up-sync-hip.)
+// whole PhysX stack assumes, so this is wave32/wave64 unified.
 template <>
 __device__ inline void scanWarp<PxU32, AddOP<PxU32> >(unsigned int scanIdx, volatile PxU32 * sdata)
 {

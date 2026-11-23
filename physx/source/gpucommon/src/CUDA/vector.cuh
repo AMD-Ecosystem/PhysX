@@ -491,7 +491,7 @@ static __device__ void crossAdd(const PxVec3& inA,
 //
 //ind is the index into mat
 // static: per-TU internal linkage to avoid a duplicate-symbol host link error
-// across GPU TUs on ROCm/HIP (KB header-defined-constant-device-static-hip).
+// across GPU TUs on ROCm/HIP.
 static __constant__ int ind[16] = { 3,	12,	9,	6,
 7,	13,	2,	8,
 11,	14,	4,	1,

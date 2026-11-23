@@ -534,7 +534,7 @@ CudaCtxMgr::CudaCtxMgr(const PxCudaContextManagerDesc& desc, PxErrorCallback& er
 		// -- a TU that shipped no gfx942 code object) leaves a STICKY error
 		// latched on the HIP runtime. If left undrained, the very next unrelated
 		// hip* call would (mis)report it. Drain it here so a tolerated startup
-		// skip never masquerades as a later runtime error. (plan Risk #3.)
+		// skip never masquerades as a later runtime error.
 		hipGetLastError();
 #endif
 	}

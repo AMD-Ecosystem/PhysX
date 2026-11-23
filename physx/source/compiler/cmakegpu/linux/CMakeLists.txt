@@ -35,15 +35,6 @@
 #
 # * amdhip64 replaces the CUDA driver/runtime libs; -lamdhip64 links the HIP
 # runtime (which IS the driver on ROCm).
-#
-# STILL TODO before an end-to-end link (next porter session): retarget each
-# per-module *.cmake (PhysX{Broadphase,Common,Narrowphase,SimulationController,
-# Solver,Articulation}Gpu.cmake, PhysXCudaContextManager.cmake) from the nvcc
-# CUDA_COMPILE flow to the HIP LANGUAGE flow above, replace the nvcc-only flags
-# (-use_fast_math -ftz=true -prec-div=false -t0 -lineinfo --compiler-options),
-# and generate the ROCm HSACO module table that PhysX's module loader
-# (hipModuleLoadDataEx loop in CudaContextManager) consumes in place of the
-# NVIDIA fatbin-registration ABI (compiled out in CudaKernelWrangler.cpp).
 # ---------------------------------------------------------------------------
 # PX_USE_HIP is declared in the parent CMakeLists.txt (cmakegpu/CMakeLists.txt)
 # before project() so that the right GPU language is selected there.

@@ -39,8 +39,7 @@ namespace physx
 // midphase on CDNA. Tracked as a documented deviation for this port; the SDF
 // collision GPU path is the only narrowphase feature gated off on HIP -- the
 // rest of the GPU stack (broadphase, solver, articulation, non-SDF
-// narrowphase) is fully ported. See projects/PhysX/notes.md and KB
-// cdna-no-texture-image-hw-sdf-software-sampler.
+// narrowphase) is fully ported.
 //
 // Until that lands, the HIP build compiles the sampler as an explicit,
 // loud device abort (never a silently-wrong value) so no caller can mistake
@@ -54,8 +53,7 @@ PX_INLINE __device__ PxReal pxgSampleSdfTexture3D(CUtexObject texObj, float x, f
 	// is not yet wired (see TODO above). Abort loudly rather than return a
 	// wrong distance.
 	printf("PhysX ROCm: GPU SDF-collision (tex3D) is not yet supported on CDNA "
-	       "(gfx942/gfx950); needs the software-trilinear SDF sampler. See "
-	       "projects/PhysX/notes.md.\n");
+	       "(gfx942/gfx950); needs the software-trilinear SDF sampler.\n");
 	__builtin_trap();
 	return 0.0f;
 #else
