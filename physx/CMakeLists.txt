@@ -73,7 +73,7 @@ if(PX_GENERATE_GPU_PROJECTS AND PX_USE_HIP)
     project(PhysX VERSION ${_PX_VERSION})
   endif()
   message(STATUS "PX_USE_HIP=ON: GPU projects target AMD ROCm/HIP (CUDA not probed)")
-elif(PX_GENERATE_GPU_PROJECTS)
+elseif(PX_GENERATE_GPU_PROJECTS)
   if(_PHYSX_IS_TOP_LEVEL_FOR_PROJECT)
     # Top-level: declare all languages in project() - this is the normal case
     project(PhysX VERSION ${_PX_VERSION} LANGUAGES C CXX CUDA)
