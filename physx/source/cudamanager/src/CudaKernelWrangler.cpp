@@ -246,7 +246,7 @@ struct cudaChannelFormatDesc CUDARTAPI cudaCreateChannelDesc(
 	return desc;
 }
 
-extern "C"
+extern "C" 
 cudaError_t CUDARTAPI __cudaPopCallConfiguration(
   dim3         *,
   dim3         *,

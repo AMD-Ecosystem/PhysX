@@ -153,7 +153,7 @@ public:
 				//Evaluate coarse
 				f *= fineToCoarse;
 				//+0.5: Align with texel center
-				//https://forums.developer.nvidia.com/t/understanding-cuda-texture-2d-linear-interpolation/213924
+				//https://forums.developer.nvidia.com/t/understanding-cuda-texture-2d-linear-interpolation/213924	
 				return pxgSampleSdfTexture3D(texture, f.x + 0.5f, f.y + 0.5f, f.z + 0.5f);
 			}
 			else
