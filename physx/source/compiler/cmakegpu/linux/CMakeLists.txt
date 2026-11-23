@@ -12,8 +12,8 @@
 # enable_language(HIP)
 # set_source_files_properties(${CU_SOURCES} PROPERTIES LANGUAGE HIP)
 # target_compile_options(<tgt> PRIVATE
-# $<$<COMPILE_LANGUAGE:HIP>:--offload-arch=${CMAKE_HIP_ARCHITECTURES}
-# -ffp-contract=on>)
+# $<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=on>)
+# (CMAKE_HIP_ARCHITECTURES supplies one --offload-arch per architecture)
 # NOTE: -fgpu-rdc is intentionally OMITTED. PhysX uses per-TU independent
 # driver-API fatbins (no cross-TU device linking). -fgpu-rdc requires an
 # explicit device-link step (clang++ --hip-link) that CMake's HIP shared-lib
@@ -186,6 +186,12 @@ IF(PX_USE_HIP)
 
 	# Enable the HIP language (must happen before any target is created).
 	ENABLE_LANGUAGE(HIP)
+	# Without -DCMAKE_HIP_ARCHITECTURES, CMake fills it with the architecture of every
+	# GPU agent it finds, so a machine with several identical GPUs lists one
+	# architecture many times. Keep each architecture once.
+	SET(_PX_HIP_ARCHITECTURES ${CMAKE_HIP_ARCHITECTURES})
+	LIST(REMOVE_DUPLICATES _PX_HIP_ARCHITECTURES)
+	SET(CMAKE_HIP_ARCHITECTURES "${_PX_HIP_ARCHITECTURES}" CACHE STRING "HIP architectures" FORCE)
 	MESSAGE(STATUS "PX_USE_HIP: HIP language enabled, arch=${CMAKE_HIP_ARCHITECTURES}")
 
 	# ---------------------------------------------------------------------------

@@ -121,7 +121,6 @@ IF(PX_USE_HIP)
 	SET_SOURCE_FILES_PROPERTIES(${PHYXGPU_BROADPHASE_CUDA_KERNELS} PROPERTIES LANGUAGE HIP)
 	TARGET_COMPILE_OPTIONS(PhysXBroadphaseGpu PRIVATE
 		$<$<COMPILE_LANGUAGE:HIP>:
-			--offload-arch=${CMAKE_HIP_ARCHITECTURES}
 			-ffp-contract=on
 			# -fgpu-rdc removed: PhysX loads each kernel as an independent runtime
 			# module (driver-API), so no cross-TU device link is needed; non-RDC
