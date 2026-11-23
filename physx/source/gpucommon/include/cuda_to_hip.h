@@ -275,6 +275,7 @@ typedef hipArray_Format   CUarray_format;
 #define cuModuleUnload               hipModuleUnload
 #define cuLaunchKernel               hipModuleLaunchKernel
 #define cuFuncGetAttribute           hipFuncGetAttribute
+#define cuOccupancyMaxActiveBlocksPerMultiprocessor hipModuleOccupancyMaxActiveBlocksPerMultiprocessor
 #define cuMemGetInfo                 hipMemGetInfo
 // cuStreamCreate(phStream, flags) is the 2-arg CUDA driver form; its HIP peer
 // is hipStreamCreateWithFlags (hipStreamCreate takes no flags arg).
