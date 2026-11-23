@@ -24,8 +24,11 @@ SET(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 IF(NOT CMAKE_CROSSCOMPILING AND (TARGET_BUILD_PLATFORM STREQUAL "windows" OR TARGET_BUILD_PLATFORM STREQUAL "linux"))
 	OPTION(PX_GENERATE_GPU_PROJECTS "Generate the GPU projects, if possible." OFF)
 	OPTION(PX_GENERATE_GPU_PROJECTS_ONLY "Generate ONLY the GPU projects, if possible." OFF)
+	# ROCm/HIP GPU backend: the HIP language is enabled by the GPU projects
+	# (source/compiler/cmakegpu), so CUDA is not probed here.
+	OPTION(PX_USE_HIP "Build the PhysX GPU stack for AMD ROCm/HIP instead of NVIDIA CUDA" OFF)
 
-	IF(PX_GENERATE_GPU_PROJECTS OR PX_GENERATE_GPU_PROJECTS_ONLY)
+	IF((PX_GENERATE_GPU_PROJECTS OR PX_GENERATE_GPU_PROJECTS_ONLY) AND NOT PX_USE_HIP)
 		# Will enable building CUDA files ( .cu )
 		ENABLE_LANGUAGE(CUDA)
 		# The FIND_PACKAGE(CUDAToolkit) makes it easier if you have CUDA language enabled to link to
