@@ -1,26 +1,117 @@
 // SPDX-FileCopyrightText: Copyright (c) 2019-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-// This include must come first
-// clang-format off
-#include "UsdPCH.h"
-// clang-format on
+/**
+ * @implements REQ-CACHE-UPDATE-001
+ * @covers AC-2 AC-6 AC-7 AC-8
+ */
+
+/** @implements REQ-PARSE-FEED-006
+ * @covers AC-5 AC-7
+ */
+
+// @implements REQ-ATTACH-SERVICES-001
+// @covers AC-3
+
+// @implements REQ-REPLICATE-002
+// @covers AC-6
+
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1 AC-2
+
+// @implements REQ-ATTACH-LIFETIME-001
+// @covers AC-1 AC-2
+// @implements REQ-PARSE-VEH-DRIVETRAIN-001
+// @covers AC-4 AC-6
+// @implements REQ-PARSE-VEH-DRIVE-001
+// @covers AC-6 AC-8
+/** @implements REQ-PARSE-BATCH-001
+ * @covers AC-3
+ * @implements REQ-PARSE-PARALLEL-001
+ * @covers AC-3 AC-4 AC-7
+ */
+
+/**
+ * @implements REQ-LOAD-TOKENS-001
+ * @covers AC-5
+ */
+
+/**
+ * @implements REQ-PARSE-INSTANCER-DISPATCH-001
+ * @covers AC-2 AC-3 AC-4
+ */
+
+/**
+ * @implements REQ-PARSE-SCENE-OWNER-001
+ * @covers AC-1 AC-2 AC-4 AC-5 AC-6
+ */
+
+/**
+ * @implements REQ-PARSE-CONSUMER-001
+ * @covers AC-9 AC-16 AC-17 AC-18 AC-19 AC-20 AC-21 AC-22 AC-23 AC-24
+ *
+ * @implements REQ-PARSE-FEED-003
+ * @covers AC-12
+ *
+ * @implements REQ-SIM-MULTISCENE-001
+ * @covers AC-3
+ *
+ * @implements REQ-SIM-OBJECTDB-001
+ * @covers AC-2
+ *
+ * @implements REQ-WRITE-LOCALXFORM-001
+ * @covers AC-4
+ *
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-23 AC-27 AC-29 AC-30
+ *
+ * @implements REQ-SPLINE-TARGET-001
+ * @covers AC-1 AC-2
+ *
+ * @implements REQ-SIM-AUTOATTACH-001
+ * @covers AC-2 AC-4
+ *
+ * @implements REQ-PARSE-FEED-002
+ * @covers AC-5
+ *
+ * @implements REQ-PARSE-COL-003
+ * @covers AC-1 AC-3 AC-6
+ */
+
 #include <carb/logging/Log.h>
 #include <carb/Framework.h>
 #include <private/omni/physx/PhysxUsd.h>
 #include <omni/physx/IPhysxSettings.h>
 #include <common/foundation/Allocator.h>
-#include <common/utilities/PrimUtilities.h>
-#include <common/utilities/Utilities.h>
-#include <common/utilities/OmniPhysXUtilities.h>
-#include <omni/log/ILog.h>
 #include <carb/profiler/Profile.h>
 #include <carb/tasking/TaskingTypes.h>
 #include <carb/tasking/TaskingUtils.h>
 
-#include "LoadUsd.h"
 #include "LoadTools.h"
+#include "Joint.h"
+#include "MimicJoint.h"
+#include "DeformableAttachment.h"
+#include "IceDescriptorAllocator.h"
+#include <attachment/PhysXAttachment.h>
+#include <usdBridge/AttachmentAuthoringBridge.h>
+#include <omni/physics/parse/IPhysicsSource.h>
+#include <omni/physics/parse/KnownTokens.h>
+#include <omni/physics/parse/ParseContext.h>
+#include <omni/physics/parse/PreparedScene.h>
+#include <omni/physics/parse/ScanBackend.h> // pxr-free scanStage(AttachTarget, ...) sibling
+#include <omni/physics/parse/ScannedStage.h>
+#include <unordered_map>
+#include <unordered_set>
+#include "Vehicle.h"
+#include <usdInterface/UsdInterface.h>
+
+// Forward-declared rather than pulling in PhysXScene.h, a heavy header, for one function.
+namespace omni { namespace physx { bool isRigidBodyDynamic(const omni::physx::usdparser::AttachedStage& attachedStage, omni::physx::usdparser::ObjectId id); } }
+
+#include "LoadUsd.h"
 #include "PhysXTools.h"
+#include <common/foundation/CarbPhysXCast.h> // toPhysX/toPhysXQuat for the Joints loop's body-transform check
+#include <common/foundation/MatrixTools.h> // getScale/makeMatrix/toTransform for isJointBodyTransformEqual
 #include "Mass.h"
 #include "Collision.h"
 #include "Particles.h"
@@ -29,25 +120,22 @@
 #include "JointInstancer.h"
 #include "Material.h"
 #include "Scene.h"
-#include "Joint.h"
 #include "PhysicsBody.h"
 #include "CollisionGroup.h"
 #include "LoadStage.h"
+#include "../cache/AttachmentCache.h"
+#include <omni/physics/parse/DescriptorBatchAllocator.h>
+#include "DescriptorRuntimeStats.h"
 #include <CookingDataAsync.h>
 #include <utils/Profile.h>
 #include <PhysXScene.h>
 #include <OmniPhysX.h>
 #include <VoxelMap.h>
-#include <attachment/PhysXAttachment.h>
 #include <particles/PhysXParticleSampling.h>
-
 
 // physx specific stuff
 #include "FixedTendon.h"
 #include "SpatialTendon.h"
-#include "Vehicle.h"
-#include "DeformableAttachment.h"
-#include "MimicJoint.h"
 #include <ChangeRegister.h>
 
 /**
@@ -55,45 +143,33 @@
  * @covers AC-1 AC-5 AC-9 AC-16 AC-17 AC-18 AC-19 AC-20 AC-21 AC-22
  *
  * @implements REQ-PARSE-SCAN-001
- * @covers AC-5
+ * @covers AC-5 AC-20
  *
- * LoadStage is the consumer of the parse-library `ScannedStage`.
- * `loadFromRange` runs `scanStage(attachTarget, roots)` first, then
- * `processScannedDescs` iterates the typed lists (materials, shapes,
- * bodies, articulations, joints, attachments, ...) and translates
- * descriptors into runtime objects.  Scenes still use the
- * `reportObjectDesc` callback path because the simulator-ownership
- * gate (`canSceneBeProcessedByPhysX`, ADR-0002 §4) must run before
- * synchronous body dispatch resolves `simulationOwners → sceneIds`
- * against ObjectDatabase.
+ * LoadStage borrows descriptors from the ScannedStage owned by loadFromRange.
+ * Creation helpers do not free those borrowed descriptors. The owning DescPtr
+ * lists retain concrete destructors and allocator provenance through every
+ * success, rejection and exception path. Auxiliary mesh/source storage stays
+ * with the scan until all consumers finish.
  *
- * Descriptors are produced ICE-allocated by `scanStage` (the
- * `IceDescriptorAllocator` is injected at the entry point; see
- * ADR-0005), so each descriptor moves out of `ScannedStage` via
- * `.release()` with no deep copy.  Cross-namespace `ObjectKey`
- * re-keying still runs at the boundary via
- * `attachedStage.keyFor(scanned.pathFor(scanKey))`.
+ * @implements REQ-PARSE-CORE-006
+ * @covers AC-9
  */
 
-#include <omni/physics/usd/StageScan.h>
 #include <OvstageSource.h>
-#include "IceDescriptorAllocator.h"
 #include "ScannedShapeCookingDispatch.h"
 
 #include "TimeSampledCallbacks.h"
 #include "DeformableBodyConverter.h"
 #include "Material.h"  // setToDefault overloads for default sub-material descs
-#include <common/utilities/UsdMaterialParsing.h>  // usdmaterialutils::getMaterialBinding
 #include <propertiesUpdate/PhysXPropertiesUpdate.h>  // updateDeformableContactOffset/RestOffset
-#include <pxr/usd/usdGeom/tetMesh.h>
-#include <common/foundation/TypeCast.h>  // toVec3f / toQuatf for joint tm check
 #include <PhysXCustomJoint.h>  // CustomJointManager for eJointCustom registry lookup
+#include <cmath>
 #include <cstdlib>
 #include <unordered_set>
 
 #include <omni/physics/parse/IPhysicsSource.h>  // source-backed isA/hasSchema dispatch
+#include <omni/physics/parse/KnownTokens.h>
 
-using namespace PXR_NS;
 using namespace carb;
 using namespace carb::tasking;
 using namespace omni::physics::schema;
@@ -104,12 +180,9 @@ namespace physx
 {
 namespace usdparser
 {
-// schemaTypeToken lives in PhysXTools.h (single boundary translation).
-using omni::physx::internal::schemaTypeToken;
-
 omni::physics::ovstage::OvstageSource* seedOvstageKnownKeysForInitialLoad(
     AttachedStage& attachedStage,
-    const std::vector<SdfPath>& scanRoots)
+    const std::vector<std::string>& scanRoots)
 {
     auto* ovstageSource = dynamic_cast<omni::physics::ovstage::OvstageSource*>(attachedStage.getSource());
     if (!ovstageSource)
@@ -119,91 +192,53 @@ omni::physics::ovstage::OvstageSource* seedOvstageKnownKeysForInitialLoad(
     if (!source)
         return nullptr;
 
-    std::vector<omni::physics::parse::ObjectKey> knownKeys;
-    std::unordered_set<uint64_t> seen;
+    (void)scanRoots;
 
-    auto addKey = [&](omni::physics::parse::ObjectKey key)
-    {
-        if (key.valid() && seen.insert(key.handle).second)
-            knownKeys.push_back(key);
-    };
-    // Enumerate the subtree via the iterative, mChildCache-backed collector rather
-    // than the recursive forEachDescendantPruned walk. scanStage has already built
-    // the child cache by this point, so this is a pure in-memory traversal (no
-    // per-node pathOf std::string copies, recursive-mutex re-locks, per-call
-    // unordered_set / std::function allocations). It visits the same key set the
-    // eActiveInstanced pruned walk did (forEachChild ignores scope and reads the
-    // same cache), so known-key seeding is unchanged. This was the dominant cost
-    // of ovstage attach (~13 s on FrankaCabinet128 -> a few ms).
-    std::vector<omni::physics::parse::ObjectKey> subtreeKeys;
-    auto seedRoot = [&](omni::physics::parse::ObjectKey rootKey)
-    {
-        if (!rootKey.valid())
-            return;
-        subtreeKeys.clear();
-        ovstageSource->collectDescendantKeys(rootKey, subtreeKeys);
-        for (const omni::physics::parse::ObjectKey key : subtreeKeys)
-            addKey(key);
-    };
-
-    if (scanRoots.empty())
-    {
-        seedRoot(source->getRootKey());
-    }
-    else
-    {
-        for (const SdfPath& rootPath : scanRoots)
-            seedRoot(rootPath.IsEmpty() ? source->getRootKey() : attachedStage.keyFor(rootPath));
-    }
-
-    if (knownKeys.empty())
-        seedRoot(source->getRootKey());
+    // Seed and transform prefetch share one prim set: bodies, colliders and their ancestors
+    // (ancestors for joint-frame world transforms). exists() falls back to a live query for
+    // unseeded keys, so joints -- never exists()-checked at load -- are left out.
+    std::vector<omni::physics::parse::ObjectKey> physicsKeys;
+    ovstageSource->collectSchemaKeys(ovstageSource->internToken("PhysicsRigidBodyAPI"), physicsKeys);
+    ovstageSource->collectSchemaKeys(ovstageSource->internToken("PhysicsCollisionAPI"), physicsKeys);
+    const std::vector<omni::physics::parse::ObjectKey> ancestors = ovstageSource->collectAncestors(physicsKeys);
+    physicsKeys.insert(physicsKeys.end(), ancestors.begin(), ancestors.end());
 
     ovstageSource->clearKnownKeys();
-    ovstageSource->seedKnownKeys(knownKeys);
-    ovstageSource->prefetchBucket(
-        knownKeys,
-        { omni::physics::ovstage::conv::kFabricWorldMatrix,
-          omni::physics::ovstage::conv::kFabricLocalMatrix,
-          omni::physics::ovstage::conv::kLocalTransform,
-          omni::physics::ovstage::conv::kResetXformStack });
+    ovstageSource->seedKnownKeys(physicsKeys);
+
+    ovstageSource->prefetchBucket(physicsKeys,
+                                  { omni::physics::ovstage::conv::kFabricWorldMatrix,
+                                    omni::physics::ovstage::conv::kFabricLocalMatrix,
+                                    omni::physics::ovstage::conv::kLocalTransform,
+                                    omni::physics::ovstage::conv::kResetXformStack });
     return ovstageSource;
 }
 
-bool doesBodyExist(AttachedStage& attachedStage, SdfPath& bodyPath)
+bool doesBodyExist(AttachedStage& attachedStage, omni::physics::parse::ObjectKey bodyKey)
 {
-    const ObjectId body = attachedStage.getObjectDatabase()->findEntry(bodyPath, eBody);
-    if (body != kInvalidObjectId)
-        return true;
-
-    return false;
+    return attachedStage.getObjectDatabase()->findEntry(bodyKey, eBody) != kInvalidObjectId;
 }
 
-void createJoint(AttachedStage& attachedStage, const SdfPath& primKey, PhysxJointDesc* desc)
+void createJoint(AttachedStage& attachedStage, omni::physics::parse::ObjectKey primKey, PhysxJointDesc* desc)
 {
     if (desc != nullptr)
     {
         ObjectDb* objectDb = attachedStage.getObjectDatabase();
-        PhysXUsdPhysicsInterface* physInt = attachedStage.getPhysXPhysicsInterface();
 
-        const SdfPath body0Path = attachedStage.pathFor(desc->body0);
-        const SdfPath body1Path = attachedStage.pathFor(desc->body1);
-
-        ObjectId body0 = objectDb->findEntry(body0Path, eBody);
+        ObjectId body0 = objectDb->findEntry(desc->body0, eBody);
         if (body0 == kInvalidObjectId)
         {
-            body0 = objectDb->findEntry(body0Path, eArticulationLink);
+            body0 = objectDb->findEntry(desc->body0, eArticulationLink);
         }
-        const bool body0Dynamic = body0 == kInvalidObjectId ? false : isRigidBodyDynamic(body0);
-        ObjectId body1 = objectDb->findEntry(body1Path, eBody);
+        const bool body0Dynamic = body0 == kInvalidObjectId ? false : isRigidBodyDynamic(attachedStage, body0);
+        ObjectId body1 = objectDb->findEntry(desc->body1, eBody);
         if (body1 == kInvalidObjectId)
         {
-            body1 = objectDb->findEntry(body1Path, eArticulationLink);
+            body1 = objectDb->findEntry(desc->body1, eArticulationLink);
         }
-        const bool body1Dynamic = body1 == kInvalidObjectId ? false : isRigidBodyDynamic(body1);
+        const bool body1Dynamic = body1 == kInvalidObjectId ? false : isRigidBodyDynamic(attachedStage, body1);
 
         createJoint(attachedStage, primKey, desc, body0, body0Dynamic, body1, body1Dynamic);
-        ICE_FREE(desc);
     }
 }
 
@@ -220,20 +255,21 @@ void createBodies(AttachedStage& attachedStage, BodyMap& bodyMap, BodyVector& ad
             // we dont send articulation links, they already have been created
             if (bodyDesc->type == eDynamicBody || bodyDesc->type == eStaticBody)
             {
-                const SdfPath& bodyPath = it->first;
-                const ObjectId id = attachedStage.getPhysXPhysicsInterface()->createObject(attachedStage, bodyPath, *bodyDesc);
+                const omni::physics::parse::ObjectKey bodyKey = it->first;
+                const ObjectId id = attachedStage.getPhysXPhysicsInterface()->createObject(attachedStage, bodyKey, *bodyDesc);
                 // If PhysXUsdPhysicsInterface::setForceParseOnlySingleScene is used it may return kInvalidObjectId
                 if (id != kInvalidObjectId)
                 {
-                    attachedStage.getObjectDatabase()->findOrCreateEntry(bodyPath, eBody, id);
+                    // The pathText overload also feeds PrimHierarchyStorage; the bare-key one
+                    // skips it, breaking cascade-delete-on-parent-removal for these bodies.
+                    attachedStage.getObjectDatabase()->findOrCreateEntry(bodyKey, attachedStage.textFor(bodyKey), eBody, id);
                     if (bodyDesc->type == eDynamicBody)
                     {
-                        attachedStage.bufferRequestRigidBodyMassUpdate(bodyPath);
+                        attachedStage.bufferRequestRigidBodyMassUpdate(bodyKey);
                     }
                 }
 
             }
-            ICE_FREE(bodyDesc);
         }
 
         it++;
@@ -242,19 +278,23 @@ void createBodies(AttachedStage& attachedStage, BodyMap& bodyMap, BodyVector& ad
     bodyMap.clear();
 
     // Additional bodies
-    for (std::pair<SdfPath, BodyDescAndColliders>& ref : additonalBodies)
+    for (std::pair<omni::physics::parse::ObjectKey, BodyDescAndColliders>& ref : additonalBodies)
     {
         PhysxRigidBodyDesc* bodyDesc = ref.second.desc;
 
         // we should have only static bodies here
         if (bodyDesc->type == eStaticBody)
         {
-            const SdfPath& bodyPath = ref.first;
-            const ObjectId id = attachedStage.getPhysXPhysicsInterface()->createObject(attachedStage, bodyPath, *bodyDesc);
+            const omni::physics::parse::ObjectKey bodyKey = ref.first;
+            const ObjectId id = attachedStage.getPhysXPhysicsInterface()->createObject(attachedStage, bodyKey, *bodyDesc);
 
-            attachedStage.getObjectDatabase()->findOrCreateEntry(bodyPath, eBody, id);
+            // Guarded: findOrCreateEntry is backed by map::insert (no overwrite), so an entry
+            // once written as kInvalidObjectId can never be replaced (REQ-SIM-OBJECTDB-001 AC-2).
+            if (id != kInvalidObjectId)
+            {
+                attachedStage.getObjectDatabase()->findOrCreateEntry(bodyKey, attachedStage.textFor(bodyKey), eBody, id);
+            }
         }
-        ICE_FREE(bodyDesc);
     }
     additonalBodies.clear();
 }
@@ -288,35 +328,21 @@ void createJoints(AttachedStage& attachedStage, const JointVector& joints, bool 
             if ((!jointDesc.excludedFromArticulation) && jointDesc.jointEnabled)
             {
                 ObjectDb* objectDb = attachedStage.getObjectDatabase();
-                ObjectId link0Id = objectDb->findEntry(attachedStage.pathFor(jointDesc.body0), eArticulationLink);
+                ObjectId link0Id = objectDb->findEntry(jointDesc.body0, eArticulationLink);
                 if (link0Id != kInvalidObjectId)
                 {
-                    ObjectId link1Id = objectDb->findEntry(attachedStage.pathFor(jointDesc.body1), eArticulationLink);
+                    ObjectId link1Id = objectDb->findEntry(jointDesc.body1, eArticulationLink);
                     if (link1Id != kInvalidObjectId)
                     {
                         PhysXUsdPhysicsInterface* physInt = attachedStage.getPhysXPhysicsInterface();
                         physInt->recreateArticulationJoint(attachedStage, jointDesc, link0Id, link1Id);
-                        ICE_FREE_BASIC(&jointDesc);
                         skipJoint = true;
                     }
                 }
             }
         }
-        else
-        {
-            if (skipJoint)
-            {
-                ICE_FREE_BASIC(joints[i].desc);
-            }
-        }
-
         if (!skipJoint)
         {
-            if (joints[i].desc->jointFriction != 0.0)
-            {
-                CARB_LOG_WARN("Joint friction attribute is only applied for joints in articulations. (%s)",
-                              joints[i].path.GetText());
-            }
             if (joints[i].desc->type != eJointGear && joints[i].desc->type != eJointRackAndPinion)
             {
                 createJoint(attachedStage, joints[i].path, joints[i].desc);
@@ -345,74 +371,100 @@ void createMimicJoints(AttachedStage& attachedStage, MimicJointVector& mimicJoin
     }
 }
 
-void createDeformableBody(AttachedStage& attachedStage, PhysxDeformableBodyDesc* bodyDesc, SdfPath bodyPath)
+void createDeformableBody(AttachedStage& attachedStage, PhysxDeformableBodyDesc* bodyDesc, omni::physics::parse::ObjectKey bodyKey)
 {
     if (bodyDesc)
     {
         if (bodyDesc->type == eVolumeDeformableBody ||
             bodyDesc->type == eSurfaceDeformableBody)
         {
-            const ObjectId id = attachedStage.getPhysXPhysicsInterface()->createObject(attachedStage, bodyPath, *bodyDesc);
+            const ObjectId id = attachedStage.getPhysXPhysicsInterface()->createObject(attachedStage, bodyKey, *bodyDesc);
             // If PhysXUsdPhysicsInterface::setForceParseOnlySingleScene is used it may return kInvalidObjectId
             if (id != kInvalidObjectId)
             {
-                attachedStage.getObjectDatabase()->findOrCreateEntry(bodyPath, bodyDesc->type, id);
+                // The pathText overload also feeds PrimHierarchyStorage.
+                attachedStage.getObjectDatabase()->findOrCreateEntry(bodyKey, attachedStage.textFor(bodyKey), bodyDesc->type, id);
             }
         }
         ICE_FREE(bodyDesc);
     }
 }
 
-// Source-routed equivalent of common/utilities `canSceneBeProcessedByPhysX`
-// (no UsdPrim). PhysX processes a scene that carries PhysxSceneAPI, or that has
-// no applied API while PhysX is the default simulator, or whose applied APIs are
-// all in the allow-list.
-//
-// The applied-API list is the source's plain applied-schema set (the only
-// notion an arbitrary IPhysicsSource backend — e.g. ovstage — can offer; there
-// is no authored-vs-built-in distinction). This matches the legacy authored-only
-// read in practice: the only API the allow-list path inspects is the one
-// authored on a scene prim, and `UsdPhysicsScene` contributes no built-in API
-// schemas of its own, so its applied-schema set equals its authored set.
-bool canSceneBeProcessedByPhysXSource(const omni::physics::parse::IPhysicsSource& src,
-                                      omni::physics::parse::ObjectKey key, bool isDefaultSimulator)
+// Compose each joint's local pose (scaled to remove the body's own scale) with the body's
+// world matrix, then compare the two resulting world translations/rotations within tolerance.
+// Relies on the Gf/PhysX matrix-operand-order swap documented in MatrixTools.h.
+bool isJointBodyTransformEqual(const ::physx::PxMat44d& body0World, bool body0Valid,
+                                const ::physx::PxMat44d& body1World, bool body1Valid,
+                                const ::physx::PxVec3& localPose0Position, const ::physx::PxQuat& localPose0Orientation,
+                                const ::physx::PxVec3& localPose1Position, const ::physx::PxQuat& localPose1Orientation,
+                                double jointBodyTransformCheckTolerance,
+                                bool checkPosition, bool checkRotation,
+                                unsigned char axis)
 {
-    bool processScene = src.hasSchema(key, src.internToken(PhysxSchemaTokens->PhysxSceneAPI.GetString()));
-    static const char* const allowedList[] = { "PhysxSceneQuasistaticAPI", "MaterialBindingAPI",
-                                               "CollectionAPI", "VehicleContextAPI",
-                                               "NewtonPhysicsSceneAPI", "NewtonPhysicsXpbdSceneAPI",
-                                               "NewtonPhysicsKaminoSceneAPI" };
-    std::vector<std::string> apis;
-    src.forEachAppliedSchema(key, [&](omni::physics::parse::TokenId t)
-                             { apis.emplace_back(src.tokenToString(t)); });
-    if (apis.empty() && isDefaultSimulator)
-    {
-        processScene = true;
-    }
-    else if (!processScene && !apis.empty())
-    {
-        bool allowedApis = true;
-        for (const std::string& tokenString : apis)
+    auto getJointBodyPose = [](const ::physx::PxMat44d& bodyWorld, bool bodyValid,
+                                const ::physx::PxVec3& locPos, const ::physx::PxQuat& locRot) -> ::physx::PxTransform {
+        if (!bodyValid)
         {
-            bool allowed = false;
-            for (const char* allowedToken : allowedList)
+            return ::physx::PxTransform(locPos, locRot);
+        }
+        const ::physx::PxVec3 scale = getScale(bodyWorld);
+        const ::physx::PxVec3 scaledPos(locPos.x / scale.x, locPos.y / scale.y, locPos.z / scale.z);
+        const ::physx::PxMat44d localPose = makeMatrix(::physx::PxTransform(scaledPos, locRot));
+        // Gf composes local*bodyWorld (row-vector convention: local applied first); the
+        // PhysX (column-vector) equivalent of the same element-copied matrices swaps the
+        // operand order, so bodyWorld*localPose still applies localPose first.
+        return toTransform(bodyWorld * localPose);
+    };
+
+    const ::physx::PxTransform body0tm = getJointBodyPose(body0World, body0Valid, localPose0Position, localPose0Orientation);
+    const ::physx::PxTransform body1tm = getJointBodyPose(body1World, body1Valid, localPose1Position, localPose1Orientation);
+
+    const double eps = jointBodyTransformCheckTolerance;
+
+    if (checkPosition)
+    {
+        if (axis < 3)
+        {
+            const ::physx::PxVec3 tran = body0tm.p - body1tm.p;
+            static const unsigned char axes[3][2] = { { 1, 2 }, { 0, 2 }, { 0, 1 } };
+            const double a1 = tran[axes[axis][0]];
+            const double a2 = tran[axes[axis][1]];
+            if (!(fabs(a1) < eps && fabs(a2) < eps))
             {
-                if (tokenString.find(allowedToken) != std::string::npos)
-                {
-                    allowed = true;
-                    break;
-                }
-            }
-            if (!allowed)
-            {
-                allowedApis = false;
-                break;
+                return false;
             }
         }
-        if (allowedApis)
-            processScene = true;
+        else
+        {
+            const ::physx::PxVec3 tran = body0tm.p - body1tm.p;
+            if (!(tran.magnitudeSquared() <= eps * eps))
+            {
+                return false;
+            }
+        }
     }
-    return processScene;
+
+    if (checkRotation)
+    {
+        const ::physx::PxQuat& rot0 = body0tm.q;
+        const ::physx::PxQuat& rot1 = body1tm.q;
+        // Double-cover-aware closeness (GfIsClose(GfQuatd,GfQuatd) semantics): compare
+        // real+imaginary parts against +rot1 OR -rot1, both scalar-eps on the real part
+        // and distance-eps on the imaginary part.
+        auto imagClose = [eps](const ::physx::PxQuat& a, const ::physx::PxQuat& b) {
+            const ::physx::PxVec3 d(a.x - b.x, a.y - b.y, a.z - b.z);
+            return d.magnitudeSquared() <= eps * eps;
+        };
+        const bool same = fabs(rot0.w - rot1.w) < eps && imagClose(rot0, rot1);
+        const bool opposite = fabs(rot0.w + rot1.w) < eps &&
+                               imagClose(rot0, ::physx::PxQuat(-rot1.x, -rot1.y, -rot1.z, -rot1.w));
+        if (!(same || opposite))
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 void refreshAutoDeformableAttachments(AttachedStage& attachedStage,
@@ -420,53 +472,124 @@ void refreshAutoDeformableAttachments(AttachedStage& attachedStage,
 {
     // Child prims (VtxXformAttachment, etc.) live under the parent Scope prim
     // that carries AutoDeformableAttachmentAPI. Collect unique parents first —
-    // applied-API gate via the source (no UsdPrim).
+    // applied-API gate via the source (no UsdPrim). Parent lookup routes
+    // through IPhysicsSource::getParent rather than SdfPath::GetParentPath
+    // (ADR-0019 decision 2).
     const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
-    SdfPathSet autoAttachmentPaths;
+    std::unordered_set<omni::physics::parse::ObjectKey, omni::physics::parse::ObjectKey::Hash> autoAttachmentKeys;
     if (src)
     {
-        const omni::physics::parse::TokenId autoApiTok =
-            src->internToken(PhysxSchemaTokens->PhysxAutoDeformableAttachmentAPI.GetString());
+        const omni::physics::parse::KnownTokens& tok = attachedStage.getKnownTokens();
+        const omni::physics::parse::TokenId autoApiTok = tok.physxAutoDeformableAttachmentAPI;
         for (const auto& attachment : attachments)
         {
-            const SdfPath parentPath = attachment.path.GetParentPath();
-            const omni::physics::parse::ObjectKey parentKey = attachedStage.keyFor(parentPath);
+            const omni::physics::parse::ObjectKey attachmentKey = attachment.path;
+            const omni::physics::parse::ObjectKey parentKey = src->getParent(attachmentKey);
             if (src->exists(parentKey) && src->hasSchema(parentKey, autoApiTok))
             {
-                autoAttachmentPaths.insert(parentPath);
+                autoAttachmentKeys.insert(parentKey);
             }
+        }
+        // In-memory layouts (attach that cannot author sub-prims) name their parent directly.
+        for (const auto& layout : attachedStage.getGeneratedAutoAttachmentLayouts())
+        {
+            if (src->exists(layout.first) && src->hasSchema(layout.first, autoApiTok))
+                autoAttachmentKeys.insert(layout.first);
         }
     }
 
-    auto invalidateDescsUnderPath = [](auto& vec, const SdfPath& parentPath)
+    // Ancestry test routes through AttachedStage::isAncestorOrSelf (source
+    // parent-chain walk) rather than SdfPath::HasPrefix (ADR-0019 decision 2).
+    auto invalidateDescsUnderKey = [&attachedStage](auto& vec, omni::physics::parse::ObjectKey parentKey)
     {
         for (auto& entry : vec)
         {
-            if (entry.path.HasPrefix(parentPath))
+            if (attachedStage.isAncestorOrSelf(parentKey, entry.path))
             {
                 ICE_FREE(entry.desc);
             }
         }
     };
 
-    for (const SdfPath& autoAttachmentPath : autoAttachmentPaths)
+    for (const omni::physics::parse::ObjectKey autoAttachmentKey : autoAttachmentKeys)
     {
         bool attachmentDataRecomputed = false;
-        if (!omni::physx::updateAutoDeformableAttachment(autoAttachmentPath, attachmentDataRecomputed))
+        if (!omni::physx::updateAutoDeformableAttachment(attachedStage, autoAttachmentKey, attachmentDataRecomputed))
         {
             CARB_LOG_WARN("refreshAutoDeformableAttachments: updateAutoDeformableAttachment failed for %s",
-                autoAttachmentPath.GetText());
+                attachedStage.textFor(autoAttachmentKey));
         }
 
         // Only invalidate pre-parsed descs if attachment data was actually recomputed
         if (attachmentDataRecomputed)
         {
-            invalidateDescsUnderPath(attachments, autoAttachmentPath);
-            invalidateDescsUnderPath(collisionFilters, autoAttachmentPath);
+            invalidateDescsUnderKey(attachments, autoAttachmentKey);
+            invalidateDescsUnderKey(collisionFilters, autoAttachmentKey);
         }
     }
 }
 
+// Auto-attachment prims whose sub-prims cannot be authored (no live USD stage, i.e. an ovstage
+// attach) get in-memory generated children instead of nothing. Prims that already carry
+// authored sub-prims (scenes generated elsewhere) keep those.
+void generateAutoDeformableAttachmentLayouts(AttachedStage& attachedStage,
+    const KeySet& autoAttachmentKeys,
+    DeformableAttachmentVector& attachments, DeformableCollisionFilterVector& collisionFilters)
+{
+    if (autoAttachmentKeys.empty() || omni::physx::attachmentauthoring::canAuthor(attachedStage))
+        return;
+    const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
+    if (!src)
+        return;
+
+    // authored sub-prim count per parent
+    std::unordered_map<omni::physics::parse::ObjectKey, uint32_t, omni::physics::parse::ObjectKey::Hash> authoredParents;
+    for (const auto& attachment : attachments)
+        ++authoredParents[src->canonicalKey(src->getParent(attachment.path))];
+    for (const auto& filter : collisionFilters)
+        ++authoredParents[src->canonicalKey(src->getParent(filter.path))];
+
+    for (const omni::physics::parse::ObjectKey autoAttachmentKey : autoAttachmentKeys)
+    {
+        auto authored = authoredParents.find(src->canonicalKey(autoAttachmentKey));
+        if (authored != authoredParents.end())
+        {
+            // Authored children win, but an incomplete set (interrupted or older producer) is
+            // not completed here, so make the gap visible.
+            const uint32_t expected = omni::physx::expectedAutoDeformableAttachmentSubPrimCount(attachedStage, autoAttachmentKey);
+            if (expected != 0 && expected != authored->second)
+            {
+                CARB_LOG_WARN("Auto deformable attachment %s carries %u authored sub prims where %u are expected; "
+                              "the missing ones are not generated, re-create the attachment to refresh them",
+                    attachedStage.textFor(autoAttachmentKey), authored->second, expected);
+            }
+            continue;
+        }
+        if (!omni::physx::buildGeneratedAutoDeformableAttachmentLayout(attachedStage, autoAttachmentKey))
+            continue;
+        const GeneratedAutoAttachmentLayout* layout = attachedStage.getGeneratedAutoAttachmentLayout(autoAttachmentKey);
+        for (const GeneratedAutoAttachmentChild& child : layout->children)
+        {
+            if (child.type == eDeformableCollisionFilter)
+            {
+                DeformableCollisionFilterDescAndPath entry;
+                entry.path = child.key;
+                entry.desc = omni::physx::makeGeneratedDeformableCollisionFilterDesc(child);
+                collisionFilters.push_back(entry);
+            }
+            else
+            {
+                DeformableAttachmentDescAndPath entry;
+                entry.path = child.key;
+                entry.desc = omni::physx::makeGeneratedDeformableAttachmentDesc(child);
+                attachments.push_back(entry);
+            }
+        }
+    }
+}
+
+// When a desc is null (invalidated by refreshAutoDeformableAttachments above), does a
+// single-prim scanStage() rescan to rebuild it.
 void createDeformableAttachments(AttachedStage& attachedStage, DeformableAttachmentVector& attachments)
 {
     ObjectDb* objectDb = attachedStage.getObjectDatabase();
@@ -478,27 +601,31 @@ void createDeformableAttachments(AttachedStage& attachedStage, DeformableAttachm
     {
         if (attachments[i].desc == nullptr)
         {
+            // A generated (in-memory) child has no prim to rescan; rebuild its desc from the layout.
+            if (const GeneratedAutoAttachmentChild* generated = attachedStage.findGeneratedAutoAttachmentChild(attachments[i].path))
+                attachments[i].desc = omni::physx::makeGeneratedDeformableAttachmentDesc(*generated);
+        }
+        if (attachments[i].desc == nullptr)
+        {
             // Single-prim scanStage produces a typed parse-lib desc;
             // parseDeformableAttachment translates it into the
-            // consumer-side usdparser::PhysxDeformableAttachmentDesc
-            // (which keeps the SdfPath src0/src1 vocabulary).
+            // consumer-side usdparser::PhysxDeformableAttachmentDesc.
             const omni::physics::parse::IPhysicsSource* dsrc = attachedStage.getSource();
-            if (!dsrc || !dsrc->exists(attachedStage.keyFor(attachments[i].path)))
+            if (!dsrc || !dsrc->exists(attachments[i].path))
                 return;
 
             // Subtree scan rooted at the attachment prim (default predicate, no
             // instance proxies), routed through the active scan backend.
-            const std::vector<SdfPath> scanRoots{ attachments[i].path };
-            static const std::unordered_set<SdfPath, SdfPath::Hash> kNoExclude;
-            omni::physics::parse::ScanOptions scanOptions;
+            const std::vector<std::string> scanRoots{ std::string(attachedStage.textViewFor(attachments[i].path)) };
+            static const std::vector<std::string> kNoExclude;
+            omni::physics::parse::ScanOptions scanOptions = attachedStage.descriptorScanOptions();
             scanOptions.descendantScope = omni::physics::parse::DescendantScope::eActive;
-            omni::physics::usd::ScannedStage scanned = omni::physics::usd::scanStage(
-                attachedStage.attachTarget(), scanRoots, kNoExclude,
-                omni::physx::usdparser::iceDescriptorAllocator(), scanOptions);
+            omni::physics::parse::ScannedStage scanned = attachedStage.scanStage(scanRoots, kNoExclude, scanOptions,
+                omni::physx::usdparser::iceDescriptorAllocator());
             if (scanned.attachments.empty())
                 return;
 
-            attachments[i].desc = parseDeformableAttachment(scanned, *scanned.attachments[0]);
+            attachments[i].desc = parseDeformableAttachment(scanned, *scanned.attachments[0], attachedStage);
             if (attachments[i].desc == nullptr)
                 return;
         }
@@ -506,7 +633,10 @@ void createDeformableAttachments(AttachedStage& attachedStage, DeformableAttachm
         id = physInt->createObject(attachedStage, attachments[i].path, *attachments[i].desc);
 
         if (id != kInvalidObjectId)
-            objectDb->findOrCreateEntry(attachments[i].path, attachments[i].desc->type, id);
+            // The pathText overload also feeds PrimHierarchyStorage, needed for cascade-delete
+            // when an ancestor prim is removed.
+            objectDb->findOrCreateEntry(
+                attachments[i].path, attachedStage.textViewFor(attachments[i].path), attachments[i].desc->type, id);
 
         ICE_FREE(attachments[i].desc);
     }
@@ -523,26 +653,31 @@ void createDeformableCollisionFilters(AttachedStage& attachedStage, DeformableCo
     {
         if (collisionFilters[i].desc == nullptr)
         {
+            if (const GeneratedAutoAttachmentChild* generated = attachedStage.findGeneratedAutoAttachmentChild(collisionFilters[i].path))
+                collisionFilters[i].desc = omni::physx::makeGeneratedDeformableCollisionFilterDesc(*generated);
+        }
+        if (collisionFilters[i].desc == nullptr)
+        {
             // Single-prim scanStage; same pattern as the attachment
             // branch above.
             const omni::physics::parse::IPhysicsSource* dsrc = attachedStage.getSource();
-            if (!dsrc || !dsrc->exists(attachedStage.keyFor(collisionFilters[i].path)))
+            if (!dsrc || !dsrc->exists(collisionFilters[i].path))
                 return;
 
             // Subtree scan rooted at the filter prim (default predicate, no instance
             // proxies), routed through the active scan backend.
-            const std::vector<SdfPath> scanRoots{ collisionFilters[i].path };
-            static const std::unordered_set<SdfPath, SdfPath::Hash> kNoExclude;
-            omni::physics::parse::ScanOptions scanOptions;
+            const std::vector<std::string> scanRoots{ std::string(
+                attachedStage.textViewFor(collisionFilters[i].path)) };
+            static const std::vector<std::string> kNoExclude;
+            omni::physics::parse::ScanOptions scanOptions = attachedStage.descriptorScanOptions();
             scanOptions.descendantScope = omni::physics::parse::DescendantScope::eActive;
-            omni::physics::usd::ScannedStage scanned = omni::physics::usd::scanStage(
-                attachedStage.attachTarget(), scanRoots, kNoExclude,
-                omni::physx::usdparser::iceDescriptorAllocator(), scanOptions);
+            omni::physics::parse::ScannedStage scanned = attachedStage.scanStage(scanRoots, kNoExclude, scanOptions,
+                omni::physx::usdparser::iceDescriptorAllocator());
             if (scanned.deformableCollisionFilters.empty())
                 return;
 
             collisionFilters[i].desc =
-                parseDeformableCollisionFilter(scanned, *scanned.deformableCollisionFilters[0]);
+                parseDeformableCollisionFilter(scanned, *scanned.deformableCollisionFilters[0], attachedStage);
             if (collisionFilters[i].desc == nullptr)
                 return;
         }
@@ -550,24 +685,27 @@ void createDeformableCollisionFilters(AttachedStage& attachedStage, DeformableCo
         id = physInt->createObject(attachedStage, collisionFilters[i].path, *collisionFilters[i].desc);
 
         if (id != kInvalidObjectId)
-            objectDb->findOrCreateEntry(collisionFilters[i].path, collisionFilters[i].desc->type, id);
+            // The pathText overload, as in createDeformableAttachments above.
+            objectDb->findOrCreateEntry(collisionFilters[i].path,
+                                        attachedStage.textViewFor(collisionFilters[i].path),
+                                        collisionFilters[i].desc->type, id);
 
         ICE_FREE(collisionFilters[i].desc);
     }
 }
 
-void createFilteredPairs(AttachedStage& attachedStage, const CollisionPairVector& pairsVector, const SdfPathVector& filteredPairsPaths)
+void createFilteredPairs(AttachedStage& attachedStage, const CollisionPairVector& pairsVector, const KeySet& filteredPairsPaths)
 {
     ObjectDb& objectDb = *attachedStage.getObjectDatabase();
-    std::unordered_map<SdfPath, FilteredPairDesc, SdfPath::Hash> blockDescMap;
-    for (const SdfPath& path : filteredPairsPaths)
+    std::unordered_map<omni::physics::parse::ObjectKey, FilteredPairDesc, omni::physics::parse::ObjectKey::Hash> blockDescMap;
+    for (const omni::physics::parse::ObjectKey key : filteredPairsPaths)
     {
-        blockDescMap[path] = FilteredPairDesc();
+        blockDescMap[key] = FilteredPairDesc();
     }
 
     for (size_t iPairs = pairsVector.size(); iPairs--;)
     {
-        const CollisionBlockPair& pair = pairsVector[iPairs];        
+        const CollisionBlockPair& pair = pairsVector[iPairs];
 
         FilteredPairDesc& blockDesc = blockDescMap[pair.first];
         const ObjectIdMap* entriesFirst = objectDb.getEntries(pair.first);
@@ -594,11 +732,11 @@ void createFilteredPairs(AttachedStage& attachedStage, const CollisionPairVector
                     // via the source (no UsdPrim), pruning a child's subtree once a
                     // body/shape pair is recorded there (mirrors PruneChildren).
                     src->forEachDescendantPruned(
-                        attachedStage.keyFor(pair.second),
+                        pair.second,
                         [&](omni::physics::parse::ObjectKey childKey) -> bool
                         {
                             bool pairFound = false;
-                            const ObjectIdMap* entriesSecond = objectDb.getEntries(attachedStage.pathFor(childKey));
+                            const ObjectIdMap* entriesSecond = objectDb.getEntries(childKey);
                             if (entriesSecond && !entriesSecond->empty())
                             {
                                 auto itSecond = entriesSecond->begin();
@@ -633,7 +771,70 @@ void createFilteredPairs(AttachedStage& attachedStage, const CollisionPairVector
     }
 }
 
-ObjectId createObject(AttachedStage& attachedStage, const SdfPath& primKey, PhysxObjectDesc* desc,
+// Default-material descriptors and quasistatic actors complete a parsed scene
+// descriptor from the source, alike for a load and for a compiled-cache hit.
+void completeSceneDesc(AttachedStage& attachedStage, omni::physics::parse::ObjectKey sceneKey, PhysxSceneDesc& desc)
+{
+    const omni::physics::parse::IPhysicsSource* sceneSource = attachedStage.getSource();
+    if (!sceneSource)
+        return;
+    const omni::physics::parse::IPhysicsSource& source = *sceneSource;
+    // Scene-level nested material descriptor defaults + binding overlay.
+    // Mirrors legacy `parseSceneDesc` at usdLoad/Scene.cpp:108-138:
+    //   1. `setToDefault` each nested material desc (units-aware defaults
+    //      — youngsModulus needs metersPerUnit/kilogramsPerUnit, surface
+    //      thickness needs metersPerUnit).  The parse-lib `setToDefault`
+    //      for PhysxSceneDesc doesn't touch the nested descs (SourceUnits
+    //      lacks kilogramsPerUnit; the deformable defaults need it), so
+    //      we re-apply the USD-side defaults here at the consumer
+    //      boundary.  Without this, scene->defaultDeformableMaterialDesc
+    //      ships with youngsModulus=0 — `createDeformableVolumeMaterial`
+    //      makes a degenerate material and modified-rest-shape volume
+    //      deformables collapse (TestDeformables.cpp:606).
+    //   2. Overlay each nested desc from the scene prim's material
+    //      binding (if any) via the source-backed `parse*ForPrim` helpers.
+    //      These no-op when the source has no bound material key.  This replaces
+    //      the binding overlay that `StageScan::emitScene` does — the
+    //      consumer's overlay applies to a properly-defaulted desc and
+    //      uses legacy `parseMaterialDescInt` paths.
+    setToDefault(desc.defaultMaterialDesc);
+    // Units-aware deformable-material defaults from the source units
+    // (backend-agnostic; no USD stage needed under ovstage).
+    const omni::physics::parse::SourceUnits sceneUnits = source.getSourceUnits();
+    setToDefault(sceneUnits, desc.defaultDeformableMaterialDesc);
+    setToDefault(sceneUnits, desc.defaultSurfaceDeformableMaterialDesc);
+    setToDefault(desc.defaultPBDMaterialDesc);
+    // Scene's bound default material via the source (no UsdPrim / UsdStage).
+    const omni::physics::parse::ObjectKey sceneMatKey = source.getMaterialBinding(sceneKey);
+    parseMaterialForPrim(attachedStage, sceneMatKey, desc.defaultMaterialDesc);
+    parseDeformableMaterialForPrim(attachedStage, sceneMatKey, desc.defaultDeformableMaterialDesc);
+    parseSurfaceDeformableMaterialForPrim(attachedStage, sceneMatKey, desc.defaultSurfaceDeformableMaterialDesc);
+    parsePBDMaterialForPrim(attachedStage, sceneMatKey, desc.defaultPBDMaterialDesc);
+
+    // PhysxSceneQuasistaticAPI: resolve the actors collection at
+    // the consumer (USD-side work; parse-lib has no UsdCollectionAPI
+    // dependency).  Mirrors `parseSceneDesc` at usdLoad/Scene.cpp:
+    // 288-310 — when the includes rel has targets, compute the
+    // membership and insert each resolved path as an attachedStage
+    // key into `desc.quasistaticActors`.
+    {
+        // resolveCollection performs the include/exclude membership walk
+        // (instance proxies included) internally and returns persistent-source
+        // ObjectKeys, replacing the UsdCollectionAPI::ComputeIncludedPaths path.
+        const omni::physics::parse::KnownTokens& tok = attachedStage.getKnownTokens();
+        if (source.hasSchema(sceneKey, tok.physxSceneQuasistaticAPI))
+        {
+            std::vector<omni::physics::parse::ObjectKey> members;
+            source.resolveCollection(sceneKey, source.internToken("quasistaticactors"), members);
+            desc.quasistaticActors.clear();
+            desc.quasistaticActors.reserve(members.size());
+            for (const omni::physics::parse::ObjectKey& k : members)
+                desc.quasistaticActors.insert(k);
+        }
+    }
+}
+
+ObjectId createObject(AttachedStage& attachedStage, omni::physics::parse::ObjectKey primKey, PhysxObjectDesc* desc,
     PhysXUsdPhysicsInterface& physicsInterface, ObjectDb& objectDb)
 {
     if (!desc)
@@ -641,11 +842,13 @@ ObjectId createObject(AttachedStage& attachedStage, const SdfPath& primKey, Phys
 
     const ObjectId id = physicsInterface.createObject(attachedStage, primKey, *desc);
     if (id != kInvalidObjectId)
-        objectDb.findOrCreateEntry(primKey, desc->type, id);
+        // The pathText overload, not the bare-key one: objects created here (e.g. materials)
+        // are still looked up by SdfPath elsewhere, so mPathMap must stay populated too.
+        objectDb.findOrCreateEntry(primKey, attachedStage.textFor(primKey), desc->type, id);
     return id;
 }
 
-ObjectId createObject(AttachedStage& attachedStage, const SdfPath& primKey, PhysxObjectDesc* desc, bool deleteDesc = true)
+ObjectId createObject(AttachedStage& attachedStage, omni::physics::parse::ObjectKey primKey, PhysxObjectDesc* desc, bool deleteDesc = true)
 {
     if (!desc)
         return kInvalidObjectId;
@@ -662,8 +865,7 @@ ObjectId createObject(AttachedStage& attachedStage, const SdfPath& primKey, Phys
 // data transform on already-resolved data — no UsdCollectionAPI calls
 // happen here.  See ADR-0006 and REQ-PARSE-COLGROUP-002.
 //
-// `beginIdx` / `endIdx` slice `scanned.collisionGroups` so the same
-// helper drives the serial path and the parallel-batched path.  Append
+// `beginIdx` / `endIdx` select the groups to invert in source walk order. Append
 // semantics match the legacy `updateCollisionCollection` exactly: a
 // re-invocation on the same group adds duplicate entries (callers
 // either consult `mCollectionsPopulated` to skip re-entry or, in the
@@ -672,31 +874,36 @@ ObjectId createObject(AttachedStage& attachedStage, const SdfPath& primKey, Phys
 //
 // @implements REQ-PARSE-COLGROUP-002
 // @covers AC-4 AC-5
-void invertCollisionGroupMembers(const omni::physics::usd::ScannedStage& scanned,
+void invertCollisionGroupMembers(const AttachedStage& attachedStage,
+                                 const omni::physics::parse::ScannedStage& scanned,
                                  size_t beginIdx, size_t endIdx,
                                  CollisionGroupsMap& cgMap)
 {
+    // Attachment scan contexts share the owner's key namespace; independent
+    // scans translate native identities through the destination backend.
     for (size_t i = beginIdx; i < endIdx; ++i)
     {
         const auto& group = scanned.collisionGroups[i];
-        const SdfPath groupPath = scanned.pathFor(group->primKey);
-        for (const omni::physics::parse::ObjectKey member : group->sourceMembers)
-        {
-            const SdfPath memberPath = scanned.pathFor(member);
-            cgMap[memberPath].push_back(groupPath);
-        }
+        const omni::physics::parse::ObjectKey groupKey =
+            attachedStage.keyFor(scanned.source().sourceKeyToString(group->primKey));
+        const bool sameSource = attachedStage.getSource() == scanned.sourcePtr();
+        const std::vector<omni::physics::parse::ObjectKey> remapped = sameSource ?
+            std::vector<omni::physics::parse::ObjectKey>{} :
+            attachedStage.getSource()->remapKeysFrom(scanned.source(), group->sourceMembers);
+        const std::vector<omni::physics::parse::ObjectKey>& members = sameSource ? group->sourceMembers : remapped;
+        for (const omni::physics::parse::ObjectKey memberKey : members)
+            cgMap[memberKey].push_back(groupKey);
     }
 }
 
-void setupCollisionGroups(AttachedStage& attachedStage, const std::vector<SdfPath>& collisionGroupsPaths)
+void setupCollisionGroups(AttachedStage& attachedStage, const KeySet& collisionGroupsPaths)
 {
     const ObjectDb& db = *attachedStage.getObjectDatabase();
 
-    std::vector<SdfPath>::const_iterator it = collisionGroupsPaths.begin();
+    const omni::physics::parse::KnownTokens& tok = attachedStage.getKnownTokens();
 
-    while (it != collisionGroupsPaths.end())
+    for (const omni::physics::parse::ObjectKey collisionGroupKey : collisionGroupsPaths)
     {
-        const SdfPath& collisionGroupKey = (*it);
         const ObjectIdMap* map = db.getEntries(collisionGroupKey);
         CollisionGroupDesc desc;
         CARB_ASSERT(map);
@@ -708,20 +915,14 @@ void setupCollisionGroups(AttachedStage& attachedStage, const std::vector<SdfPat
             // physics:filteredGroups targets via the source (no UsdPhysicsCollisionGroup
             // handle). An absent relationship yields no targets, matching the prior
             // `if (GetFilteredGroupsRel())` gate.
-            SdfPathVector targets;
+            std::vector<omni::physics::parse::ObjectKey> targets;
             if (const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource())
             {
-                std::vector<omni::physics::parse::ObjectKey> filterKeys;
-                src->getRelationshipTargets(attachedStage.keyFor(collisionGroupKey),
-                                            src->internToken(UsdPhysicsTokens->physicsFilteredGroups.GetString()), filterKeys);
-                targets.reserve(filterKeys.size());
-                for (const omni::physics::parse::ObjectKey& k : filterKeys)
-                    targets.push_back(attachedStage.pathFor(k));
+                src->getRelationshipTargets(collisionGroupKey, tok.physicsFilteredGroups, targets);
             }
-            for (size_t iTargets = 0; iTargets < targets.size(); iTargets++)
+            for (const omni::physics::parse::ObjectKey filterKey : targets)
             {
-                const SdfPath& filterPath = targets[iTargets];
-                const ObjectIdMap* filterMap = db.getEntries(filterPath);
+                const ObjectIdMap* filterMap = db.getEntries(filterKey);
                 if (filterMap && !filterMap->empty())
                 {
                     ObjectIdMap::const_iterator itSecond = filterMap->begin();
@@ -733,9 +934,8 @@ void setupCollisionGroups(AttachedStage& attachedStage, const std::vector<SdfPat
                     }
                 }
             }
-            attachedStage.getPhysXPhysicsInterface()->setupCollisionGroup(collisionGroupKey, desc);
+            attachedStage.getPhysXPhysicsInterface()->setupCollisionGroup(attachedStage, collisionGroupKey, desc);
         }
-        it++;
     }
 }
 
@@ -745,11 +945,11 @@ void createParticleSystemsAndObjects(AttachedStage& attachedStage, const std::ve
     // create particle systems
     for (ParticleSystemDesc* particleSys : particleSysDescs)
     {
-        createObject(attachedStage, particleSys->systemPath, particleSys, false);
+        createObject(attachedStage, particleSys->systemKey, particleSys, false);
 
         for (size_t i = 0; i < particleSys->filteredCollisions.size(); i++)
         {
-            filteredPairs.push_back(std::make_pair(particleSys->systemPath, particleSys->filteredCollisions[i]));
+            filteredPairs.push_back(std::make_pair(particleSys->systemKey, particleSys->filteredCollisions[i]));
         }
         ICE_FREE(particleSys)
     }
@@ -757,24 +957,22 @@ void createParticleSystemsAndObjects(AttachedStage& attachedStage, const std::ve
     // create particles
     for (ParticleDesc* particleDesc : particleDescs)
     {
-        createObject(attachedStage, particleDesc->primPath, particleDesc);
+        createObject(attachedStage, particleDesc->primKey, particleDesc);
     }
 }
 
-omni::physx::usdparser::ObjectId findOrCreatePhysXObject(AttachedStage& attachedStage, const SdfPath& path, PhysxObjectDesc* objectDesc,
+omni::physx::usdparser::ObjectId findOrCreatePhysXObject(AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, PhysxObjectDesc* objectDesc,
     PhysXUsdPhysicsInterface& physicsInterface, ObjectDb& objectDb)
 {
-    ObjectId objectId = objectDb.findEntry(path, objectDesc->type);
+    ObjectId objectId = objectDb.findEntry(key, objectDesc->type);
     if (objectId != kInvalidObjectId)
         return objectId;
     else
-        return createObject(attachedStage, path, objectDesc, physicsInterface, objectDb);
+        return createObject(attachedStage, key, objectDesc, physicsInterface, objectDb);
 }
 
 void loadVehicle(AttachedStage& attachedStage, omni::physics::parse::ObjectKey primObjKey, VehicleComponentTracker& vehicleComponentTracker)
 {
-    const SdfPath primKey = attachedStage.pathFor(primObjKey);
-
     VehicleDesc vehicleDesc;
     VehicleControllerDesc vehicleControllerDesc;
     VehicleTankControllerDesc vehicleTankControllerDesc;
@@ -792,74 +990,74 @@ void loadVehicle(AttachedStage& attachedStage, omni::physics::parse::ObjectKey p
             if (vehicleDesc.drive->type == ObjectType::eVehicleDriveStandard)
             {
                 DriveStandardDesc* driveDesc = static_cast<DriveStandardDesc*>(vehicleDesc.drive);
-                driveDesc->engineId = findOrCreatePhysXObject(attachedStage, driveDesc->engine->path, driveDesc->engine,
+                driveDesc->engineId = findOrCreatePhysXObject(attachedStage, driveDesc->engine->key, driveDesc->engine,
                     physicsInterface, objectDb);
             }
             else
             {
                 CARB_ASSERT(vehicleDesc.drive->type == ObjectType::eVehicleDriveBasic);
                 DriveBasicDesc* driveDesc = static_cast<DriveBasicDesc*>(vehicleDesc.drive);
-                driveDesc->id = findOrCreatePhysXObject(attachedStage, driveDesc->path, driveDesc,
+                driveDesc->id = findOrCreatePhysXObject(attachedStage, driveDesc->key, driveDesc,
                     physicsInterface, objectDb);
             }
         }
 
         for (WheelAttachmentDesc& wheelAttachment : vehicleDesc.wheelAttachments)
         {
-            wheelAttachment.id = createObject(attachedStage, wheelAttachment.path, &wheelAttachment, physicsInterface, objectDb);
+            wheelAttachment.id = createObject(attachedStage, wheelAttachment.key, &wheelAttachment, physicsInterface, objectDb);
 
             WheelDesc* wheelDesc = wheelAttachment.wheel;
-            wheelAttachment.wheelId = findOrCreatePhysXObject(attachedStage, wheelDesc->path, wheelDesc,
+            wheelAttachment.wheelId = findOrCreatePhysXObject(attachedStage, wheelDesc->key, wheelDesc,
                 physicsInterface, objectDb);
 
             TireDesc* tireDesc = wheelAttachment.tire;
-            wheelAttachment.tireId = findOrCreatePhysXObject(attachedStage,tireDesc->path, tireDesc,
+            wheelAttachment.tireId = findOrCreatePhysXObject(attachedStage, tireDesc->key, tireDesc,
                 physicsInterface, objectDb);
 
             SuspensionDesc* suspDesc = wheelAttachment.suspension;
-            wheelAttachment.suspensionId = findOrCreatePhysXObject(attachedStage, suspDesc->path, suspDesc,
+            wheelAttachment.suspensionId = findOrCreatePhysXObject(attachedStage, suspDesc->key, suspDesc,
                 physicsInterface, objectDb);
 
-            if (!wheelAttachment.tire->frictionTablePath.IsEmpty())
+            if (wheelAttachment.tire->frictionTableKey.valid())
                 wheelAttachment.tire->frictionTableId = objectDb.findEntry(
-                    wheelAttachment.tire->frictionTablePath, eVehicleTireFrictionTable);
+                    wheelAttachment.tire->frictionTableKey, eVehicleTireFrictionTable);
             else
                 wheelAttachment.tire->frictionTableId = kInvalidObjectId;
 
-            if (!wheelAttachment.collisionGroupPath.IsEmpty())
+            if (wheelAttachment.collisionGroupKey.valid())
             {
                 wheelAttachment.collisionGroupId = objectDb.findEntry(
-                    wheelAttachment.collisionGroupPath, eCollisionGroup);
+                    wheelAttachment.collisionGroupKey, eCollisionGroup);
             }
             else
                 wheelAttachment.collisionGroupId = kInvalidObjectId;
 
             if (wheelAttachment.state & WheelAttachmentDesc::eHAS_SHAPE)
                 wheelAttachment.shapeId =
-                    objectDb.findEntry(wheelAttachment.shapePath, eShape);
+                    objectDb.findEntry(wheelAttachment.shapeKey, eShape);
             else
                 wheelAttachment.shapeId = kInvalidObjectId;
         }
 
         for (WheelControllerDesc& wheelController : vehicleDesc.wheelControllers)
         {
-            wheelController.id = createObject(attachedStage, wheelController.path, &wheelController, physicsInterface, objectDb);
+            wheelController.id = createObject(attachedStage, wheelController.key, &wheelController, physicsInterface, objectDb);
         }
 
-        vehicleDesc.bodyId = objectDb.findEntry(primKey, eBody);
+        vehicleDesc.bodyId = objectDb.findEntry(primObjKey, eBody);
 
-        ObjectId vehicleId = createObject(attachedStage, primKey, &vehicleDesc, physicsInterface, objectDb);
+        ObjectId vehicleId = createObject(attachedStage, primObjKey, &vehicleDesc, physicsInterface, objectDb);
 
         if (vehicleId != kInvalidObjectId)
         {
             if (vehicleControllerType != eUndefined)
             {
                 if (vehicleControllerType == eVehicleControllerStandard)
-                    createObject(attachedStage, primKey, &vehicleControllerDesc, physicsInterface, objectDb);
+                    createObject(attachedStage, primObjKey, &vehicleControllerDesc, physicsInterface, objectDb);
                 else
                 {
                     CARB_ASSERT(vehicleControllerType == eVehicleControllerTank);
-                    createObject(attachedStage, primKey, &vehicleTankControllerDesc, physicsInterface, objectDb);
+                    createObject(attachedStage, primObjKey, &vehicleTankControllerDesc, physicsInterface, objectDb);
                 }
             }
         }
@@ -869,7 +1067,7 @@ void loadVehicle(AttachedStage& attachedStage, omni::physics::parse::ObjectKey p
             {
                 if (wheelController.id != kInvalidObjectId)
                 {
-                    physicsInterface.releaseObject(attachedStage, wheelController.path, wheelController.id);
+                    physicsInterface.releaseObject(attachedStage, wheelController.key, wheelController.id);
                     wheelController.id = kInvalidObjectId;
                 }
             }
@@ -878,13 +1076,22 @@ void loadVehicle(AttachedStage& attachedStage, omni::physics::parse::ObjectKey p
             {
                 if (wheelAttachment.id != kInvalidObjectId)
                 {
-                    physicsInterface.releaseObject(attachedStage, wheelAttachment.path, wheelAttachment.id);
+                    physicsInterface.releaseObject(attachedStage, wheelAttachment.key, wheelAttachment.id);
                     wheelAttachment.id = kInvalidObjectId;
                 }
             }
         }
     }
 }
+
+// RAII IPhysicsDataWrite batch: closes on every early return, including exceptions.
+// `dw` may be null (no write sink), in which case both calls are skipped.
+struct DataWriteScope
+{
+    omni::physics::parse::IPhysicsDataWrite* dw;
+    explicit DataWriteScope(omni::physics::parse::IPhysicsDataWrite* d) : dw(d) { if (dw) dw->beginWrite(); }
+    ~DataWriteScope() { if (dw) dw->endWrite(); }
+};
 
 struct ParsingFlag
 {
@@ -905,30 +1112,25 @@ class PhysxUsdPhysicsListener
 public:
 
     PhysxUsdPhysicsListener(AttachedStage& attachedStage)
-        : mSceneFound(false), mNoValidScene(false), mNoPhysXScene(false), mCollectionsPopulated(false), mNumScenes(0), mAttachedStage(attachedStage)
+        : mSceneFound(false), mNoValidScene(false), mCollectionsPopulated(false), mNumScenes(0), mAttachedStage(attachedStage)
     {
-        mNoPhysXScene = !attachedStage.isPhysXDefaultSimulator();
     }
-
 
     // Per-prim side-effect walk.  scanStage's descriptor lists cover
     // most of the data, but a handful of per-prim parse-flag and
     // schema-API-flag side effects (CCT, PBD material, particles,
     // vehicles, force-API, contact reports) aren't part of the
     // descriptor model and must still be visited per-prim here.
-    // Source-driven replacement for the legacy PrimIterator re-walks. Visits
-    // every load object under each scan root (root inclusive) via IPhysicsSource,
-    // honoring the replicator exclude set; `visit` returns true to prune that
-    // object's subtree (mirrors PrimIterator::pruneChildren). The eActiveInstanced
-    // scope reproduces the UsdTraverseInstanceProxies walk the iterators used —
-    // no UsdPrim, no PrimIterator.
-    void forEachLoadObject(const std::vector<SdfPath>& scanRoots, const PathSet* excludePaths,
+    // Visits every load object under each scan root (root inclusive) via IPhysicsSource,
+    // honoring the replicator exclude set; `visit` returns true to prune that object's
+    // subtree. The eActiveInstanced scope reproduces the UsdTraverseInstanceProxies walk.
+    void forEachLoadObject(const std::vector<std::string>& scanRoots, const PathSet* excludePaths,
                            const std::function<bool(omni::physics::parse::ObjectKey)>& visit)
     {
         const omni::physics::parse::IPhysicsSource* src = mAttachedStage.getSource();
         if (!src)
             return;
-        for (const SdfPath& root : scanRoots)
+        for (const std::string& root : scanRoots)
         {
             src->forEachDescendantPruned(
                 mAttachedStage.keyFor(root),
@@ -936,16 +1138,22 @@ public:
                 {
                     if (excludePaths && !excludePaths->empty())
                     {
-                        const SdfPath keyPath = mAttachedStage.pathFor(key);
-                        // A root-prim exclude path is never pruned (see
-                        // PrimIteratorExcludeRange): the legacy stage->Traverse()
-                        // walk yielded the stage's root prim unchecked, so a
-                        // root-prim-level exclude (clone()'s derived env root,
-                        // e.g. "/World") was a no-op and the subtree was still
-                        // visited.  Keep the gather walk consistent with the
-                        // backend scan: only prune non-root-prim exclude paths.
-                        if (!keyPath.IsRootPrimPath() &&
-                            excludePaths->find(keyPath) != excludePaths->end())
+                        const std::string_view path = src->sourceKeyToString(key);
+                        bool excluded = false;
+                        for (const omni::physics::parse::ObjectKey excludedKey : *excludePaths)
+                        {
+                            const std::string_view rootPath = src->sourceKeyToString(excludedKey);
+                            if (!rootPath.empty() &&
+                                (rootPath == "/" || rootPath.find('/', 1) != std::string_view::npos) &&
+                                (rootPath == "/" || path == rootPath ||
+                                (path.size() > rootPath.size() && path.substr(0, rootPath.size()) == rootPath &&
+                                 path[rootPath.size()] == '/')))
+                            {
+                                excluded = true;
+                                break;
+                            }
+                        }
+                        if (excluded)
                             return true; // skip the excluded prim and prune its subtree
                     }
                     return visit(key);
@@ -954,18 +1162,124 @@ public:
         }
     }
 
-    void gatherPerPrimSideEffects(const std::vector<SdfPath>& scanRoots, const PathSet* excludePaths)
+    // Applied-API side effects that the SCANNED lists do not carry.
+    //
+    // gatherScannedSideEffects() reconstructs its side effects from ScannedStage's
+    // typed descriptor lists (shapes, bodies, articulations, vehicles, particles,
+    // ccts). PhysxForceAPI and PhysxContactReportAPI have NO descriptor list in the
+    // parse library at all, so nothing on the scanned path can observe them and both
+    // were silently dropped for every non-USD source: no PhysxForceDesc was ever
+    // built, so ForceAPI forces were never applied under ovstage.
+    //
+    // They are recovered here with the same source-routed applied-schema walk the USD
+    // path uses. This is a targeted sweep, not the full gatherPerPrimSideEffects: the
+    // other branches there are already covered by the scanned lists and running them
+    // twice would double-register.
+    void gatherSourceOnlySideEffects(const std::vector<std::string>& scanRoots, const PathSet* excludePaths)
     {
-        static const TfToken gCctAPI("PhysxCharacterControllerAPI");
-        static const TfToken gParticleSetAPI("PhysxParticleSetAPI");
-        static const TfToken gParticleSamplingAPI("PhysxParticleSamplingAPI");
-        static const TfToken gVehicleAPI("PhysxVehicleAPI");
-        static const TfToken gVehicleContextAPI("PhysxVehicleContextAPI");
-        static const TfToken gCollisionAPIToken("PhysicsCollisionAPI");
-        static const TfToken gFilteredPairsAPIToken("PhysicsFilteredPairsAPI");
-        static const TfToken gForceAPIToken("PhysxForceAPI");
-        static const TfToken gContactReportAPIToken("PhysxContactReportAPI");
+        const omni::physics::parse::IPhysicsSource* src = mAttachedStage.getSource();
+        if (!src)
+            return;
 
+        ObjectDb* objectDb = mAttachedStage.getObjectDatabase();
+        if (!objectDb)
+            return;
+
+        // Intern the two names once. TokenId compare is an integer compare
+        // against the source's own intern table.
+        const omni::physics::parse::TokenId forceApiId = src->internToken("PhysxForceAPI");
+        const omni::physics::parse::TokenId contactReportApiId = src->internToken("PhysxContactReportAPI");
+        // Same story for the auto-attachment prims: no descriptor list carries them, and the
+        // in-memory sub-prim generation needs the set (REQ-SIM-AUTOATTACH-001 AC-2).
+        const omni::physics::parse::TokenId autoAttachmentApiId = src->internToken("PhysxAutoDeformableAttachmentAPI");
+        if (!forceApiId.valid() && !contactReportApiId.valid() && !autoAttachmentApiId.valid())
+            return;
+
+        auto onForceKey = [&](omni::physics::parse::ObjectKey primObjKey)
+        {
+            objectDb->addSchemaAPI(primObjKey, SchemaAPIFlag::ePhysxForceAPI);
+            PhysxForceDesc* desc = parsePhysxForce(mAttachedStage, primObjKey);
+            mPhysxForceDescs.push_back(std::make_pair(primObjKey, desc));
+        };
+        auto onContactReportKey = [&](omni::physics::parse::ObjectKey primObjKey)
+        {
+            objectDb->addSchemaAPI(primObjKey, SchemaAPIFlag::eContactReportAPI);
+        };
+
+        // This is called on every attach with an external (e.g. ovstage) source,
+        // regardless of physics relevance -- so the O(stage size) route below
+        // (forEachLoadObject -> forEachAppliedSchema per prim) dominated attach
+        // cost on scenes with a lot of physics-irrelevant content (NVBug 6532970):
+        // it was the single largest contributor to ovstage attach time by a wide
+        // margin, well above anything in the ovstage scan/ordering path itself.
+        // ovstage exposes schema membership as an O(matching-prim-count) query
+        // (collectSchemaKeys, backed by a schema-membership cache or a single
+        // targeted query -- see OvstageSource::collectSchemaKeysRaw), so prefer
+        // that: it visits only prims that actually carry the schema, never the
+        // rest of the stage.
+        // collectSchemaKeys() reports EVERY prim on the stage that carries the
+        // schema, with no way to restrict to scanRoots / excludePaths. That is
+        // exactly right for a whole-stage initial load, but a scoped re-parse
+        // (loadPhysicsFromPrimitive passes the changed subtrees as scanRoots,
+        // AC-15) or a load with a non-empty exclude set would then re-apply
+        // PhysxForceAPI / PhysxContactReportAPI side effects for out-of-scope
+        // prims. Gate the fast path to an unscoped whole-stage scan with no
+        // excludes; anything scoped falls through to the scope-honoring
+        // forEachLoadObject walk below.
+        const bool wholeStageScan =
+            scanRoots.size() == 1 && scanRoots[0] == "/" && (!excludePaths || excludePaths->empty());
+        if (auto* ovstageSource =
+                wholeStageScan ? dynamic_cast<const omni::physics::ovstage::OvstageSource*>(src) : nullptr)
+        {
+            bool ok = true;
+            if (forceApiId.valid())
+            {
+                std::vector<omni::physics::parse::ObjectKey> keys;
+                ok = ok && ovstageSource->collectSchemaKeys(forceApiId, keys);
+                if (ok)
+                    for (const omni::physics::parse::ObjectKey key : keys)
+                        onForceKey(key);
+            }
+            if (ok && contactReportApiId.valid())
+            {
+                std::vector<omni::physics::parse::ObjectKey> keys;
+                ok = ovstageSource->collectSchemaKeys(contactReportApiId, keys);
+                if (ok)
+                    for (const omni::physics::parse::ObjectKey key : keys)
+                        onContactReportKey(key);
+            }
+            if (ok && autoAttachmentApiId.valid())
+            {
+                std::vector<omni::physics::parse::ObjectKey> keys;
+                ok = ovstageSource->collectSchemaKeys(autoAttachmentApiId, keys);
+                if (ok)
+                    mAutoDeformableAttachmentKeys.insert(keys.begin(), keys.end());
+            }
+            if (ok)
+                return;
+            // collectSchemaKeys() only reports failure when the source has no
+            // live instance/dict to query at all -- an attach-time inconsistency
+            // rather than an ordinary cache miss. Fall through to the walk below
+            // so results are still correct in that case.
+        }
+
+        forEachLoadObject(scanRoots, excludePaths, [&](omni::physics::parse::ObjectKey primObjKey) -> bool
+        {
+            src->forEachAppliedSchema(primObjKey, [&](omni::physics::parse::TokenId tok)
+            {
+                if (forceApiId.valid() && tok == forceApiId)
+                    onForceKey(primObjKey);
+                else if (contactReportApiId.valid() && tok == contactReportApiId)
+                    onContactReportKey(primObjKey);
+                else if (autoAttachmentApiId.valid() && tok == autoAttachmentApiId)
+                    mAutoDeformableAttachmentKeys.insert(primObjKey);
+            });
+            return false;
+        });
+    }
+
+    void gatherPerPrimSideEffects(const std::vector<std::string>& scanRoots, const PathSet* excludePaths)
+    {
         DeformableAttachmentHistoryMap& attHistory =
             mAttachedStage.getDeformableAttachmentHistoryMap();
         DeformableCollisionFilterHistoryMap& filterHistory =
@@ -973,39 +1287,46 @@ public:
 
         const omni::physics::parse::IPhysicsSource* src = mAttachedStage.getSource();
 
+        // Intern the known API names once (see gatherSourceOnlySideEffects): this
+        // walk runs over every prim on every attach, so round-tripping each
+        // applied schema through std::string into a TfToken just to compare
+        // against a handful of constants would put registry and string work on
+        // the hot path. TokenId compare is an integer compare.
+        omni::physics::parse::KnownTokens knownTok;
+        if (src)
+            knownTok.intern(*src);
+
         forEachLoadObject(scanRoots, excludePaths, [&](omni::physics::parse::ObjectKey primObjKey) -> bool
         {
-            const SdfPath primKey = mAttachedStage.pathFor(primObjKey);
             ObjectDb* objectDb = mAttachedStage.getObjectDatabase();
 
             // Applied-API list via the source (= prim.GetAppliedSchemas()).
             src->forEachAppliedSchema(primObjKey, [&](omni::physics::parse::TokenId tok)
             {
-                const TfToken api{ std::string(src->tokenToString(tok)) };
-                if (api == gCctAPI)
+                if (tok == knownTok.physxCharacterControllerAPI)
                 {
                     mParsingFlags |= ParsingFlag::eParseInternal;
                 }
-                else if (api == gForceAPIToken)
+                else if (tok == knownTok.physxForceAPI)
                 {
-                    objectDb->addSchemaAPI(primKey, SchemaAPIFlag::ePhysxForceAPI);
+                    objectDb->addSchemaAPI(primObjKey, SchemaAPIFlag::ePhysxForceAPI);
                     PhysxForceDesc* desc = parsePhysxForce(mAttachedStage, primObjKey);
-                    mPhysxForceDescs.push_back(std::make_pair(primKey, desc));
+                    mPhysxForceDescs.push_back(std::make_pair(primObjKey, desc));
                 }
-                else if (api == gFilteredPairsAPIToken)
+                else if (tok == knownTok.physicsFilteredPairsAPI)
                 {
-                    mFilteredPairsPaths.push_back(primKey);
-                    objectDb->addSchemaAPI(primKey, SchemaAPIFlag::eFilteredPairsAPI);
+                    mFilteredPairsPaths.insert(primObjKey);
+                    objectDb->addSchemaAPI(primObjKey, SchemaAPIFlag::eFilteredPairsAPI);
                 }
-                else if (api == gParticleSetAPI || api == gParticleSamplingAPI)
+                else if (tok == knownTok.physxParticleSetAPI || tok == knownTok.physxParticleSamplingAPI)
                 {
                     mParsingFlags |= ParsingFlag::eParseParticles;
                 }
-                else if (api == gVehicleAPI)
+                else if (tok == knownTok.physxVehicleAPI)
                 {
                     mParsingFlags |= ParsingFlag::eParseVehicles;
                 }
-                else if (api == gVehicleContextAPI)
+                else if (tok == knownTok.physxVehicleContextAPI)
                 {
                     // Vehicle context parsing moved into the native
                     // walker in 7A.1 (ADR-0008); the descriptor flows
@@ -1014,33 +1335,37 @@ public:
                     // creation block runs.
                     mParsingFlags |= ParsingFlag::eParseVehicles;
                 }
-                else if (api == gCollisionAPIToken)
+                else if (tok == knownTok.physxAutoDeformableAttachmentAPI)
                 {
-                    objectDb->addSchemaAPI(primKey, SchemaAPIFlag::eCollisionAPI);
+                    mAutoDeformableAttachmentKeys.insert(primObjKey);
                 }
-                else if (api == gContactReportAPIToken)
+                else if (tok == knownTok.physicsCollisionAPI)
                 {
-                    objectDb->addSchemaAPI(primKey, SchemaAPIFlag::eContactReportAPI);
+                    objectDb->addSchemaAPI(primObjKey, SchemaAPIFlag::eCollisionAPI);
+                }
+                else if (tok == knownTok.physxContactReportAPI)
+                {
+                    objectDb->addSchemaAPI(primObjKey, SchemaAPIFlag::eContactReportAPI);
                 }
             });
 
-            if (src->isA(primObjKey, schemaTypeToken<UsdGeomPointInstancer>(*src)))
+            if (src->isA(primObjKey, knownTok.pointInstancerType))
             {
                 mParsingFlags |= ParsingFlag::eParseParticles;
             }
-            else if (src->isA(primObjKey, schemaTypeToken<PhysxSchemaPhysxParticleSystem>(*src)))
+            else if (src->isA(primObjKey, knownTok.physxParticleSystemType))
             {
                 mParsingFlags |= ParsingFlag::eParseParticles;
             }
-            else if (src->isA(primObjKey, schemaTypeToken<PhysxSchemaPhysxPhysicsJointInstancer>(*src)))
+            else if (src->isA(primObjKey, knownTok.physxPhysicsJointInstancerType))
             {
                 mParsingFlags |= ParsingFlag::eParseParticles;
             }
-            else if (src->isA(primObjKey, schemaTypeToken<UsdPhysicsCollisionGroup>(*src)))
+            else if (src->isA(primObjKey, knownTok.physicsCollisionGroupType))
             {
-                mCollisionGroupsPrims.push_back(primKey);
+                mCollisionGroupsPrims.insert(primObjKey);
             }
-            else if (src->isA(primObjKey, schemaTypeToken<PhysxSchemaPhysxVehicleTireFrictionTable>(*src)))
+            else if (src->isA(primObjKey, knownTok.physxVehicleTireFrictionTableType))
             {
                 // Tire friction table parsing moved into the native
                 // walker in 7A.1 (ADR-0008); the descriptor flows
@@ -1052,8 +1377,8 @@ public:
             // the deleted parsePrim block — replays history entries
             // whose key matches this prim into the to-be-created list).
             {
-                auto it = attHistory.find(primKey);
-                while (it != attHistory.end() && it->first == primKey)
+                auto it = attHistory.find(primObjKey);
+                while (it != attHistory.end() && it->first == primObjKey)
                 {
                     DeformableAttachmentDescAndPath attachmentDescAndPath;
                     attachmentDescAndPath.path = it->second;
@@ -1063,8 +1388,8 @@ public:
                 }
             }
             {
-                auto it = filterHistory.find(primKey);
-                while (it != filterHistory.end() && it->first == primKey)
+                auto it = filterHistory.find(primObjKey);
+                while (it != filterHistory.end() && it->first == primObjKey)
                 {
                     DeformableCollisionFilterDescAndPath collisionFilterDescAndPath;
                     collisionFilterDescAndPath.path = it->second;
@@ -1078,7 +1403,7 @@ public:
         });
     }
 
-    void gatherScannedSideEffects(omni::physics::usd::ScannedStage& scanned)
+    void gatherScannedSideEffects(omni::physics::parse::ScannedStage& scanned)
     {
         ObjectDb* objectDb = mAttachedStage.getObjectDatabase();
         if (!objectDb)
@@ -1087,7 +1412,7 @@ public:
         if (!scanned.ccts.empty())
             mParsingFlags |= ParsingFlag::eParseInternal;
 
-        if (scanned.hasPointInstancerPrims ||
+        if (!scanned.particleObjectCandidates.empty() || scanned.hasPointInstancerPrims ||
             !scanned.particleSystems.empty() || !scanned.particleSets.empty() ||
             !scanned.particleSamplers.empty() || !scanned.particleAnisotropies.empty() ||
             !scanned.particleSmoothings.empty() || !scanned.particleIsosurfaces.empty())
@@ -1113,12 +1438,13 @@ public:
         {
             if (!shapeUPtr)
                 continue;
-            const SdfPath path = scanned.pathFor(shapeUPtr->primKey);
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(shapeUPtr->primKey));
             objectDb->addSchemaAPI(path, SchemaAPIFlag::eCollisionAPI);
             if (!shapeUPtr->sourceFilteredCollisions.empty())
             {
                 objectDb->addSchemaAPI(path, SchemaAPIFlag::eFilteredPairsAPI);
-                mFilteredPairsPaths.push_back(path);
+                mFilteredPairsPaths.insert(path);
             }
         }
 
@@ -1126,11 +1452,12 @@ public:
         {
             if (!bodyUPtr)
                 continue;
-            const SdfPath path = scanned.pathFor(bodyUPtr->primKey);
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(bodyUPtr->primKey));
             if (!bodyUPtr->sourceFilteredCollisions.empty())
             {
                 objectDb->addSchemaAPI(path, SchemaAPIFlag::eFilteredPairsAPI);
-                mFilteredPairsPaths.push_back(path);
+                mFilteredPairsPaths.insert(path);
             }
         }
 
@@ -1138,11 +1465,12 @@ public:
         {
             if (!articulationUPtr)
                 continue;
-            const SdfPath path = scanned.pathFor(articulationUPtr->rootPrim);
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(articulationUPtr->rootPrim));
             if (!articulationUPtr->sourceFilteredCollisions.empty())
             {
                 objectDb->addSchemaAPI(path, SchemaAPIFlag::eFilteredPairsAPI);
-                mFilteredPairsPaths.push_back(path);
+                mFilteredPairsPaths.insert(path);
             }
         }
 
@@ -1150,18 +1478,20 @@ public:
         {
             if (!deformableUPtr)
                 continue;
-            const SdfPath path = scanned.pathFor(deformableUPtr->primKey);
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(deformableUPtr->primKey));
             if (!deformableUPtr->sourceFilteredCollisions.empty())
             {
                 objectDb->addSchemaAPI(path, SchemaAPIFlag::eFilteredPairsAPI);
-                mFilteredPairsPaths.push_back(path);
+                mFilteredPairsPaths.insert(path);
             }
         }
 
         for (const omni::physics::parse::DescPtr<omni::physics::parse::CollisionGroupDesc>& collisionGroupUPtr : scanned.collisionGroups)
         {
             if (collisionGroupUPtr)
-                mCollisionGroupsPrims.push_back(scanned.pathFor(collisionGroupUPtr->primKey));
+                mCollisionGroupsPrims.insert(
+                    mAttachedStage.keyFor(scanned.source().sourceKeyToString(collisionGroupUPtr->primKey)));
         }
     }
 
@@ -1169,41 +1499,33 @@ public:
     // after the backend-dispatched scanStage returns; populates mShapes /
     // mBodyMap / mMaterials / etc. buffers consumed by the body /
     // shape / articulation creation paths.
-    void processScannedDescs(omni::physics::usd::ScannedStage& scanned,
-                             const std::vector<SdfPath>& scanRoots, const PathSet* excludePaths)
+    void processScannedDescs(omni::physics::parse::ScannedStage& scanned)
     {
         callbacks::TimeSampledCallbackList cbList;
 
         // ----- Scenes ------------------------------------------------
         // Process scenes first so they're in ObjectDatabase by the time
         // the later body / shape / articulation blocks resolve
-        // `simulationOwners → sceneIds`.  The consumer-side
-        // `canSceneBeProcessedByPhysX` simulator-ownership gate
-        // (ADR-0002 §4 — engine-agnostic scan, consumer applies
-        // filtering) decides whether each scanned scene becomes a
-        // PhysX scene.  Mirrors legacy `reportObjectDesc:eScene`
-        // behavior including mSceneFound / mNoPhysXScene / mNumScenes
-        // bookkeeping.
+        // `simulationOwners → sceneIds`.  Every scanned PhysicsScene
+        // becomes a PhysX scene, whatever API schemas it carries
+        // (REQ-PARSE-SCENE-OWNER-001).  Mirrors legacy
+        // `reportObjectDesc:eScene` behavior including mSceneFound /
+        // mNumScenes bookkeeping.
         for (auto& scanScene : scanned.scenes)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:scene");
-            const SdfPath path = scanned.pathFor(scanScene->primKey);
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanScene->primKey));
             const omni::physics::parse::IPhysicsSource* scnSrc = mAttachedStage.getSource();
-            const omni::physics::parse::ObjectKey sceneKey = mAttachedStage.keyFor(path);
+            const omni::physics::parse::ObjectKey sceneKey = path;
             if (!scnSrc)
                 continue;
             // A synthetic default scene (makeDefaultSceneDesc — backend authored no
-            // prim) has no source object, so skip the existence + simulator-ownership
-            // gates that assume a real prim. Real scanned scenes still pass through them.
-            if (!scanScene->synthetic)
-            {
-                if (!scnSrc->exists(sceneKey))
-                    continue;
-                const bool isDefaultSimulator = mAttachedStage.isPhysXDefaultSimulator();
-                if (!canSceneBeProcessedByPhysXSource(*scnSrc, sceneKey, isDefaultSimulator))
-                    continue;
-            }
-            PhysxSceneDesc* desc = scanScene.release();
+            // prim) has no source object, so skip the existence gate that assumes a
+            // real prim. Real scanned scenes still pass through it.
+            if (!scanScene->synthetic && !scnSrc->exists(sceneKey))
+                continue;
+            PhysxSceneDesc* desc = scanScene.get();
             if (!desc)
                 continue;
 
@@ -1219,84 +1541,43 @@ public:
             // bound material's restitution changes (TestContactReport
             // "Contact Report Lost - Plane Delete" reproduces).
             auto rekey = [&](omni::physics::parse::ObjectKey& k) {
-                if (k.valid()) k = mAttachedStage.keyFor(scanned.pathFor(k));
+                if (k.valid()) k = mAttachedStage.keyFor(scanned.source().sourceKeyToString(k));
             };
             rekey(desc->defaultMaterialDesc.materialKey);
             rekey(desc->defaultDeformableMaterialDesc.materialKey);
             rekey(desc->defaultSurfaceDeformableMaterialDesc.materialKey);
             rekey(desc->defaultPBDMaterialDesc.materialKey);
 
-            // Scene-level nested material descriptor defaults + binding overlay.
-            // Mirrors legacy `parseSceneDesc` at usdLoad/Scene.cpp:108-138:
-            //   1. `setToDefault` each nested material desc (units-aware defaults
-            //      — youngsModulus needs metersPerUnit/kilogramsPerUnit, surface
-            //      thickness needs metersPerUnit).  The parse-lib `setToDefault`
-            //      for PhysxSceneDesc doesn't touch the nested descs (SourceUnits
-            //      lacks kilogramsPerUnit; the deformable defaults need it), so
-            //      we re-apply the USD-side defaults here at the consumer
-            //      boundary.  Without this, scene->defaultDeformableMaterialDesc
-            //      ships with youngsModulus=0 — `createDeformableVolumeMaterial`
-            //      makes a degenerate material and modified-rest-shape volume
-            //      deformables collapse (TestDeformables.cpp:606).
-            //   2. Overlay each nested desc from the scene prim's material
-            //      binding (if any) via the source-backed `parse*ForPrim` helpers.
-            //      These no-op when the source has no bound material key.  This replaces
-            //      the binding overlay that `StageScan::emitScene` does — the
-            //      consumer's overlay applies to a properly-defaulted desc and
-            //      uses legacy `parseMaterialDescInt` paths.
-            setToDefault(desc->defaultMaterialDesc);
-            // Units-aware deformable-material defaults from the source units
-            // (backend-agnostic; no USD stage needed under ovstage).
-            const omni::physics::parse::SourceUnits sceneUnits = scnSrc->getSourceUnits();
-            setToDefault(sceneUnits, desc->defaultDeformableMaterialDesc);
-            setToDefault(sceneUnits, desc->defaultSurfaceDeformableMaterialDesc);
-            setToDefault(desc->defaultPBDMaterialDesc);
-            // Scene's bound default material via the source (no UsdPrim / UsdStage).
-            const omni::physics::parse::ObjectKey sceneMatKey = scnSrc->getMaterialBinding(sceneKey);
-            parseMaterialForPrim(mAttachedStage, sceneMatKey, desc->defaultMaterialDesc);
-            parseDeformableMaterialForPrim(mAttachedStage, sceneMatKey, desc->defaultDeformableMaterialDesc);
-            parseSurfaceDeformableMaterialForPrim(mAttachedStage, sceneMatKey, desc->defaultSurfaceDeformableMaterialDesc);
-            parsePBDMaterialForPrim(mAttachedStage, sceneMatKey, desc->defaultPBDMaterialDesc);
+            completeSceneDesc(mAttachedStage, path, *desc);
 
-            // PhysxSceneQuasistaticAPI: resolve the actors collection at
-            // the consumer (USD-side work; parse-lib has no UsdCollectionAPI
-            // dependency).  Mirrors `parseSceneDesc` at usdLoad/Scene.cpp:
-            // 288-310 — when the includes rel has targets, compute the
-            // membership and insert each resolved path as an attachedStage
-            // key into `desc->quasistaticActors`.
+            // A compiled-cache attach that missed created this prim's scene while it
+            // captured the stage's inputs, from the same reads: take it and announce it
+            // where its creation would have.
+            ObjectId sceneId = kInvalidObjectId;
+            auto& prepared = mAttachedStage.preparedScene;
+            if (prepared && prepared->key == path)
             {
-                // resolveCollection performs the include/exclude membership walk
-                // (instance proxies included) internally and returns persistent-source
-                // ObjectKeys, replacing the UsdCollectionAPI::ComputeIncludedPaths path.
-                const omni::physics::parse::IPhysicsSource* src = mAttachedStage.getSource();
-                if (src && src->hasSchema(mAttachedStage.keyFor(path),
-                                          schemaTypeToken<PhysxSchemaPhysxSceneQuasistaticAPI>(*src)))
-                {
-                    std::vector<omni::physics::parse::ObjectKey> members;
-                    src->resolveCollection(mAttachedStage.keyFor(path), src->internToken("quasistaticactors"), members);
-                    desc->quasistaticActors.clear();
-                    desc->quasistaticActors.reserve(members.size());
-                    for (const omni::physics::parse::ObjectKey& k : members)
-                        desc->quasistaticActors.insert(k);
-                }
+                sceneId = prepared->id;
+                const auto& records = mAttachedStage.getInternalPhysXDatabase().getRecords();
+                for (const ObjectId record : prepared->records)
+                    mAttachedStage.getPhysXPhysicsInterface()->sendObjectCreationNotification(
+                        mAttachedStage, records[record].mKey, record, records[record].mType);
+                prepared.reset();
             }
-
-            const ObjectId sceneId = createObject(mAttachedStage, path, desc);
+            else
+                sceneId = createObject(mAttachedStage, path, desc, false);
             if (sceneId != kInvalidObjectId)
             {
                 mSceneFound = true;
-                mNoPhysXScene = false;
                 mNumScenes++;
             }
-            else if (OmniPhysX::getInstance().getISettings()->getStringBuffer(kSettingForceParseOnlySingleScene) == nullptr)
+            else if (mAttachedStage.getParseOptions().forceSingleScenePath.empty())
             {
                 mNoValidScene = true;
             }
         }
 
         if (mNoValidScene)
-            return;
-        if (mNoPhysXScene)
             return;
         // ----- CollisionGroups --------------------------------------
         // First-time collection population: invert the per-group
@@ -1311,51 +1592,45 @@ public:
             if (!mCollectionsPopulated)
             {
                 PHYSICS_PROFILE("invertCollisionGroupMembers");
-                const size_t minBatchSize = 20;
-                const size_t collisionGroupsSize = scanned.collisionGroups.size();
-                const omni::physics::parse::AttachTarget attachTarget = mAttachedStage.attachTarget();
-                const bool serialCollisionGroupInversion = attachTarget.nativeStage && attachTarget.stageId == 0;
-                if (collisionGroupsSize < minBatchSize || serialCollisionGroupInversion)
-                {
-                    invertCollisionGroupMembers(scanned, 0, collisionGroupsSize,
-                                                mAttachedStage.getCollisionGroupMap());
-                }
+                CollisionGroupsMap& groups = mAttachedStage.getCollisionGroupMap();
+                const size_t count = scanned.collisionGroups.size();
+                if (count < 20 || (mAttachedStage.hasExternalSource() &&
+                    mAttachedStage.getSource() != scanned.sourcePtr()))
+                    invertCollisionGroupMembers(mAttachedStage, scanned, 0, count, groups);
                 else
                 {
-                    const size_t numBatches = 24;
-                    const size_t batchSize = collisionGroupsSize / numBatches;
-                    if (!mAttachedStage.getAdditionalCollisionGroupMaps().empty())
+                    // Allocate independent maps in parallel, then transfer their nodes
+                    // into one lookup map. Merge contiguous ranges in walk order so
+                    // overlapping members retain every group in the original order.
+                    const size_t batches = std::min(size_t(8), count);
+                    std::vector<CollisionGroupsMap> maps(batches);
+                    const auto invert = [&](size_t batch)
                     {
-                        PHYSICS_PROFILE("invertCollisionGroupMembers:merge");
-                        CollisionGroupsMap& cgMap = mAttachedStage.getCollisionGroupMap();
-                        for (const CollisionGroupsMap& m : mAttachedStage.getAdditionalCollisionGroupMaps())
-                            cgMap.insert(m.begin(), m.end());
-                        mAttachedStage.getAdditionalCollisionGroupMaps().clear();
-                    }
-                    std::vector<CollisionGroupsMap>& cgMaps = mAttachedStage.getAdditionalCollisionGroupMaps();
-                    cgMaps.resize(numBatches);
-                    auto&& computeFunc = [&scanned, numBatches, batchSize, collisionGroupsSize, &cgMaps](size_t batchIndex)
-                    {
-                        const size_t batchEnd =
-                            batchIndex == (numBatches - 1) ? collisionGroupsSize : (batchIndex + 1) * batchSize;
-                        invertCollisionGroupMembers(scanned, batchIndex * batchSize, batchEnd, cgMaps[batchIndex]);
+                        invertCollisionGroupMembers(mAttachedStage, scanned,
+                            count * batch / batches, count * (batch + 1) / batches, maps[batch]);
                     };
+                    carb::getCachedInterface<carb::tasking::ITasking>()->parallelFor(size_t(0), batches, invert);
+                    size_t capacity = groups.size();
+                    for (const CollisionGroupsMap& map : maps)
+                        capacity += map.size();
+                    groups.reserve(capacity);
+                    for (CollisionGroupsMap& map : maps)
                     {
-                        PHYSICS_PROFILE("invertCollisionGroupMembers:parallelFor");
-                        ITasking* tasking = carb::getCachedInterface<ITasking>();
-                        tasking->parallelFor(size_t(0), numBatches, computeFunc);
+                        groups.merge(map);
+                        for (CollisionGroupsMap::const_reference entry : map)
+                        {
+                            std::vector<omni::physics::parse::ObjectKey>& existing = groups.at(entry.first);
+                            existing.insert(existing.end(), entry.second.begin(), entry.second.end());
+                        }
                     }
                 }
                 mCollectionsPopulated = true;
             }
             for (auto& cgUPtr : scanned.collisionGroups)
             {
-                const SdfPath path = scanned.pathFor(cgUPtr->primKey);
-                if (std::find(mCollisionGroupsPrims.begin(), mCollisionGroupsPrims.end(), path) ==
-                    mCollisionGroupsPrims.end())
-                {
-                    mCollisionGroupsPrims.push_back(path);
-                }
+                const omni::physics::parse::ObjectKey path =
+                    mAttachedStage.keyFor(scanned.source().sourceKeyToString(cgUPtr->primKey));
+                mCollisionGroupsPrims.insert(path);
                 CollisionGroupDesc desc;
                 createObject(mAttachedStage, path, &desc, false);
             }
@@ -1365,8 +1640,9 @@ public:
         for (auto& matUPtr : scanned.materials)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:material");
-            const SdfPath path = scanned.pathFor(matUPtr->materialKey);
-            PhysxMaterialDesc* desc = matUPtr.release();
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(matUPtr->materialKey));
+            PhysxMaterialDesc* desc = matUPtr.get();
             if (desc)
                 mMaterials.push_back(std::make_pair(path, desc));
         }
@@ -1375,8 +1651,9 @@ public:
         for (omni::physics::parse::DescPtr<PBDMaterialDesc>& matUPtr : scanned.pbdMaterials)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:pbdMaterial");
-            const SdfPath path = scanned.pathFor(matUPtr->materialKey);
-            PBDMaterialDesc* desc = matUPtr.release();
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(matUPtr->materialKey));
+            PBDMaterialDesc* desc = matUPtr.get();
             if (desc)
                 mPDBMatrialsDescs.push_back(std::make_pair(path, desc));
         }
@@ -1385,8 +1662,9 @@ public:
         for (auto& dmUPtr : scanned.deformableMaterials)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:deformableMaterial");
-            const SdfPath path = scanned.pathFor(dmUPtr->materialKey);
-            PhysxDeformableMaterialDesc* desc = dmUPtr.release();
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(dmUPtr->materialKey));
+            PhysxDeformableMaterialDesc* desc = dmUPtr.get();
             if (desc)
                 mDeformableMaterials.push_back(std::make_pair(path, desc));
         }
@@ -1403,7 +1681,8 @@ public:
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:shape");
             PhysxShapeDesc* scanDesc = shapeUPtr.get();
-            const SdfPath path = scanned.pathFor(scanDesc->primKey);
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanDesc->primKey));
 
             scan::dispatchScannedShapeCooking(mAttachedStage, scanned, scanDesc);
 
@@ -1436,23 +1715,25 @@ public:
             }
 
             if (scanDesc->rigidBody.valid())
-                scanDesc->rigidBody = mAttachedStage.keyFor(scanned.pathFor(scanDesc->rigidBody));
+                scanDesc->rigidBody = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanDesc->rigidBody));
             if (scanDesc->sourceGprim.valid())
-                scanDesc->sourceGprim = mAttachedStage.keyFor(scanned.pathFor(scanDesc->sourceGprim));
+                scanDesc->sourceGprim = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanDesc->sourceGprim));
             if (scanDesc->type == eConvexMeshShape)
             {
                 auto* d = static_cast<ConvexMeshPhysxShapeDesc*>(scanDesc);
-                if (d->meshPrimKey.valid()) d->meshPrimKey = mAttachedStage.keyFor(scanned.pathFor(d->meshPrimKey));
+                if (d->meshPrimKey.valid())
+                    d->meshPrimKey = mAttachedStage.keyFor(scanned.source().sourceKeyToString(d->meshPrimKey));
             }
             else if (scanDesc->type == eTriangleMeshShape ||
                      scanDesc->type == eConvexMeshDecompositionShape ||
                      scanDesc->type == eSpherePointsShape)
             {
                 auto* d = static_cast<TriangleMeshPhysxShapeDesc*>(scanDesc);
-                if (d->meshPrimKey.valid()) d->meshPrimKey = mAttachedStage.keyFor(scanned.pathFor(d->meshPrimKey));
+                if (d->meshPrimKey.valid())
+                    d->meshPrimKey = mAttachedStage.keyFor(scanned.source().sourceKeyToString(d->meshPrimKey));
             }
 
-            SdfPathVector materials;
+            std::vector<omni::physics::parse::ObjectKey> materials;
             if (!scan::resolveConsumerSideShapeState(mAttachedStage, scanned, scanDesc, materials, mFilteredPairs))
                 continue;
 
@@ -1461,41 +1742,31 @@ public:
             // (Collision.cpp:1622-1653).
             {
                 const omni::physics::parse::IPhysicsSource* isrc = mAttachedStage.getSource();
-                const omni::physics::parse::ObjectKey shapeKey = mAttachedStage.keyFor(path);
+                const omni::physics::parse::ObjectKey shapeKey = path;
                 if (isrc && isrc->isInstanceProxy(shapeKey))
                 {
                     if (scanDesc->sourceMaterials.size() < 2)
                     {
                         // Instance-proxy material binding via the source (no UsdPrim).
                         const omni::physics::parse::ObjectKey matKey = isrc->getMaterialBinding(shapeKey);
-                        const SdfPath instMatPath = matKey.valid() ? mAttachedStage.pathFor(matKey) : SdfPath();
-                        if (!instMatPath.IsEmpty())
+                        if (matKey.valid())
                         {
                             materials.clear();
-                            materials.push_back(instMatPath);
+                            materials.push_back(matKey);
                         }
                     }
-                    if (scanDesc->rigidBody.valid())
+                    if (scanDesc->rigidBody.valid() && isrc->exists(scanDesc->rigidBody))
                     {
-                        const SdfPath bodyPath = mAttachedStage.pathFor(scanDesc->rigidBody);
-                        if (isrc->exists(mAttachedStage.keyFor(bodyPath)))
-                        {
-                            GfVec3f localPos, localScale;
-                            GfQuatf localRot;
-                            getCollisionShapeLocalTransform(mAttachedStage, shapeKey,
-                                scanDesc->rigidBody, localPos, localRot, localScale);
-                            scanDesc->localPos   = { localPos[0], localPos[1], localPos[2] };
-                            scanDesc->localRot   = { localRot.GetImaginary()[0], localRot.GetImaginary()[1],
-                                                     localRot.GetImaginary()[2], localRot.GetReal() };
-                            scanDesc->localScale = { localScale[0], localScale[1], localScale[2] };
-                        }
+                        getCollisionShapeLocalTransform(mAttachedStage, shapeKey, scanDesc->rigidBody,
+                                                        scanDesc->localPos, scanDesc->localRot,
+                                                        scanDesc->localScale);
                     }
                 }
             }
 
             scanDesc->collisionGroup = getCollisionGroup(mAttachedStage, path);
 
-            PhysxShapeDesc* desc = shapeUPtr.release();
+            PhysxShapeDesc* desc = shapeUPtr.get();
             if (!desc)
                 continue;
 
@@ -1506,29 +1777,29 @@ public:
             // independent of the side-effect gather pass.
             mAttachedStage.getObjectDatabase()->addSchemaAPI(path, SchemaAPIFlag::eCollisionAPI);
 
-            callbacks::collectShapeTimeSampledCallbacks(mAttachedStage, mAttachedStage.keyFor(path), cbList);
+            callbacks::collectShapeTimeSampledCallbacks(mAttachedStage, path, cbList);
 
             mShapes.push_back({ path, desc, materials });
         }
 
         // ----- RigidBodies -----------------------------------------
-        // AC-16 investigation: bodies routed through scanStage emit.
-        // Mirrors the pre-revert block from 8ef89730ca~1.  Translates
-        // ObjectKeys back to SdfPath via scanned.pathFor() and clones
-        // into ICE storage.
+        // Resolves each scanned body's source key to an attached-stage ObjectKey and
+        // borrows the descriptor from the owning scan.
         for (auto& bodyUPtr : scanned.bodies)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:rigidBody");
             PhysxRigidBodyDesc* scanDesc = bodyUPtr.get();
-            const SdfPath path = scanned.pathFor(scanDesc->primKey);
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanDesc->primKey));
 
             // Translate sourceSimulationOwners → sceneIds.
             scanDesc->sceneIds.clear();
             for (const auto& sk : scanDesc->sourceSimulationOwners)
             {
-                const SdfPath sp = scanned.pathFor(sk);
-                if (sp.IsEmpty()) continue;
-                const ObjectId entry = mAttachedStage.getObjectDatabase()->findEntry(sp, eScene);
+                if (!sk.valid()) continue;
+                const omni::physics::parse::ObjectKey spKey =
+                    mAttachedStage.keyFor(scanned.source().sourceKeyToString(sk));
+                const ObjectId entry = mAttachedStage.getObjectDatabase()->findEntry(spKey, eScene);
                 if (entry != kInvalidObjectId)
                     scanDesc->sceneIds.push_back(entry);
             }
@@ -1543,9 +1814,10 @@ public:
             // Translate sourceFilteredCollisions → filteredPairs.
             for (const auto& fk : scanDesc->sourceFilteredCollisions)
             {
-                const SdfPath fp = scanned.pathFor(fk);
-                if (!fp.IsEmpty())
-                    mFilteredPairs.push_back(std::make_pair(path, fp));
+                if (!fk.valid()) continue;
+                const omni::physics::parse::ObjectKey fpKey =
+                    mAttachedStage.keyFor(scanned.source().sourceKeyToString(fk));
+                mFilteredPairs.push_back(std::make_pair(path, fpKey));
             }
 
             // Time-varying transform → kinematic auto-conversion.
@@ -1559,7 +1831,8 @@ public:
             if (scanDesc->type == eDynamicBody)
             {
                 const omni::physics::parse::IPhysicsSource* ssrc = mAttachedStage.getSource();
-                const omni::physics::parse::ObjectKey bodyKey = mAttachedStage.keyFor(path);
+                const omni::physics::parse::ObjectKey bodyKey = path;
+                const omni::physics::parse::KnownTokens& tok = mAttachedStage.getKnownTokens();
 
                 // Splines surface velocity validation warnings.  The
                 // parse library silently disables splines when its
@@ -1575,42 +1848,57 @@ public:
                 // keying off it would suppress every warning. The inner checks below
                 // re-derive the specific reason from the source.
                 if (ssrc && ssrc->exists(bodyKey) &&
-                    ssrc->hasSchema(bodyKey, ssrc->internToken(
-                        PhysxSchemaTokens->PhysxSplinesSurfaceVelocityAPI.GetString())))
+                    ssrc->hasSchema(bodyKey, tok.physxSplinesSurfaceVelocityAPI))
                 {
                     bool splinesEnabledAuthored = true;
-                    internal::getValue<bool>(mAttachedStage, bodyKey, PhysxSchemaTokens->physxSplinesSurfaceVelocitySurfaceVelocityEnabled,
-                                             UsdTimeCode::Default(), splinesEnabledAuthored);
+                    internal::getValue<bool>(mAttachedStage, bodyKey,
+                                             tok.physxSplinesSurfaceVelocitySurfaceVelocityEnabled,
+                                             omni::physics::parse::ReadTime::defaultTime(), splinesEnabledAuthored);
 
                     if (dyn->surfaceVelocityEnabled && splinesEnabledAuthored)
                     {
                         CARB_LOG_ERROR(
                             "Detected rigid body (%s) with both surface velocity and splines surface velocity, please disable one.",
-                            path.GetText());
+                            mAttachedStage.textFor(path));
                     }
                     else if (splinesEnabledAuthored)
                     {
                         // Distinguish an absent relationship from a defined-but-empty one
                         // (matches the prior `!splinesRel || splinesList.empty()` gate).
                         const omni::physics::parse::TokenId curveRelTok =
-                            ssrc->internToken(PhysxSchemaTokens->physxSplinesSurfaceVelocitySurfaceVelocityCurve.GetString());
+                            tok.physxSplinesSurfaceVelocitySurfaceVelocityCurve;
                         const bool hasCurveRel = ssrc->hasRelationship(bodyKey, curveRelTok);
                         std::vector<omni::physics::parse::ObjectKey> curveKeys;
                         if (hasCurveRel)
                             ssrc->getRelationshipTargets(bodyKey, curveRelTok, curveKeys);
+                        // Each rejection names its cause: an unresolved target, a target that
+                        // never made it into the attached stage (a physics-only ovstage
+                        // population that skipped the curve), and a target of the wrong type
+                        // are fixed in different places.
                         if (!hasCurveRel || curveKeys.empty())
                         {
-                            CARB_LOG_ERROR("Splines surface velocity %s does not have a valid spline curve defined.",
-                                           path.GetText());
+                            CARB_LOG_ERROR("Splines surface velocity %s does not have a valid spline curve defined: "
+                                           "the physxSplinesSurfaceVelocity:surfaceVelocityCurve relationship has no target.",
+                                           mAttachedStage.textFor(path));
                         }
                         else
                         {
                             const omni::physics::parse::ObjectKey curveKey = curveKeys[0];
-                            if (!ssrc->exists(curveKey) ||
-                                !ssrc->isA(curveKey, schemaTypeToken<UsdGeomBasisCurves>(*ssrc)))
+                            const std::string_view curveText = ssrc->sourceKeyToString(curveKey);
+                            if (!ssrc->exists(curveKey))
                             {
-                                CARB_LOG_ERROR("Splines surface velocity %s does not have a valid spline curve defined.",
-                                               path.GetText());
+                                CARB_LOG_ERROR("Splines surface velocity %s does not have a valid spline curve defined: "
+                                               "the curve target %.*s is not present in the attached stage. When populating "
+                                               "with ovstage, the physics population must include the referenced BasisCurves prim.",
+                                               mAttachedStage.textFor(path), int(curveText.size()), curveText.data());
+                            }
+                            else if (!ssrc->isA(curveKey, tok.basisCurvesType))
+                            {
+                                const std::string_view typeText = ssrc->tokenToString(ssrc->getTypeName(curveKey));
+                                CARB_LOG_ERROR("Splines surface velocity %s does not have a valid spline curve defined: "
+                                               "the curve target %.*s is not a BasisCurves prim (type '%.*s').",
+                                               mAttachedStage.textFor(path), int(curveText.size()), curveText.data(),
+                                               int(typeText.size()), typeText.data());
                             }
                             else
                             {
@@ -1624,7 +1912,7 @@ public:
                                 }
                                 if (!parentBodyFound)
                                     CARB_LOG_ERROR("Splines surface velocity %s spline curve is not a child of the rigid body.",
-                                                   path.GetText());
+                                                   mAttachedStage.textFor(path));
                             }
                         }
                     }
@@ -1636,8 +1924,8 @@ public:
                 // curve prim through this key via getAttachedStage().pathFor().
                 {
                     if (dyn->splinesCurvePrimKey.valid())
-                        dyn->splinesCurvePrimKey =
-                            mAttachedStage.keyFor(scanned.pathFor(dyn->splinesCurvePrimKey));
+                        dyn->splinesCurvePrimKey = mAttachedStage.keyFor(
+                            scanned.source().sourceKeyToString(dyn->splinesCurvePrimKey));
                 }
 
                 // Time-varying transform → kinematic auto-conversion (source-routed
@@ -1649,14 +1937,14 @@ public:
                     if (!dyn->kinematicBody)
                     {
                         CARB_LOG_WARN("Detected rigid body that is not kinematic but does have parents with animated xformOps. Prim: %s, converting the body to kinematic body",
-                                      path.GetText());
+                                      mAttachedStage.textFor(path));
                         dyn->kinematicBody = true;
                     }
-                    mAttachedStage.getAnimatedKinematicBodies()[path] = mAttachedStage.keyFor(path);
+                    mAttachedStage.getAnimatedKinematicBodies().insert(path);
                 }
             }
 
-            PhysxRigidBodyDesc* desc = bodyUPtr.release();
+            PhysxRigidBodyDesc* desc = bodyUPtr.get();
             if (!desc)
                 continue;
 
@@ -1667,17 +1955,16 @@ public:
 
             BodyDescAndColliders& bdDesc = mBodyMap[path];
             bdDesc.desc = desc;
-            // Translate sourceCollisions ObjectKeys → SdfPath set for
-            // downstream body / collider lookups.
+            // Translate sourceCollisions ObjectKeys → the attachedStage-space
+            // KeySet for downstream body / collider lookups.
             bdDesc.collisions.clear();
             for (const auto& ck : scanDesc->sourceCollisions)
             {
-                const SdfPath sp = scanned.pathFor(ck);
-                if (!sp.IsEmpty())
-                    bdDesc.collisions.insert(sp);
+                if (!ck.valid()) continue;
+                bdDesc.collisions.insert(mAttachedStage.keyFor(scanned.source().sourceKeyToString(ck)));
             }
 
-            callbacks::collectRigidBodyTimeSampledCallbacks(mAttachedStage, mAttachedStage.keyFor(path), cbList);
+            callbacks::collectRigidBodyTimeSampledCallbacks(mAttachedStage, path, cbList);
         }
 
         // Time-sampled callback re-registration for tendon attributes
@@ -1698,26 +1985,23 @@ public:
         // See REQ-PARSE-TENDON-001 AC-6 and REQ-PARSE-TENDON-002 AC-6.
         // Authored/time-varying gates route through the source
         // (hasAuthoredAttribute == attr && HasAuthoredValue;
-        // mightBeTimeVarying == attr && ValueMightBeTimeVarying). The prim is
-        // used only for the attribute path (registerTimeSampledAttribute is the
-        // engine-side sink, keyed by SdfPath), not for a value read.
+        // mightBeTimeVarying == attr && ValueMightBeTimeVarying).
         const omni::physics::parse::IPhysicsSource* tsSrc = mAttachedStage.getSource();
-        auto regScalarIfAuthored = [&](const SdfPath& primPath, const std::string& attrName,
+        auto regScalarIfAuthored = [&](omni::physics::parse::ObjectKey primKey, const std::string& attrName,
                                        OnUpdateObjectFn fn) {
             if (!tsSrc)
                 return;
-            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(primPath);
             const omni::physics::parse::TokenId tok = tsSrc->internToken(attrName);
-            if (tsSrc->hasAuthoredAttribute(key, tok) && tsSrc->mightBeTimeVarying(key, tok))
-                mAttachedStage.registerTimeSampledAttribute(primPath.AppendProperty(TfToken(attrName)), fn);
+            if (tsSrc->hasAuthoredAttribute(primKey, tok) && tsSrc->mightBeTimeVarying(primKey, tok))
+                mAttachedStage.registerTimeSampledAttribute(primKey, tok, fn);
         };
-        auto regAnyIfTimeVarying = [&](const SdfPath& primPath, const std::string& attrName,
+        auto regAnyIfTimeVarying = [&](omni::physics::parse::ObjectKey primKey, const std::string& attrName,
                                        OnUpdateObjectFn fn) {
             if (!tsSrc)
                 return;
-            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(primPath);
-            if (tsSrc->mightBeTimeVarying(key, tsSrc->internToken(attrName)))
-                mAttachedStage.registerTimeSampledAttribute(primPath.AppendProperty(TfToken(attrName)), fn);
+            const omni::physics::parse::TokenId tok = tsSrc->internToken(attrName);
+            if (tsSrc->mightBeTimeVarying(primKey, tok))
+                mAttachedStage.registerTimeSampledAttribute(primKey, tok, fn);
         };
 
         // ----- Spatial tendon attachments --------------------------
@@ -1732,9 +2016,20 @@ public:
         for (const auto& scanAtt : scanned.spatialTendonAttachments)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:spatialTendon");
-            const TfToken instanceTok = scanned.tfTokenFor(scanAtt->instanceToken);
-            const std::string instanceStr = instanceTok.GetString();
-            const SdfPath linkPath = scanned.pathFor(scanAtt->linkKey);
+            const std::string instanceStr = std::string(scanned.source().tokenToString(scanAtt->instanceToken));
+
+            // linkKey/parentKey/parentToken/instanceToken are minted by the
+            // SCAN's own source and must be re-keyed/re-interned into
+            // mAttachedStage's namespace (ADR-0019 increment 7; mirrors the
+            // `rekey` pattern used above for articulations/vehicles).
+            const omni::physics::parse::IPhysicsSource* asSrc = mAttachedStage.getSource();
+            auto internStr = [asSrc](const std::string& s) -> omni::physics::parse::TokenId
+            {
+                return asSrc ? asSrc->internToken(s) : omni::physics::parse::TokenId{};
+            };
+            const omni::physics::parse::ObjectKey linkKey =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanAtt->linkKey));
+            const omni::physics::parse::TokenId instanceTokId = internStr(instanceStr);
 
             if (scanAtt->type == eTendonAttachmentRoot)
             {
@@ -1743,10 +2038,10 @@ public:
                 engineDesc->type           = eTendonAttachmentRoot;
                 engineDesc->gearing        = srcRoot.gearing;
                 engineDesc->localPos       = srcRoot.localPos;
-                engineDesc->linkPath       = linkPath;
-                engineDesc->parentPath     = scanned.pathFor(srcRoot.parentKey);
-                engineDesc->parentToken    = scanned.tfTokenFor(srcRoot.parentToken);
-                engineDesc->instanceToken  = instanceTok;
+                engineDesc->linkKey        = linkKey;
+                engineDesc->parentKey      = mAttachedStage.keyFor(scanned.source().sourceKeyToString(srcRoot.parentKey));
+                engineDesc->parentToken    = internStr(std::string(scanned.source().tokenToString(srcRoot.parentToken)));
+                engineDesc->instanceToken  = instanceTokId;
                 engineDesc->isEnabled      = srcRoot.isEnabled;
                 engineDesc->stiffness      = srcRoot.stiffness;
                 engineDesc->limitStiffness = srcRoot.limitStiffness;
@@ -1763,15 +2058,15 @@ public:
                 registerTendonAttachmentChangeParams(mAttachedStage, instanceStr);
 
                 // Time-sampled callbacks (root tendon attributes + localPos).
-                if (tsSrc && tsSrc->exists(mAttachedStage.keyFor(linkPath)))
+                if (tsSrc && tsSrc->exists(linkKey))
                 {
                     const std::string base = "physxTendon:" + instanceStr + ":";
-                    regScalarIfAuthored(linkPath, base + "stiffness",      updateSpatialTendonStiffness);
-                    regScalarIfAuthored(linkPath, base + "limitStiffness", updateSpatialTendonLimitStiffness);
-                    regScalarIfAuthored(linkPath, base + "damping",        updateSpatialTendonDamping);
-                    regScalarIfAuthored(linkPath, base + "offset",         updateSpatialTendonOffset);
-                    regScalarIfAuthored(linkPath, base + "tendonEnabled",  updateSpatialTendonEnabled);
-                    regAnyIfTimeVarying(linkPath, base + "localPos",       updateTendonAttachmentLocalPos);
+                    regScalarIfAuthored(linkKey, base + "stiffness",      updateSpatialTendonStiffness);
+                    regScalarIfAuthored(linkKey, base + "limitStiffness", updateSpatialTendonLimitStiffness);
+                    regScalarIfAuthored(linkKey, base + "damping",        updateSpatialTendonDamping);
+                    regScalarIfAuthored(linkKey, base + "offset",         updateSpatialTendonOffset);
+                    regScalarIfAuthored(linkKey, base + "tendonEnabled",  updateSpatialTendonEnabled);
+                    regAnyIfTimeVarying(linkKey, base + "localPos",       updateTendonAttachmentLocalPos);
                 }
             }
             else if (scanAtt->type == eTendonAttachmentLeaf)
@@ -1781,16 +2076,16 @@ public:
                 engineDesc->type          = eTendonAttachmentLeaf;
                 engineDesc->gearing       = srcLeaf.gearing;
                 engineDesc->localPos      = srcLeaf.localPos;
-                engineDesc->linkPath      = linkPath;
-                engineDesc->parentPath    = scanned.pathFor(srcLeaf.parentKey);
-                engineDesc->parentToken   = scanned.tfTokenFor(srcLeaf.parentToken);
-                engineDesc->instanceToken = instanceTok;
+                engineDesc->linkKey       = linkKey;
+                engineDesc->parentKey     = mAttachedStage.keyFor(scanned.source().sourceKeyToString(srcLeaf.parentKey));
+                engineDesc->parentToken   = internStr(std::string(scanned.source().tokenToString(srcLeaf.parentToken)));
+                engineDesc->instanceToken = instanceTokId;
                 engineDesc->restLength    = srcLeaf.restLength;
                 engineDesc->lowLimit      = srcLeaf.lowLimit;
                 engineDesc->highLimit     = srcLeaf.highLimit;
                 std::shared_ptr<PhysxTendonAttachmentLeafDesc> ptr(
                     engineDesc, [](PhysxTendonAttachmentLeafDesc* p) { ICE_FREE(p); });
-                mTendonAttachmentMap[engineDesc->parentPath].push_back(ptr);
+                mTendonAttachmentMap[engineDesc->parentKey].push_back(ptr);
                 registerTendonAttachmentLeafChangeParams(mAttachedStage, instanceStr);
                 // PhysxTendonAttachmentLeafAPI auto-applies
                 // PhysxTendonAttachmentAPI with the same instance name
@@ -1802,14 +2097,14 @@ public:
                 // with intermediate attachments, plus its own restLength /
                 // lowerLimit / upperLimit (matches legacy
                 // parseLeafAttachment → parseAttachment chain).
-                if (tsSrc && tsSrc->exists(mAttachedStage.keyFor(linkPath)))
+                if (tsSrc && tsSrc->exists(linkKey))
                 {
                     const std::string base = "physxTendon:" + instanceStr + ":";
-                    regScalarIfAuthored(linkPath, base + "gearing",     updateTendonAttachmentGearing);
-                    regAnyIfTimeVarying(linkPath, base + "localPos",    updateTendonAttachmentLocalPos);
-                    regScalarIfAuthored(linkPath, base + "restLength",  updateTendonAttachmentLeafRestLength);
-                    regScalarIfAuthored(linkPath, base + "lowerLimit",  updateTendonAttachmentLeafLowLimit);
-                    regScalarIfAuthored(linkPath, base + "upperLimit",  updateTendonAttachmentLeafHighLimit);
+                    regScalarIfAuthored(linkKey, base + "gearing",     updateTendonAttachmentGearing);
+                    regAnyIfTimeVarying(linkKey, base + "localPos",    updateTendonAttachmentLocalPos);
+                    regScalarIfAuthored(linkKey, base + "restLength",  updateTendonAttachmentLeafRestLength);
+                    regScalarIfAuthored(linkKey, base + "lowerLimit",  updateTendonAttachmentLeafLowLimit);
+                    regScalarIfAuthored(linkKey, base + "upperLimit",  updateTendonAttachmentLeafHighLimit);
                 }
             }
             else
@@ -1818,22 +2113,22 @@ public:
                 engineDesc->type          = scanAtt->type;
                 engineDesc->gearing       = scanAtt->gearing;
                 engineDesc->localPos      = scanAtt->localPos;
-                engineDesc->linkPath      = linkPath;
-                engineDesc->parentPath    = scanned.pathFor(scanAtt->parentKey);
-                engineDesc->parentToken   = scanned.tfTokenFor(scanAtt->parentToken);
-                engineDesc->instanceToken = instanceTok;
+                engineDesc->linkKey       = linkKey;
+                engineDesc->parentKey     = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanAtt->parentKey));
+                engineDesc->parentToken   = internStr(std::string(scanned.source().tokenToString(scanAtt->parentToken)));
+                engineDesc->instanceToken = instanceTokId;
                 std::shared_ptr<PhysxTendonAttachmentDesc> ptr(
                     engineDesc, [](PhysxTendonAttachmentDesc* p) { ICE_FREE(p); });
-                mTendonAttachmentMap[engineDesc->parentPath].push_back(ptr);
+                mTendonAttachmentMap[engineDesc->parentKey].push_back(ptr);
                 registerTendonAttachmentChangeParams(mAttachedStage, instanceStr);
 
                 // Time-sampled callbacks: gearing (scalar) + localPos
                 // (any).  Matches legacy parseAttachment exactly.
-                if (tsSrc && tsSrc->exists(mAttachedStage.keyFor(linkPath)))
+                if (tsSrc && tsSrc->exists(linkKey))
                 {
                     const std::string base = "physxTendon:" + instanceStr + ":";
-                    regScalarIfAuthored(linkPath, base + "gearing",  updateTendonAttachmentGearing);
-                    regAnyIfTimeVarying(linkPath, base + "localPos", updateTendonAttachmentLocalPos);
+                    regScalarIfAuthored(linkKey, base + "gearing",  updateTendonAttachmentGearing);
+                    regAnyIfTimeVarying(linkKey, base + "localPos", updateTendonAttachmentLocalPos);
                 }
             }
         }
@@ -1850,9 +2145,10 @@ public:
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:deformableBody");
             const auto& scanDesc = scanned.deformables[i];
-            const SdfPath path = scanned.pathFor(scanDesc->primKey);
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanDesc->primKey));
 
-            PhysxDeformableBodyDesc* desc = convert::convertScannedDeformableBody(scanned, i, mAttachedStage.getSourceUnits());
+            PhysxDeformableBodyDesc* desc = convert::convertScannedDeformableBody(scanned, i, mAttachedStage.getSourceUnits(), mAttachedStage);
             if (!desc)
                 continue;
 
@@ -1860,46 +2156,49 @@ public:
             // hasSchema, prim types via isA). Attribute-value reads below
             // (restBendAnglesDefault, PhysxCollisionAPI offsets) stay direct.
             const omni::physics::parse::IPhysicsSource* src = mAttachedStage.getSource();
+            const omni::physics::parse::KnownTokens& tok = mAttachedStage.getKnownTokens();
 
             // Collision-geom path validation — mirrors
             // PhysicsBody.cpp::parseDeformableBody:856-899.  parse-lib
             // takes the first collisionGeomPath verbatim; the consumer
             // does the type-of-prim sanity check.
-            if (desc->collisionMeshPath.IsEmpty())
+            if (!desc->collisionMeshKey.valid())
             {
                 CARB_LOG_WARN("No UsdPhysics.CollisionAPI found on deformable body prim or sub-tree, which is currently unsupported. "
-                              "Parsing failed. Prim: %s", path.GetText());
+                              "Parsing failed. Prim: %s", mAttachedStage.textFor(path));
                 ICE_FREE(desc);
                 continue;
             }
-            const omni::physics::parse::ObjectKey collKey =
-                src ? mAttachedStage.keyFor(desc->collisionMeshPath) : omni::physics::parse::ObjectKey{};
+            const omni::physics::parse::ObjectKey collKey = desc->collisionMeshKey;
             if (desc->type == eVolumeDeformableBody)
             {
-                if (!src || !src->isA(collKey, schemaTypeToken<UsdGeomTetMesh>(*src)))
+                // isTetMeshLike, not isA(UsdGeomTetMesh): ovstage reports a UsdGeomTetMesh as
+                // plain "Mesh" (its populator has no TetMesh mapping). See
+                // PhysXTools.h::isTetMeshLike.
+                if (!src || !omni::physx::internal::isTetMeshLike(mAttachedStage, collKey))
                 {
                     CARB_LOG_WARN("UsdPhysics.CollisionAPI on UsdGeomPointBased that are not UsdGeomTetMesh "
                                   "is currently not supported for volume deformables. Parsing failed. Prim: %s",
-                                  path.GetText());
+                                  mAttachedStage.textFor(path));
                     ICE_FREE(desc);
                     continue;
                 }
             }
             else if (desc->type == eSurfaceDeformableBody)
             {
-                if (!src || !src->isA(collKey, schemaTypeToken<UsdGeomMesh>(*src)))
+                if (!src || !src->isA(collKey, tok.meshType))
                 {
                     CARB_LOG_WARN("UsdPhysics.CollisionAPI on UsdGeomPointBased that are not UsdGeomMesh "
                                   "is currently not supported for surface deformables. Parsing failed. Prim: %s",
-                                  path.GetText());
+                                  mAttachedStage.textFor(path));
                     ICE_FREE(desc);
                     continue;
                 }
-                if (desc->collisionMeshPath != desc->simMeshPath)
+                if (desc->collisionMeshKey != desc->simMeshKey)
                 {
                     CARB_LOG_WARN("UsdPhysics.CollisionAPI found on different prim than UsdPhysics.SurfaceDeformableSimAPI, "
                                   "which is currently not supported for surface deformables. Parsing failed. Prim: %s",
-                                  path.GetText());
+                                  mAttachedStage.textFor(path));
                     ICE_FREE(desc);
                     continue;
                 }
@@ -1910,15 +2209,13 @@ public:
             // through the source; mirrors PhysicsBody.cpp:842-854.
             if (desc->type == eSurfaceDeformableBody && src)
             {
-                const omni::physics::parse::ObjectKey simKey = mAttachedStage.keyFor(desc->simMeshPath);
-                if (src->hasSchema(simKey,
-                                   src->internToken(OmniUsdPhysicsDeformableSchemaTokens->OmniPhysicsSurfaceDeformableSimAPI.GetString())))
+                const omni::physics::parse::ObjectKey simKey = desc->simMeshKey;
+                if (src->hasSchema(simKey, tok.omniPhysicsSurfaceDeformableSimAPI))
                 {
-                    const auto rbaTok = src->internToken(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsRestBendAnglesDefault.GetString());
+                    const auto rbaTok = tok.omniphysicsRestBendAnglesDefault;
                     omni::physics::parse::TokenId val{};
                     if (src->getAttribute(simKey, rbaTok, val) && val.valid())
-                        static_cast<PhysxSurfaceDeformableBodyDesc*>(desc)->restBendAnglesDefault =
-                            PXR_NS::TfToken(std::string(src->tokenToString(val)));
+                        static_cast<PhysxSurfaceDeformableBodyDesc*>(desc)->restBendAnglesDefault = val;
                 }
             }
 
@@ -1927,8 +2224,8 @@ public:
             // Routed through the source; mirrors PhysicsBody.cpp:904-965.
             if (src)
             {
-                const auto coTok = src->internToken(PhysxSchemaTokens->physxCollisionContactOffset.GetString());
-                const auto roTok = src->internToken(PhysxSchemaTokens->physxCollisionRestOffset.GetString());
+                const auto coTok = tok.physxCollisionContactOffset;
+                const auto roTok = tok.physxCollisionRestOffset;
                 float contactOffset = desc->contactOffset;
                 float restOffset = desc->restOffset;
                 if (src->hasAuthoredAttribute(collKey, coTok))
@@ -1938,23 +2235,69 @@ public:
                     if (!std::isinf(v) && v >= 0.0f && v <= FLT_MAX)
                         contactOffset = v;
                     if (src->isAttributeTimeSampled(collKey, coTok))
-                        mAttachedStage.registerTimeSampledAttribute(
-                            desc->collisionMeshPath.AppendProperty(PhysxSchemaTokens->physxCollisionContactOffset),
-                            updateDeformableContactOffset);
+                        mAttachedStage.registerTimeSampledAttribute(collKey, coTok, updateDeformableContactOffset);
                 }
                 if (src->hasAuthoredAttribute(collKey, roTok))
                 {
                     float v = restOffset;
                     src->getAttribute(collKey, roTok, v);
-                    if (!std::isinf(v) && v >= -FLT_MAX && v <= FLT_MAX)
+                    // Threshold test, not an exact isinf() test: a resolved-value
+                    // backend publishes the unset rest offset as -FLT_MAX rather
+                    // than -inf, and "published" means "authored" there, so the
+                    // hasAuthoredAttribute gate above does not filter it out.
+                    // Same sentinel detection as ParseCollision.cpp's isUnset.
+                    constexpr float kFiniteLimitSentinel = 0.5e38f;
+                    if (!std::isinf(v) && v >= -kFiniteLimitSentinel && v <= FLT_MAX)
                         restOffset = v;
                     if (src->isAttributeTimeSampled(collKey, roTok))
-                        mAttachedStage.registerTimeSampledAttribute(
-                            desc->collisionMeshPath.AppendProperty(PhysxSchemaTokens->physxCollisionRestOffset),
-                            updateDeformableRestOffset);
+                        mAttachedStage.registerTimeSampledAttribute(collKey, roTok, updateDeformableRestOffset);
                 }
-                if (contactOffset >= restOffset) desc->contactOffset = contactOffset;
-                if (restOffset < contactOffset) desc->restOffset = restOffset;
+                // Resolve the effective pair before cross-validation: a Newton
+                // margin can make contact valid below the temporary default rest.
+                // Newton collision offsets are fallbacks on the collision mesh,
+                // just as in ParseCollision.cpp. Resolved-value sources publish
+                // the PhysX schema's unset sentinel as an authored column, so
+                // precedence must test the value rather than the authored bit.
+                bool hasNewtonOffset = false;
+                if (!isPhysxOffsetAuthored(mAttachedStage, collKey, roTok))
+                {
+                    float margin;
+                    if (src->getAttribute(collKey, tok.newtonContactMargin, margin)
+                        && std::isfinite(margin) && margin >= 0.0f)
+                    {
+                        restOffset = margin;
+                        hasNewtonOffset = true;
+                    }
+                }
+                if (!isPhysxOffsetAuthored(mAttachedStage, collKey, coTok))
+                {
+                    float gap;
+                    if (src->getAttribute(collKey, tok.newtonContactGap, gap)
+                        && std::isfinite(gap) && gap >= 0.0f
+                        && std::isfinite(restOffset + gap))
+                    {
+                        contactOffset = restOffset + gap;
+                        hasNewtonOffset = true;
+                    }
+                }
+                // Match the rigid Newton fallback's strict-order adjustment,
+                // without changing the legacy pair or the automatic sentinel.
+                if (hasNewtonOffset && contactOffset >= 0.0f && contactOffset <= restOffset)
+                    contactOffset = restOffset + 1e-4f;
+
+                // Preserve the automatic contact sentinel and the authored rest
+                // offset together. desc->contactOffset is -1 until a deformable
+                // body is created (Descriptors.h: "sentinel: recompute in PhysX
+                // layer"), so comparing restOffset against it discards every
+                // authored value above -1 before UsdInterfaceDeformable.cpp can
+                // compute the automatic contact distance -- silently leaving the
+                // 0.02 / metersPerUnit default. Same shape as the rigid-collider
+                // fix in ParseCollision.cpp:182-185 (NVBug 6760220).
+                if (contactOffset < 0.0f || contactOffset >= restOffset) desc->contactOffset = contactOffset;
+                // At equality, deriveCollisionOffsets diagnoses and raises the
+                // contact offset before PhysX requires strict ordering.
+                if (contactOffset < 0.0f || restOffset <= contactOffset) desc->restOffset = restOffset;
+
                 // collisionGroup is resolved later in the
                 // createDeformableBody loop, after processScannedDescs
                 // fully populates the CollisionGroupsMap.
@@ -1964,31 +2307,35 @@ public:
             // desc (populated by `getDeformableMaterialBinding`).  Re-
             // resolve via the source's material binding — parse-lib
             // doesn't snapshot this.
-            SdfPath simMeshMaterial;
-            if (src && !desc->simMeshPath.IsEmpty())
+            omni::physics::parse::ObjectKey simMeshMaterial;
+            if (src && desc->simMeshKey.valid())
             {
                 const omni::physics::parse::ObjectKey matKey =
-                    src->getMaterialBinding(mAttachedStage.keyFor(desc->simMeshPath));
+                    src->getMaterialBinding(desc->simMeshKey);
                 if (matKey.valid())
-                    simMeshMaterial = mAttachedStage.pathFor(matKey);
+                    simMeshMaterial = matKey;
             }
 
-            // Translate sourceFilteredCollisions → mFilteredPairs.
-            for (const auto& fk : scanDesc->sourceFilteredCollisions)
+            // Translate sourceFilteredCollisions -> mFilteredPairs.  `fk` is minted by
+            // `scanned`'s own scan-time source, so it needs the same opaque-identity
+            // rekey as `path` above before joining mAttachedStage's namespace.
+            for (const omni::physics::parse::ObjectKey fk : scanDesc->sourceFilteredCollisions)
             {
-                const SdfPath fp = scanned.pathFor(fk);
-                if (!fp.IsEmpty())
-                    mFilteredPairs.push_back(std::make_pair(path, fp));
+                const omni::physics::parse::ObjectKey fpKey =
+                    mAttachedStage.keyFor(scanned.source().sourceKeyToString(fk));
+                if (fpKey.valid())
+                    mFilteredPairs.push_back(std::make_pair(path, fpKey));
             }
 
             // Resolve first simulationOwner → sceneId.  Legacy ignores
             // owners beyond the first (PhysicsBody.cpp:988).
             if (!scanDesc->sourceSimulationOwners.empty())
             {
-                const SdfPath sp = scanned.pathFor(scanDesc->sourceSimulationOwners[0]);
-                if (!sp.IsEmpty())
+                const omni::physics::parse::ObjectKey sceneKey =
+                    mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanDesc->sourceSimulationOwners[0]));
+                if (sceneKey.valid())
                 {
-                    const ObjectId entry = mAttachedStage.getObjectDatabase()->findEntry(sp, eScene);
+                    const ObjectId entry = mAttachedStage.getObjectDatabase()->findEntry(sceneKey, eScene);
                     if (entry != kInvalidObjectId)
                         desc->sceneId = entry;
                 }
@@ -1997,13 +2344,14 @@ public:
             // ObjectDatabase schema-flag tagging — duplicates the
             // legacy listener case (LoadStage.cpp:1043-1048) that ran
             // right after parseDeformableBody returned.
+            const omni::physics::parse::ObjectKey simMeshKey = desc->simMeshKey;
             if (desc->type == eVolumeDeformableBody)
-                mAttachedStage.getObjectDatabase()->addSchemaAPI(desc->simMeshPath, SchemaAPIFlag::eVolumeDeformableSimAPI);
+                mAttachedStage.getObjectDatabase()->addSchemaAPI(simMeshKey, SchemaAPIFlag::eVolumeDeformableSimAPI);
             else if (desc->type == eSurfaceDeformableBody)
-                mAttachedStage.getObjectDatabase()->addSchemaAPI(desc->simMeshPath, SchemaAPIFlag::eSurfaceDeformableSimAPI);
-            mAttachedStage.getObjectDatabase()->addSchemaAPI(desc->simMeshPath, SchemaAPIFlag::eDeformablePoseAPI);
-            for (SdfPath skinGeomPath : desc->skinGeomPaths)
-                mAttachedStage.getObjectDatabase()->addSchemaAPI(skinGeomPath, SchemaAPIFlag::eDeformablePoseAPI);
+                mAttachedStage.getObjectDatabase()->addSchemaAPI(simMeshKey, SchemaAPIFlag::eSurfaceDeformableSimAPI);
+            mAttachedStage.getObjectDatabase()->addSchemaAPI(simMeshKey, SchemaAPIFlag::eDeformablePoseAPI);
+            for (const omni::physics::parse::ObjectKey skinGeomKey : desc->skinGeomPaths)
+                mAttachedStage.getObjectDatabase()->addSchemaAPI(skinGeomKey, SchemaAPIFlag::eDeformablePoseAPI);
 
             // Schema-API flags on the body prim itself.  Mirrors trunk
             // LoadStage.cpp:869-895 (the per-prim switch case for
@@ -2015,17 +2363,16 @@ public:
             // the runtime updates never reach PhysX (TestDeformables.cpp:1272).
             {
                 mAttachedStage.getObjectDatabase()->addSchemaAPI(path, SchemaAPIFlag::eDeformableBodyAPI);
-                const omni::physics::parse::ObjectKey bodyKey =
-                    src ? mAttachedStage.keyFor(path) : omni::physics::parse::ObjectKey{};
+                const omni::physics::parse::ObjectKey bodyKey = src ? path : omni::physics::parse::ObjectKey{};
                 if (src && src->exists(bodyKey))
                 {
-                    if (src->hasSchema(bodyKey, src->internToken(PhysxSchemaTokens->PhysxAutoDeformableBodyAPI.GetString())))
+                    if (src->hasSchema(bodyKey, tok.physxAutoDeformableBodyAPI))
                     {
                         mAttachedStage.getObjectDatabase()->addSchemaAPI(path, SchemaAPIFlag::eAutoDeformableBodyAPI);
-                        if (src->hasSchema(bodyKey, src->internToken(PhysxSchemaTokens->PhysxAutoDeformableMeshSimplificationAPI.GetString())))
+                        if (src->hasSchema(bodyKey, tok.physxAutoDeformableMeshSimplificationAPI))
                             mAttachedStage.getObjectDatabase()->addSchemaAPI(path, SchemaAPIFlag::eAutoDeformableMeshSimplificationAPI);
                         if (desc->type == eVolumeDeformableBody &&
-                            src->hasSchema(bodyKey, src->internToken(PhysxSchemaTokens->PhysxAutoDeformableHexahedralMeshAPI.GetString())))
+                            src->hasSchema(bodyKey, tok.physxAutoDeformableHexahedralMeshAPI))
                             mAttachedStage.getObjectDatabase()->addSchemaAPI(path, SchemaAPIFlag::eAutoDeformableHexahedralMeshAPI);
                     }
                 }
@@ -2045,7 +2392,8 @@ public:
         for (auto& scanArt : scanned.articulations)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:articulation");
-            const SdfPath path = scanned.pathFor(scanArt->articulationPrim);
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanArt->articulationPrim));
 
             if (mNumScenes > 1)
             {
@@ -2053,30 +2401,33 @@ public:
                 // all articulatedBodies share the same simulationOwner
                 // and that the owner resolves to a registered scene.
                 bool firstBody = true;
-                SdfPath owner;
+                omni::physics::parse::ObjectKey owner;
                 bool ownerConsistent = true;
                 for (const auto& bk : scanArt->articulatedBodies)
                 {
-                    const SdfPath bodyPath = scanned.pathFor(bk);
-                    if (bodyPath.IsEmpty()) continue;
-                    const SdfPath bodyOwner = getRigidBodySimulationOwner(mAttachedStage, bodyPath);
+                    if (!bk.valid()) continue;
+                    const omni::physics::parse::ObjectKey bodyKey =
+                        mAttachedStage.keyFor(scanned.source().sourceKeyToString(bk));
+                    // getRigidBodySimulationOwner is ObjectKey-native (ADR-0019).
+                    const omni::physics::parse::ObjectKey bodyOwner =
+                        getRigidBodySimulationOwner(mAttachedStage, bodyKey);
                     if (firstBody) { owner = bodyOwner; firstBody = false; }
                     else if (owner != bodyOwner)
                     {
                         CARB_LOG_ERROR("Articulation contains bodies with different simulation owners. Articulation: %s",
-                                       path.GetText());
+                                       mAttachedStage.textFor(path));
                         ownerConsistent = false;
                         break;
                     }
                 }
                 if (!ownerConsistent)
                     continue;
-                if (!owner.IsEmpty() &&
+                if (owner.valid() &&
                     mAttachedStage.getObjectDatabase()->findEntry(owner, eScene) == kInvalidObjectId)
                     continue;
             }
 
-            PhysxArticulationDesc* desc = scanArt.release();
+            PhysxArticulationDesc* desc = scanArt.get();
             if (!desc)
                 continue;
 
@@ -2085,7 +2436,7 @@ public:
             // articulation creation does `attachedStage.pathFor(...)` and
             // would get empty paths from scan-source keys.
             auto rekey = [&](omni::physics::parse::ObjectKey k) {
-                return k.valid() ? mAttachedStage.keyFor(scanned.pathFor(k)) : omni::physics::parse::ObjectKey{};
+                return k.valid() ? mAttachedStage.keyFor(scanned.source().sourceKeyToString(k)) : omni::physics::parse::ObjectKey{};
             };
             desc->articulationPrim = rekey(desc->articulationPrim);
             desc->rootPrim         = rekey(desc->rootPrim);
@@ -2105,12 +2456,12 @@ public:
             // empty after release()).
             for (const auto& fk : desc->sourceFilteredCollisions)
             {
-                const SdfPath fp = scanned.pathFor(fk);
-                if (!fp.IsEmpty())
-                    mFilteredPairs.push_back(std::make_pair(path, fp));
+                const omni::physics::parse::ObjectKey fpKey = rekey(fk);
+                if (fpKey.valid())
+                    mFilteredPairs.push_back(std::make_pair(desc->articulationPrim, fpKey));
             }
 
-            mArticulationMap[path].push_back(desc);
+            mArticulationMap[desc->articulationPrim].push_back(desc);
         }
 
         // ----- Joints ---------------------------------------------
@@ -2119,108 +2470,81 @@ public:
         // PhysicsBody.cpp::checkJointBodySimulationOwners and the
         // body-transform-equality check legacy applies per joint type
         // (parse-lib can't compute that — it has no xformCache).
+        // USD keeps the per-joint tendon-axis check; ovstage skips it when no prim applies the API.
+        bool stageHasTendons = true;
+        // Under ovstage the scan source and the attach source share one intern table, so a
+        // scan key canonicalizes directly via canonicalKey() (no SdfPath round-trip). USD
+        // attaches keep keyFor(pathFor()): their two UsdSource keyspaces differ.
+        omni::physics::ovstage::OvstageSource* ovAttachSrc =
+            dynamic_cast<omni::physics::ovstage::OvstageSource*>(mAttachedStage.getSource());
+        // Only joints consume this flag. On a render-only attachment the generic
+        // multi-apply presence fallback would read every schema row for an empty loop.
+        if (ovAttachSrc && !scanned.joints.empty())
+        {
+            static const char* const kTendonAxisApi[] = { "PhysxTendonAxisAPI" };
+            stageHasTendons = ovAttachSrc->stageHasAnySchema(kTendonAxisApi, 1).value_or(true);
+        }
         for (auto& scanJoint : scanned.joints)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:joint");
-            const SdfPath path = scanned.pathFor(scanJoint->jointPrimKey);
-            const SdfPath body0Path = scanned.pathFor(scanJoint->body0);
-            const SdfPath body1Path = scanned.pathFor(scanJoint->body1);
+
+            // Re-key a scan-source key into the AttachedStage source (ovstage: canonicalKey;
+            // USD: path round-trip).
+            auto rekey = [&](omni::physics::parse::ObjectKey k) -> omni::physics::parse::ObjectKey {
+                if (!k.valid())
+                    return {};
+                return ovAttachSrc ? ovAttachSrc->canonicalKey(k)
+                                   : mAttachedStage.keyFor(scanned.source().sourceKeyToString(k));
+            };
 
             if (mNumScenes > 1)
             {
-                const SdfPath simOwner0 = getRigidBodySimulationOwner(mAttachedStage, body0Path);
-                const SdfPath simOwner1 = getRigidBodySimulationOwner(mAttachedStage, body1Path);
-                if (!body0Path.IsEmpty() && !body1Path.IsEmpty() && simOwner0 != simOwner1)
+                // getRigidBodySimulationOwner is ObjectKey-native (ADR-0019).
+                const omni::physics::parse::ObjectKey simOwner0 =
+                    getRigidBodySimulationOwner(mAttachedStage, rekey(scanJoint->body0));
+                const omni::physics::parse::ObjectKey simOwner1 =
+                    getRigidBodySimulationOwner(mAttachedStage, rekey(scanJoint->body1));
+                if (scanJoint->body0.valid() && scanJoint->body1.valid() && simOwner0 != simOwner1)
                 {
                     CARB_LOG_ERROR("Cannot create joint between bodies that belong to different owners. Joint: %s",
-                                   path.GetText());
+                                   mAttachedStage.textFor(rekey(scanJoint->jointPrimKey)));
                     continue;
                 }
-                const SdfPath owner = !simOwner0.IsEmpty() ? simOwner0 : simOwner1;
-                if (!owner.IsEmpty() &&
+                const omni::physics::parse::ObjectKey owner = simOwner0.valid() ? simOwner0 : simOwner1;
+                if (owner.valid() &&
                     mAttachedStage.getObjectDatabase()->findEntry(owner, eScene) == kInvalidObjectId)
                     continue;
             }
 
-            PhysxJointDesc* desc = nullptr;
-            // For eJointCustom, parse-lib's CustomPhysxJointDesc has a
-            // different field layout than the consumer-side
-            // `usdparser::CustomPhysxJointDesc` (TokenId vs TfToken,
-            // ObjectKey vs SdfPath on Gear/Rack subclasses), so a
-            // `static_cast` from the parse-lib subclass to the consumer
-            // subclass would read past the parse-lib allocation. Detect
-            // gear / rack / registered-custom from the prim type and
-            // allocate the consumer-side typed desc directly from the
-            // base fields. Mirrors Joint.cpp:713-779.
-            // Gear / rack are now first-class typed joints captured by the
-            // walker (parse-lib GearPhysxJointDesc/RackPhysxJointDesc, ObjectKey
-            // targets). Convert to the engine desc (SdfPath targets) without any
-            // USD re-read. Third-party custom joints still resolve via the
-            // CustomJointManager below.
-            if (scanJoint->type == eJointGear)
+            PhysxJointDesc* desc = scanJoint.get();
+            if (desc->type == eJointGear)
             {
-                auto* gearDesc = ICE_PLACEMENT_NEW(GearPhysxJointDesc)();
-                static_cast<PhysxJointDesc&>(*gearDesc) = *scanJoint;
-                gearDesc->type = eJointGear;
-                const auto* scanGear = static_cast<const omni::physics::parse::GearPhysxJointDesc*>(&*scanJoint);
-                gearDesc->gearRatio = scanGear->gearRatio;
-                // hinge keys are parse-time ScannedStage keys -> resolve via scanned.pathFor
-                // (NOT the persistent AttachedStage source; different intern tables).
-                gearDesc->hingePrimPath0 = scanned.pathFor(scanGear->hingePrimPath0);
-                gearDesc->hingePrimPath1 = scanned.pathFor(scanGear->hingePrimPath1);
-                desc = gearDesc;
+                GearPhysxJointDesc* gear = static_cast<GearPhysxJointDesc*>(desc);
+                gear->hingePrimPath0 = rekey(gear->hingePrimPath0);
+                gear->hingePrimPath1 = rekey(gear->hingePrimPath1);
             }
-            else if (scanJoint->type == eJointRackAndPinion)
+            else if (desc->type == eJointRackAndPinion)
             {
-                auto* rackDesc = ICE_PLACEMENT_NEW(RackPhysxJointDesc)();
-                static_cast<PhysxJointDesc&>(*rackDesc) = *scanJoint;
-                rackDesc->type = eJointRackAndPinion;
-                const auto* scanRack = static_cast<const omni::physics::parse::RackPhysxJointDesc*>(&*scanJoint);
-                rackDesc->ratio = scanRack->ratio;
-                rackDesc->hingePrimPath = scanned.pathFor(scanRack->hingePrimKey);
-                rackDesc->prismaticPrimPath = scanned.pathFor(scanRack->prismaticPrimKey);
-                desc = rackDesc;
+                RackPhysxJointDesc* rack = static_cast<RackPhysxJointDesc*>(desc);
+                rack->hingePrimKey = rekey(rack->hingePrimKey);
+                rack->prismaticPrimKey = rekey(rack->prismaticPrimKey);
             }
-            else if (scanJoint->type == eJointCustom)
+            else if (desc->type == eJointCustom)
             {
-                // Custom joints are keyed by the prim's raw type name (not a schema
-                // hierarchy), so read it through the source (no UsdPrim).
-                const omni::physics::parse::IPhysicsSource* csrc = mAttachedStage.getSource();
-                if (csrc && csrc->exists(mAttachedStage.keyFor(path)))
-                {
-                    const TfToken typeName(
-                        std::string(csrc->tokenToString(csrc->getTypeName(mAttachedStage.keyFor(path)))));
-                    const auto& customMap = OmniPhysX::getInstance().getCustomJointManager().getCustomJointTypeMap();
-                    if (customMap.find(typeName) != customMap.end())
-                    {
-                        auto* customDesc = ICE_PLACEMENT_NEW(CustomPhysxJointDesc)();
-                        static_cast<PhysxJointDesc&>(*customDesc) = *scanJoint;
-                        customDesc->type = eJointCustom;
-                        customDesc->customJointToken = typeName;
-                        desc = customDesc;
-                    }
-                }
-                if (!desc)
-                {
-                    // Unrecognised custom joint — drop. Mirrors legacy
-                    // default of returning nullptr from parseJoint.
+                const omni::physics::parse::IPhysicsSource* source = mAttachedStage.getSource();
+                const omni::physics::parse::ObjectKey jointKey = rekey(desc->jointPrimKey);
+                if (!source || !source->exists(jointKey))
                     continue;
-                }
-            }
-            else
-            {
-                desc = scanJoint.release();
-                if (!desc)
+                const omni::physics::parse::TokenId typeName = source->getTypeName(jointKey);
+                const std::string name(source->tokenToString(typeName));
+                const CustomJointTypeMap& customMap = OmniPhysX::getInstance().getCustomJointManager().getCustomJointTypeMap();
+                if (customMap.find(name) == customMap.end())
                     continue;
+                static_cast<CustomPhysxJointDesc*>(desc)->customJointToken = typeName;
             }
 
-            // Re-key body0/body1/rel0/rel1/jointPrimKey from scanStage's
-            // internal source into the consumer's AttachedStage source —
-            // downstream createJoint does attachedStage.pathFor() and would
-            // get empty paths without this (REQ-PARSE-CONSUMER-001 AC-5).
-            auto rekey = [&](omni::physics::parse::ObjectKey k) {
-                return k.valid() ? mAttachedStage.keyFor(scanned.pathFor(k)) : omni::physics::parse::ObjectKey{};
-            };
+            // Re-key body0/body1/rel0/rel1/jointPrimKey into the AttachedStage source
+            // (REQ-PARSE-CONSUMER-001 AC-5).
             desc->jointPrimKey = rekey(desc->jointPrimKey);
             desc->body0 = rekey(desc->body0);
             desc->body1 = rekey(desc->body1);
@@ -2246,32 +2570,38 @@ public:
                 break;
             default: break;
             }
+            // Body-transform-equality diagnostic.
             if (checkPos || checkRot)
             {
                 // Body world transforms via the source (EarliestTime, matching
                 // the replaced mXfCache); validity via the source mirrors the
                 // prior prim.IsValid() gate (no UsdPrim).
+                // desc->body0/body1 are already the rekeyed AttachedStage keys.
                 const omni::physics::parse::IPhysicsSource* jbSrc = mAttachedStage.getSource();
-                const bool body0Valid = jbSrc && jbSrc->exists(mAttachedStage.keyFor(body0Path));
-                const bool body1Valid = jbSrc && jbSrc->exists(mAttachedStage.keyFor(body1Path));
-                const GfMatrix4d body0World =
-                    body0Valid ? internal::getWorldTransform(mAttachedStage, mAttachedStage.keyFor(body0Path)) : GfMatrix4d(1.0);
-                const GfMatrix4d body1World =
-                    body1Valid ? internal::getWorldTransform(mAttachedStage, mAttachedStage.keyFor(body1Path)) : GfMatrix4d(1.0);
-                desc->validBodyTransformations = primutils::isBodyTransformEqual(
+                const bool body0Valid = jbSrc && jbSrc->exists(desc->body0);
+                const bool body1Valid = jbSrc && jbSrc->exists(desc->body1);
+                // World matrices stay PhysX-typed into primutils::isBodyTransformEqual; an invalid
+                // body contributes identity (ignored there).
+                const ::physx::PxMat44d body0World =
+                    body0Valid ? internal::getWorldTransform(mAttachedStage, desc->body0) :
+                                 ::physx::PxMat44d(::physx::PxIdentity);
+                const ::physx::PxMat44d body1World =
+                    body1Valid ? internal::getWorldTransform(mAttachedStage, desc->body1) :
+                                 ::physx::PxMat44d(::physx::PxIdentity);
+                desc->validBodyTransformations = isJointBodyTransformEqual(
                     body0World, body0Valid, body1World, body1Valid,
-                    toVec3f(desc->localPose0Position), toQuatf(desc->localPose0Orientation),
-                    toVec3f(desc->localPose1Position), toQuatf(desc->localPose1Orientation),
-                    OmniPhysX::getInstance().getCachedSettings().jointBodyTransformCheckTolerance,
+                    toPhysX(desc->localPose0Position), toPhysXQuat(desc->localPose0Orientation),
+                    toPhysX(desc->localPose1Position), toPhysXQuat(desc->localPose1Orientation),
+                    mAttachedStage.getCachedSettings().jointBodyTransformCheckTolerance,
                     checkPos, checkRot, tmAxis);
             }
 
             JointDescAndPath jd;
-            jd.path = path;
+            jd.path = desc->jointPrimKey;
             jd.desc = desc;
             jd.articulationJoint = false;
             jd.index = uint32_t(mJointVector.size());
-            mJointPathIndexMap[path] = mJointVector.size();
+            mJointPathIndexMap[desc->jointPrimKey] = mJointVector.size();
             mJointVector.push_back(jd);
 
             // Mimic + tendon parsing moved into the native walker
@@ -2279,7 +2609,11 @@ public:
             // tendon-axis warning is preserved here since only this loop
             // has the joint type bucketing in front of it. Source-routed (no UsdPrim).
             const omni::physics::parse::IPhysicsSource* jsrc = mAttachedStage.getSource();
-            if (jsrc && jsrc->exists(mAttachedStage.keyFor(path)))
+            // Only the tendon-axis warning needs a token; read it from the attach-scoped cache.
+            const bool jointTypeTakesTendonWarn = desc->type == eJointFixed ||
+                desc->type == eJointSpherical || desc->type == eJointDistance;
+            // desc->jointPrimKey is already the rekeyed AttachedStage key.
+            if (stageHasTendons && jointTypeTakesTendonWarn && jsrc && jsrc->exists(desc->jointPrimKey))
             {
                 switch (desc->type)
                 {
@@ -2287,11 +2621,11 @@ public:
                 case eJointSpherical:
                 case eJointDistance:
                 {
-                    if (jsrc->hasSchema(mAttachedStage.keyFor(path),
-                                        schemaTypeToken<PhysxSchemaPhysxTendonAxisAPI>(*jsrc)))
+                    if (jsrc->hasSchema(desc->jointPrimKey,
+                                        mAttachedStage.getKnownTokens().physxTendonAxisAPI))
                     {
                         CARB_LOG_WARN("A Tendon Axis API was applied to an unsupported joint type at %s!",
-                                      path.GetText());
+                                      mAttachedStage.textFor(desc->jointPrimKey));
                     }
                     break;
                 }
@@ -2310,9 +2644,15 @@ public:
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:mimicJoint");
             MimicJointDesc engineDesc;
             engineDesc.type                 = scanMimic->type;
-            engineDesc.mimicJointPath       = scanned.pathFor(scanMimic->mimicJointKey);
+            // mimicJointKey/referenceJointKey are minted by the SCAN's own
+            // source and must be re-keyed into mAttachedStage's namespace
+            // (ADR-0019 increment 7; mirrors the tire-friction-table and
+            // articulation `rekey` pattern above) -- MimicJoint.cpp's
+            // createMimicJoint reads them against mAttachedStage's own
+            // ObjectDatabase.
+            engineDesc.mimicJointKey        = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanMimic->mimicJointKey));
             engineDesc.mimicJointAxis       = scanMimic->mimicJointAxis;
-            engineDesc.referenceJointPath   = scanned.pathFor(scanMimic->referenceJointKey);
+            engineDesc.referenceJointKey    = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanMimic->referenceJointKey));
             engineDesc.referenceJointAxis   = scanMimic->referenceJointAxis;
             engineDesc.gearing              = scanMimic->gearing;
             engineDesc.offset               = scanMimic->offset;
@@ -2331,20 +2671,33 @@ public:
         // `PhysxTendonFixedDesc::rootAxis` is wired by matching
         // jointKey + instanceToken against mTendonAxisMap.
         // See REQ-PARSE-TENDON-002 AC-6.
-        std::unordered_map<TfToken, std::shared_ptr<PhysxTendonAxisDesc>, TfToken::HashFunctor>
+        // Composite key is jointKey-string + ":" + instance-name-string, not a
+        // TfToken: both halves are only ever produced/consumed as strings here
+        // (tokenToString / SdfPath::GetString) for the axisByInstance lookup;
+        // mTendonAxisMap itself is ObjectKey-keyed (LoadTools.h retype), keyed
+        // below by the already-rekeyed engineDesc->link0/link1/jointKey.
+        std::unordered_map<std::string, std::shared_ptr<PhysxTendonAxisDesc>>
             axisByInstance; // jointKey:instance → engine axis ptr (for rootAxis wiring)
         for (const auto& scanAxis : scanned.fixedTendonAxes)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:fixedTendonAxis");
-            const TfToken instanceTok = scanned.tfTokenFor(scanAxis->instanceToken);
-            const SdfPath jointKey = scanned.pathFor(scanAxis->jointKey);
-            const SdfPath link0     = scanned.pathFor(scanAxis->link0);
-            const SdfPath link1     = scanned.pathFor(scanAxis->link1);
+            const std::string instanceTokStr = std::string(scanned.source().tokenToString(scanAxis->instanceToken));
+            // Both this loop and the fixedTendons loop below derive the composite
+            // axisByInstance key from sourceKeyToString, so they always agree.
+            const std::string jointKeyStr = std::string(scanned.source().sourceKeyToString(scanAxis->jointKey));
+            const omni::physics::parse::ObjectKey jointKey = mAttachedStage.keyFor(jointKeyStr);
+            const omni::physics::parse::ObjectKey link0 =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanAxis->link0));
+            const omni::physics::parse::ObjectKey link1 =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanAxis->link1));
 
             auto* engineDesc = ICE_PLACEMENT_NEW(PhysxTendonAxisDesc)();
             engineDesc->type              = scanAxis->type;
-            engineDesc->instanceToken     = instanceTok;
-            engineDesc->jointPath         = jointKey;
+            // instanceToken/jointKey/link0/link1 are minted by the SCAN's
+            // own source and must be re-interned/re-keyed into
+            // mAttachedStage's namespace (ADR-0019 increment 7).
+            engineDesc->instanceToken     = mAttachedStage.getSource() ? mAttachedStage.getSource()->internToken(instanceTokStr) : omni::physics::parse::TokenId{};
+            engineDesc->jointKey          = jointKey;
             engineDesc->link0             = link0;
             engineDesc->link1             = link1;
             engineDesc->gearings          = scanAxis->gearings;
@@ -2356,24 +2709,24 @@ public:
             std::shared_ptr<PhysxTendonAxisDesc> ptr(
                 engineDesc, [](PhysxTendonAxisDesc* p) { ICE_FREE(p); });
 
-            mTendonAxisMap[link0].push_back(ptr);
-            mTendonAxisMap[link1].push_back(ptr);
-            mTendonAxisMap[jointKey].push_back(ptr);
+            mTendonAxisMap[engineDesc->link0].push_back(ptr);
+            mTendonAxisMap[engineDesc->link1].push_back(ptr);
+            mTendonAxisMap[engineDesc->jointKey].push_back(ptr);
 
             // The "axis by instance on this joint" lookup is used below
             // to wire PhysxTendonFixedDesc::rootAxis.  Use a composite
             // key of jointKey + ":" + instance.
-            const TfToken composite(jointKey.GetString() + ":" + instanceTok.GetString());
+            const std::string composite = jointKeyStr + ":" + instanceTokStr;
             axisByInstance.emplace(composite, ptr);
 
-            registerTendonAxisChangeParam(mAttachedStage, instanceTok.GetString());
+            registerTendonAxisChangeParam(mAttachedStage, instanceTokStr);
 
             // Time-sampled callback for the axis gearing.  Matches legacy
             // parseAxes: ValueMightBeTimeVarying only (no HasAuthoredValue
             // gate — legacy registers via `gearingAttr.ValueMightBeTimeVarying()`).
-            if (tsSrc && tsSrc->exists(mAttachedStage.keyFor(jointKey)))
+            if (tsSrc && tsSrc->exists(jointKey))
             {
-                const std::string base = "physxTendon:" + instanceTok.GetString() + ":";
+                const std::string base = "physxTendon:" + instanceTokStr + ":";
                 regAnyIfTimeVarying(jointKey, base + "gearing", updateTendonAxisSingleGearing);
             }
         }
@@ -2381,13 +2734,17 @@ public:
         for (const auto& scanTendon : scanned.fixedTendons)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:fixedTendon");
-            const TfToken instanceTok = scanned.tfTokenFor(scanTendon->instanceToken);
-            const SdfPath jointKey   = scanned.pathFor(scanTendon->jointKey);
+            const std::string instanceTokStr = std::string(scanned.source().tokenToString(scanTendon->instanceToken));
+            const std::string jointKeyStr = std::string(scanned.source().sourceKeyToString(scanTendon->jointKey));
+            const omni::physics::parse::ObjectKey jointKey = mAttachedStage.keyFor(jointKeyStr);
 
             auto* engineDesc = ICE_PLACEMENT_NEW(PhysxTendonFixedDesc)();
             engineDesc->type            = eTendonFixed;
-            engineDesc->instanceToken   = instanceTok;
-            engineDesc->jointPath       = jointKey;
+            // instanceToken/jointKey are minted by the SCAN's own source and
+            // must be re-interned/re-keyed into mAttachedStage's namespace
+            // (ADR-0019 increment 7).
+            engineDesc->instanceToken   = mAttachedStage.getSource() ? mAttachedStage.getSource()->internToken(instanceTokStr) : omni::physics::parse::TokenId{};
+            engineDesc->jointKey        = jointKey;
             engineDesc->stiffness       = scanTendon->stiffness;
             engineDesc->damping         = scanTendon->damping;
             engineDesc->restLength      = scanTendon->restLength;
@@ -2399,7 +2756,7 @@ public:
             engineDesc->rootAxis        = nullptr;
 
             // Wire rootAxis by matching jointKey + instance.
-            const TfToken composite(jointKey.GetString() + ":" + instanceTok.GetString());
+            const std::string composite = jointKeyStr + ":" + instanceTokStr;
             auto axisIt = axisByInstance.find(composite);
             if (axisIt != axisByInstance.end())
                 engineDesc->rootAxis = axisIt->second.get();
@@ -2408,14 +2765,14 @@ public:
                 engineDesc, [](PhysxTendonFixedDesc* p) { ICE_FREE(p); });
             mFixedTendons.push_back(ptr);
 
-            registerFixedTendonChangeParams(mAttachedStage, instanceTok.GetString());
+            registerFixedTendonChangeParams(mAttachedStage, instanceTokStr);
 
             // Time-sampled callbacks for the fixed tendon root attributes.
             // Matches legacy parseFixedTendon's getAttribute chain
             // (HasAuthoredValue + ValueMightBeTimeVarying).
-            if (tsSrc && tsSrc->exists(mAttachedStage.keyFor(jointKey)))
+            if (tsSrc && tsSrc->exists(jointKey))
             {
-                const std::string base = "physxTendon:" + instanceTok.GetString() + ":";
+                const std::string base = "physxTendon:" + instanceTokStr + ":";
                 regScalarIfAuthored(jointKey, base + "stiffness",      updateFixedTendonStiffness);
                 regScalarIfAuthored(jointKey, base + "limitStiffness", updateFixedTendonLimitStiffness);
                 regScalarIfAuthored(jointKey, base + "damping",        updateFixedTendonDamping);
@@ -2428,23 +2785,29 @@ public:
         }
 
         // ----- DeformableAttachments -------------------------------
-        // Per-prim attachment desc, source-key cross-refs translated
-        // to SdfPath via scanned.pathFor().  Mirrors legacy
-        // reportObjectDesc(eAttachment*) case + parseDeformableAttachment.
+        // Per-prim attachment desc; src0/src1/primKey are minted by
+        // `scanned`'s own throwaway, parse-time source (ADR-0004 key-space
+        // invariant) and must be re-keyed into mAttachedStage's persistent
+        // namespace via a path round-trip -- every downstream consumer
+        // (InternalDeformableAttachment.cpp) resolves them through
+        // mAttachedStage. Mirrors legacy reportObjectDesc(eAttachment*) case
+        // + parseDeformableAttachment.
         for (const auto& scanAtt : scanned.attachments)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:deformableAttachment");
-            const SdfPath path = scanned.pathFor(scanAtt->primKey);
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanAtt->primKey));
             auto* outDesc = ICE_PLACEMENT_NEW(PhysxDeformableAttachmentDesc)();
             outDesc->type      = scanAtt->type;
+            outDesc->primKey   = path;
             outDesc->enabled   = scanAtt->enabled;
-            outDesc->src0      = scanned.pathFor(scanAtt->src0);
-            outDesc->src1      = scanned.pathFor(scanAtt->src1);
+            outDesc->src0      = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanAtt->src0));
+            outDesc->src1      = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanAtt->src1));
             outDesc->stiffness = scanAtt->stiffness;
             outDesc->damping   = scanAtt->damping;
 
             DeformableAttachmentDescAndPath entry;
-            entry.path = path;
+            entry.path = outDesc->primKey;
             entry.desc = outDesc;
             mDeformableAttachmentVector.push_back(entry);
         }
@@ -2453,14 +2816,16 @@ public:
         for (const auto& scanFilt : scanned.deformableCollisionFilters)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:deformableCollisionFilter");
-            const SdfPath path = scanned.pathFor(scanFilt->primKey);
+            const omni::physics::parse::ObjectKey path =
+                mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanFilt->primKey));
             auto* outDesc = ICE_PLACEMENT_NEW(PhysxDeformableCollisionFilterDesc)();
+            outDesc->primKey = path;
             outDesc->enabled = scanFilt->enabled;
-            outDesc->src0    = scanned.pathFor(scanFilt->src0);
-            outDesc->src1    = scanned.pathFor(scanFilt->src1);
+            outDesc->src0    = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanFilt->src0));
+            outDesc->src1    = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanFilt->src1));
 
             DeformableCollisionFilterDescAndPath entry;
-            entry.path = path;
+            entry.path = outDesc->primKey;
             entry.desc = outDesc;
             mDeformableCollisionFilterVector.push_back(entry);
         }
@@ -2479,16 +2844,18 @@ public:
             for (const auto& scanCct : scanned.ccts)
             {
                 CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:cct");
-                const SdfPath path = scanned.pathFor(scanCct->primKey);
+                const omni::physics::parse::ObjectKey path =
+                    mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanCct->primKey));
 
                 if (scanCct->sourceSimulationOwner.valid())
                 {
-                    const SdfPath ownerPath = scanned.pathFor(scanCct->sourceSimulationOwner);
-                    const ObjectId sceneId = db.findEntry(ownerPath, eScene);
+                    const omni::physics::parse::ObjectKey ownerKey =
+                        mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanCct->sourceSimulationOwner));
+                    const ObjectId sceneId = db.findEntry(ownerKey, eScene);
                     if (sceneId == kInvalidObjectId)
                     {
                         CARB_LOG_ERROR("parseCct: Failed to find physics simulation owner \"%s\".",
-                                       ownerPath.GetText());
+                                       mAttachedStage.textFor(ownerKey));
                         continue;
                     }
                     scanCct->sceneId = sceneId;
@@ -2499,21 +2866,27 @@ public:
 
         // ----- Tire friction tables (7A.1) -------------------------
         // Walker emitted parse-lib TireFrictionTableDescs into
-        // scanned.tireFrictionTables (with ObjectKey paths).  Translate
-        // to engine descriptor type (SdfPath paths) and stash in
-        // mTireFrictionTableDescList for the post-load creation block
-        // (which still owns ObjectDatabase material-id resolution +
-        // engine createObject).  See REQ-PARSE-VEH-TIREFRICTION-001 AC-5.
+        // scanned.tireFrictionTables. The engine descriptor is now the
+        // same aliased type (ADR-0019 increment 7), so most fields are a
+        // plain copy -- except `key`/`materialPaths`, which are minted by
+        // the SCAN's own source and must be re-keyed into mAttachedStage's
+        // namespace via a path round-trip before being stashed for the
+        // post-load creation block (which still owns ObjectDatabase
+        // material-id resolution + engine createObject, consumed later via
+        // UsdLoad::getActiveAttachedStage(), i.e. this same mAttachedStage).
+        // Mirrors the articulation `rekey` lambda above.
+        // See REQ-PARSE-VEH-TIREFRICTION-001 AC-5.
         for (const auto& scanTft : scanned.tireFrictionTables)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:tireFrictionTable");
             auto* engineDesc = ICE_PLACEMENT_NEW(TireFrictionTableDesc)();
-            engineDesc->path                 = scanned.pathFor(scanTft->key);
+            engineDesc->key                  = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanTft->key));
             engineDesc->defaultFrictionValue = scanTft->defaultFrictionValue;
             engineDesc->frictionValues       = scanTft->frictionValues;
+            // materialIds is resolved below, post-load, once all materials exist.
             engineDesc->materialPaths.reserve(scanTft->materialPaths.size());
             for (const omni::physics::parse::ObjectKey matKey : scanTft->materialPaths)
-                engineDesc->materialPaths.push_back(scanned.pathFor(matKey));
+                engineDesc->materialPaths.push_back(mAttachedStage.keyFor(scanned.source().sourceKeyToString(matKey)));
             mTireFrictionTableDescList.push_back(engineDesc);
         }
 
@@ -2525,7 +2898,7 @@ public:
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleContext");
             VehicleContextDesc engineDesc;
-            engineDesc.scenePath          = scanned.pathFor(scanCtx->sceneKey);
+            engineDesc.sceneKey           = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanCtx->sceneKey));
             engineDesc.vehicleUpdateMode  = static_cast<VehicleUpdateMode>(scanCtx->vehicleUpdateMode);
             engineDesc.upAxis             = scanCtx->upAxis;
             engineDesc.forwardAxis        = scanCtx->forwardAxis;
@@ -2534,23 +2907,27 @@ public:
             mVehicleContextDescList.push_back(engineDesc);
         }
 
-        // ----- Vehicle shareable components (7A.2) -----------------
+        // ----- Vehicle shareable components (7A.2) through ----------
+        // ----- Vehicles (7A.13) -------------------------------------
         // Walker emitted parse-lib WheelDesc / TireDesc / SuspensionDesc
         // into scanned.vehicleWheels / vehicleTires / vehicleSuspensions
         // (ObjectKey paths).  Translate to engine descriptors and
         // pre-populate the stage-level VehicleComponentTracker.  The
-        // legacy parseVehicle path looks up entries via SdfPath and
+        // legacy parseVehicle path looks up entries via ObjectKey and
         // short-circuits when found, so per-component legacy parsers
         // (parseWheel/parseTire/parseSuspension) are unreachable during
         // vehicle parsing.
+        //
+        // Scan-time ObjectKeys are re-keyed into mAttachedStage's namespace: scanned and
+        // mAttachedStage are different intern tables even when scanning the full stage.
         for (const auto& scanWheel : scanned.vehicleWheels)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleWheel");
-            const SdfPath path = scanned.pathFor(scanWheel->key);
-            if (mVehicleComponentTracker.mWheels.find(path) != mVehicleComponentTracker.mWheels.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanWheel->key));
+            if (mVehicleComponentTracker.mWheels.find(key) != mVehicleComponentTracker.mWheels.end())
                 continue;
             WheelDesc* engineDesc = ICE_PLACEMENT_NEW(WheelDesc)();
-            engineDesc->path                  = path;
+            engineDesc->key                   = key;
             engineDesc->radius                = scanWheel->radius;
             engineDesc->width                 = scanWheel->width;
             engineDesc->mass                  = scanWheel->mass;
@@ -2560,16 +2937,16 @@ public:
             engineDesc->maxHandBrakeTorque    = scanWheel->maxHandBrakeTorque;
             engineDesc->maxSteerAngle         = scanWheel->maxSteerAngle;
             engineDesc->toeAngle              = scanWheel->toeAngle;
-            mVehicleComponentTracker.mWheels.insert({ path, engineDesc });
+            mVehicleComponentTracker.mWheels.insert({ key, engineDesc });
         }
         for (const auto& scanTire : scanned.vehicleTires)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleTire");
-            const SdfPath path = scanned.pathFor(scanTire->key);
-            if (mVehicleComponentTracker.mTires.find(path) != mVehicleComponentTracker.mTires.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanTire->key));
+            if (mVehicleComponentTracker.mTires.find(key) != mVehicleComponentTracker.mTires.end())
                 continue;
             TireDesc* engineDesc = ICE_PLACEMENT_NEW(TireDesc)();
-            engineDesc->path                                = path;
+            engineDesc->key                                 = key;
             engineDesc->latStiffX                           = scanTire->latStiffX;
             engineDesc->latStiffY                           = scanTire->latStiffY;
             engineDesc->lateralStiffnessGraph               = scanTire->lateralStiffnessGraph;
@@ -2580,18 +2957,18 @@ public:
             for (uint32_t i = 0; i < 3; ++i)
                 engineDesc->frictionVsSlipGraph[i]          = scanTire->frictionVsSlipGraph[i];
             engineDesc->frictionTableId                     = kInvalidObjectId;
-            engineDesc->frictionTablePath                   = scanned.pathFor(scanTire->frictionTableKey);
+            engineDesc->frictionTableKey                    = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanTire->frictionTableKey));
             engineDesc->restLoad                            = scanTire->restLoad;
-            mVehicleComponentTracker.mTires.insert({ path, engineDesc });
+            mVehicleComponentTracker.mTires.insert({ key, engineDesc });
         }
         for (const auto& scanSusp : scanned.vehicleSuspensions)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleSuspension");
-            const SdfPath path = scanned.pathFor(scanSusp->key);
-            if (mVehicleComponentTracker.mSuspensions.find(path) != mVehicleComponentTracker.mSuspensions.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanSusp->key));
+            if (mVehicleComponentTracker.mSuspensions.find(key) != mVehicleComponentTracker.mSuspensions.end())
                 continue;
             SuspensionDesc* engineDesc = ICE_PLACEMENT_NEW(SuspensionDesc)();
-            engineDesc->path                    = path;
+            engineDesc->key                     = key;
             engineDesc->springStrength          = scanSusp->springStrength;
             engineDesc->springDamperRate        = scanSusp->springDamperRate;
             engineDesc->travelDistance          = scanSusp->travelDistance;
@@ -2601,21 +2978,18 @@ public:
             engineDesc->camberAtMaxCompression  = scanSusp->camberAtMaxCompression;
             engineDesc->camberAtMaxDroop        = scanSusp->camberAtMaxDroop;
             engineDesc->sprungMass              = scanSusp->sprungMass;
-            mVehicleComponentTracker.mSuspensions.insert({ path, engineDesc });
+            mVehicleComponentTracker.mSuspensions.insert({ key, engineDesc });
         }
 
-        // ----- Vehicle drivetrain components (7A.3) ----------------
-        // Engine / Gears / Clutch.  AutoGearBox stays legacy until 7A.4
-        // because parseAutoGearBox needs forwardGearCount from the
-        // parent DriveStandard.gears rel target.
+        // Populate drivetrain components before resolving DriveStandard references.
         for (const auto& scanEng : scanned.vehicleEngines)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleEngine");
-            const SdfPath path = scanned.pathFor(scanEng->key);
-            if (mVehicleComponentTracker.mEngines.find(path) != mVehicleComponentTracker.mEngines.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanEng->key));
+            if (mVehicleComponentTracker.mEngines.find(key) != mVehicleComponentTracker.mEngines.end())
                 continue;
             EngineDesc* engineDesc = ICE_PLACEMENT_NEW(EngineDesc)();
-            engineDesc->path                                = path;
+            engineDesc->key                                 = key;
             engineDesc->moi                                 = scanEng->moi;
             engineDesc->peakTorque                          = scanEng->peakTorque;
             engineDesc->maxRotationSpeed                    = scanEng->maxRotationSpeed;
@@ -2626,29 +3000,42 @@ public:
             engineDesc->dampingRateFullThrottle             = scanEng->dampingRateFullThrottle;
             engineDesc->dampingRateZeroThrottleClutchEngaged    = scanEng->dampingRateZeroThrottleClutchEngaged;
             engineDesc->dampingRateZeroThrottleClutchDisengaged = scanEng->dampingRateZeroThrottleClutchDisengaged;
-            mVehicleComponentTracker.mEngines.insert({ path, engineDesc });
+            mVehicleComponentTracker.mEngines.insert({ key, engineDesc });
         }
         for (size_t i = 0; i < scanned.vehicleGears.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleGears");
-            const SdfPath path = scanned.pathFor(scanned.vehicleGearsPaths[i]);
-            if (mVehicleComponentTracker.mGears.find(path) != mVehicleComponentTracker.mGears.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleGearsPaths[i]));
+            if (mVehicleComponentTracker.mGears.find(key) != mVehicleComponentTracker.mGears.end())
                 continue;
             GearsDesc* engineDesc = ICE_PLACEMENT_NEW(GearsDesc)();
             engineDesc->ratios     = scanned.vehicleGears[i]->ratios;
             engineDesc->ratioScale = scanned.vehicleGears[i]->ratioScale;
             engineDesc->switchTime = scanned.vehicleGears[i]->switchTime;
-            mVehicleComponentTracker.mGears.insert({ path, engineDesc });
+            mVehicleComponentTracker.mGears.insert({ key, engineDesc });
         }
         for (size_t i = 0; i < scanned.vehicleClutches.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleClutch");
-            const SdfPath path = scanned.pathFor(scanned.vehicleClutchPaths[i]);
-            if (mVehicleComponentTracker.mClutches.find(path) != mVehicleComponentTracker.mClutches.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleClutchPaths[i]));
+            if (mVehicleComponentTracker.mClutches.find(key) != mVehicleComponentTracker.mClutches.end())
                 continue;
             ClutchDesc* engineDesc = ICE_PLACEMENT_NEW(ClutchDesc)();
             engineDesc->strength = scanned.vehicleClutches[i]->strength;
-            mVehicleComponentTracker.mClutches.insert({ path, engineDesc });
+            mVehicleComponentTracker.mClutches.insert({ key, engineDesc });
+        }
+        for (size_t i = 0; i < scanned.vehicleAutoGearBoxes.size(); ++i)
+        {
+            CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleAutoGearBox");
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleAutoGearBoxPaths[i]));
+            if (mVehicleComponentTracker.mAutoGearBoxes.find(key) != mVehicleComponentTracker.mAutoGearBoxes.end())
+                continue;
+            const auto& scanAg = scanned.vehicleAutoGearBoxes[i];
+            AutoGearBoxDesc* engineDesc = ICE_PLACEMENT_NEW(AutoGearBoxDesc)();
+            engineDesc->upRatios   = scanAg->upRatios;
+            engineDesc->downRatios = scanAg->downRatios;
+            engineDesc->latency    = scanAg->latency;
+            mVehicleComponentTracker.mAutoGearBoxes.insert({ key, engineDesc });
         }
 
         // ----- Vehicle NonlinearCmdResponse (7A.6) -----------------
@@ -2656,13 +3043,30 @@ public:
         // by (ownerPath, instanceToken) so the Drive / Steering /
         // Brakes loops below can wire the nonlinearCmdResponse
         // pointer.  Engine-side descriptors land in the legacy
-        // mNonlinearCmdResponses vector for cleanup.
-        std::map<std::pair<SdfPath, TfToken>, NonlinearCmdResponseDesc*> ncrByOwnerAndInstance;
+        // mNonlinearCmdResponses vector for cleanup.  The instance half of
+        // the key is a TokenId, not a TfToken: every producer/consumer here
+        // (scan vectors, the "drive"/"steer" literals) already lives in the
+        // scan source's own TokenId namespace, so comparing TfTokens instead
+        // was a pure round-trip through pxr with no functional purpose.
+        struct OwnerInstanceKey
+        {
+            omni::physics::parse::ObjectKey owner;
+            omni::physics::parse::TokenId inst;
+            bool operator==(const OwnerInstanceKey& o) const { return owner == o.owner && inst == o.inst; }
+        };
+        struct OwnerInstanceKeyHash
+        {
+            size_t operator()(const OwnerInstanceKey& k) const
+            {
+                return omni::physics::parse::ObjectKey::Hash()(k.owner) ^ (omni::physics::parse::TokenId::Hash()(k.inst) << 1);
+            }
+        };
+        std::unordered_map<OwnerInstanceKey, NonlinearCmdResponseDesc*, OwnerInstanceKeyHash> ncrByOwnerAndInstance;
         for (size_t i = 0; i < scanned.vehicleNonlinearCmdResponses.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleNonlinearCmdResponse");
-            const SdfPath path  = scanned.pathFor(scanned.vehicleNonlinearCmdResponsePaths[i]);
-            const TfToken inst  = scanned.tfTokenFor(scanned.vehicleNonlinearCmdResponseInstanceTokens[i]);
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleNonlinearCmdResponsePaths[i]));
+            const omni::physics::parse::TokenId inst = scanned.vehicleNonlinearCmdResponseInstanceTokens[i];
             const auto& scanNcr = scanned.vehicleNonlinearCmdResponses[i];
 
             NonlinearCmdResponseDesc* engineDesc = ICE_PLACEMENT_NEW(NonlinearCmdResponseDesc)();
@@ -2671,9 +3075,9 @@ public:
             engineDesc->speedResponses               = scanNcr->speedResponses;
 
             mVehicleComponentTracker.mNonlinearCmdResponses.push_back(engineDesc);
-            ncrByOwnerAndInstance.insert({ { path, inst }, engineDesc });
+            ncrByOwnerAndInstance.insert({ { key, inst }, engineDesc });
         }
-        auto findNcr = [&ncrByOwnerAndInstance](const SdfPath& owner, const TfToken& inst) -> NonlinearCmdResponseDesc* {
+        auto findNcr = [&ncrByOwnerAndInstance](omni::physics::parse::ObjectKey owner, omni::physics::parse::TokenId inst) -> NonlinearCmdResponseDesc* {
             auto it = ncrByOwnerAndInstance.find({ owner, inst });
             return (it != ncrByOwnerAndInstance.end()) ? it->second : nullptr;
         };
@@ -2688,29 +3092,31 @@ public:
         for (const auto& scanDrive : scanned.vehicleDrivesBasic)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleDriveBasic");
-            const SdfPath path = scanned.pathFor(scanDrive->key);
-            if (mVehicleComponentTracker.mDrivesBasic.find(path) != mVehicleComponentTracker.mDrivesBasic.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanDrive->key));
+            if (mVehicleComponentTracker.mDrivesBasic.find(key) != mVehicleComponentTracker.mDrivesBasic.end())
                 continue;
             DriveBasicDesc* engineDesc = ICE_PLACEMENT_NEW(DriveBasicDesc)();
-            engineDesc->path                = path;
+            engineDesc->key                 = key;
             engineDesc->peakTorque          = scanDrive->peakTorque;
-            engineDesc->nonlinearCmdResponse = findNcr(path, PhysxSchemaTokens->drive);  // 7A.6
-            mVehicleComponentTracker.mDrivesBasic.insert({ path, engineDesc });
+            // "drive" is the fixed multi-apply-schema instance name PhysxSchemaTokens->drive
+            // names; interned straight off this scan's own source (whose tokens `key`/`inst`
+            // above are already keyed by) rather than a generated pxr token-table constant.
+            engineDesc->nonlinearCmdResponse =
+                findNcr(key, scanned.source().internToken("drive"));  // 7A.6
+            mVehicleComponentTracker.mDrivesBasic.insert({ key, engineDesc });
         }
         // DriveStandard pre-population.  Cross-references (engine /
         // gears / autoGearBox / clutch) resolve through the tracker
-        // maps populated by 7A.3 / 7A.4 above.  If ANY required
-        // cross-ref (engine / gears / clutch) failed to resolve —
-        // typically because the per-component parser rejected the
-        // authored data — skip pre-population entirely so the legacy
-        // parseRelationshipOrAPI flow runs and reports the error path
-        // identical to pre-7A.6 behavior.  AutoGearBox is optional, so
-        // null pointer is fine there.
+        // maps populated above. If a required cross-ref (engine / gears /
+        // clutch) failed to resolve, omit the drive. Vehicle pre-population
+        // then drops vehicles that reference the missing drive; parseVehicle
+        // only consumes the tracker and has no legacy parser fallback.
+        // AutoGearBox is optional, so a null pointer is fine there.
         for (size_t i = 0; i < scanned.vehicleDrivesStandard.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleDriveStandard");
-            const SdfPath path = scanned.pathFor(scanned.vehicleDrivesStandardPaths[i]);
-            if (mVehicleComponentTracker.mDrivesStandard.find(path) != mVehicleComponentTracker.mDrivesStandard.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleDrivesStandardPaths[i]));
+            if (mVehicleComponentTracker.mDrivesStandard.find(key) != mVehicleComponentTracker.mDrivesStandard.end())
                 continue;
             const auto& refs = scanned.vehicleDrivesStandardCrossRefs[i];
 
@@ -2721,28 +3127,51 @@ public:
 
             if (refs.engineKey.valid())
             {
-                auto it = mVehicleComponentTracker.mEngines.find(scanned.pathFor(refs.engineKey));
+                auto it = mVehicleComponentTracker.mEngines.find(mAttachedStage.keyFor(scanned.source().sourceKeyToString(refs.engineKey)));
                 if (it != mVehicleComponentTracker.mEngines.end()) engine = it->second;
             }
             if (refs.gearsKey.valid())
             {
-                auto it = mVehicleComponentTracker.mGears.find(scanned.pathFor(refs.gearsKey));
+                auto it = mVehicleComponentTracker.mGears.find(mAttachedStage.keyFor(scanned.source().sourceKeyToString(refs.gearsKey)));
                 if (it != mVehicleComponentTracker.mGears.end()) gears = it->second;
             }
             if (refs.clutchKey.valid())
             {
-                auto it = mVehicleComponentTracker.mClutches.find(scanned.pathFor(refs.clutchKey));
+                auto it = mVehicleComponentTracker.mClutches.find(mAttachedStage.keyFor(scanned.source().sourceKeyToString(refs.clutchKey)));
                 if (it != mVehicleComponentTracker.mClutches.end()) clutch = it->second;
             }
             if (refs.autoGearBoxKey.valid())
             {
-                auto it = mVehicleComponentTracker.mAutoGearBoxes.find(scanned.pathFor(refs.autoGearBoxKey));
+                auto it = mVehicleComponentTracker.mAutoGearBoxes.find(mAttachedStage.keyFor(scanned.source().sourceKeyToString(refs.autoGearBoxKey)));
                 if (it != mVehicleComponentTracker.mAutoGearBoxes.end()) autoGearBox = it->second;
             }
 
-            // Required refs missing → defer to legacy parser path.
+            // Missing required components leave this drive unavailable to vehicles.
             if (!engine || !gears || !clutch)
                 continue;
+
+            if (autoGearBox)
+            {
+                const size_t expectedRatioCount = gears->ratios.size() > 1 ? gears->ratios.size() - 2 : 0;
+                const auto validateRatios = [&](const std::vector<float>& ratios, const char* attribute)
+                {
+                    // Empty arrays use defaults when each vehicle is built. Keep the shared
+                    // descriptor unchanged: other drives can have different gear counts.
+                    if (!ratios.empty() && ratios.size() < expectedRatioCount)
+                    {
+                        CARB_LOG_ERROR("Usd Physics: vehicle drive \"%s\": autoGearBox %s entry count is smaller "
+                                       "than the number of relevant gears.", mAttachedStage.textFor(key), attribute);
+                        return false;
+                    }
+                    if (ratios.size() > expectedRatioCount)
+                        CARB_LOG_WARN("Usd Physics: vehicle drive \"%s\": extra autoGearBox %s entries will be ignored.",
+                                      mAttachedStage.textFor(key), attribute);
+                    return true;
+                };
+                if (!validateRatios(autoGearBox->upRatios, "upRatios") ||
+                    !validateRatios(autoGearBox->downRatios, "downRatios"))
+                    continue;
+            }
 
             DriveStandardDesc* engineDesc = ICE_PLACEMENT_NEW(DriveStandardDesc)();
             engineDesc->engine       = engine;
@@ -2750,11 +3179,11 @@ public:
             engineDesc->gears        = gears;
             engineDesc->autoGearBox  = autoGearBox;
             engineDesc->clutch       = clutch;
-            mVehicleComponentTracker.mDrivesStandard.insert({ path, engineDesc });
+            mVehicleComponentTracker.mDrivesStandard.insert({ key, engineDesc });
         }
         // ----- Vehicle SuspensionCompliance (7A.7) ------------------
         // SuspensionCompliance is per-attachment-prim.  Pre-populate
-        // a SdfPath-keyed side-table and push to the legacy
+        // an ObjectKey-keyed side-table and push to the legacy
         // mSuspensionCompliances vector for cleanup lifetime.  Legacy
         // parseWheelAttachment consults the side-table when the
         // PhysxVehicleSuspensionComplianceAPI is applied on the
@@ -2762,8 +3191,8 @@ public:
         for (size_t i = 0; i < scanned.vehicleSuspensionCompliances.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleSuspensionCompliance");
-            const SdfPath path = scanned.pathFor(scanned.vehicleSuspensionCompliancePaths[i]);
-            if (mVehicleComponentTracker.mSuspensionComplianceByPath.find(path) !=
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleSuspensionCompliancePaths[i]));
+            if (mVehicleComponentTracker.mSuspensionComplianceByPath.find(key) !=
                 mVehicleComponentTracker.mSuspensionComplianceByPath.end())
                 continue;
             const auto& scanSc = scanned.vehicleSuspensionCompliances[i];
@@ -2773,7 +3202,7 @@ public:
             engineDesc->suspensionForceAppPointList = scanSc->suspensionForceAppPointList;
             engineDesc->tireForceAppPointList       = scanSc->tireForceAppPointList;
             mVehicleComponentTracker.mSuspensionCompliances.push_back(engineDesc);
-            mVehicleComponentTracker.mSuspensionComplianceByPath.insert({ path, engineDesc });
+            mVehicleComponentTracker.mSuspensionComplianceByPath.insert({ key, engineDesc });
         }
         // WheelAttachment full pre-population (7A.8).  Walker emitted
         // a descriptor + parallel WheelAttachmentInfo side-table with
@@ -2788,8 +3217,8 @@ public:
         for (size_t i = 0; i < scanned.vehicleWheelAttachments.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleWheelAttachment");
-            const SdfPath path = scanned.pathFor(scanned.vehicleWheelAttachments[i]->key);
-            if (mVehicleComponentTracker.mWheelAttachmentByPath.find(path) !=
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleWheelAttachments[i]->key));
+            if (mVehicleComponentTracker.mWheelAttachmentByPath.find(key) !=
                 mVehicleComponentTracker.mWheelAttachmentByPath.end())
                 continue;
             const auto& info = scanned.vehicleWheelAttachmentInfos[i];
@@ -2799,17 +3228,17 @@ public:
             SuspensionDesc* suspension = nullptr;
             if (info.wheelKey.valid())
             {
-                auto it = mVehicleComponentTracker.mWheels.find(scanned.pathFor(info.wheelKey));
+                auto it = mVehicleComponentTracker.mWheels.find(mAttachedStage.keyFor(scanned.source().sourceKeyToString(info.wheelKey)));
                 if (it != mVehicleComponentTracker.mWheels.end()) wheel = it->second;
             }
             if (info.tireKey.valid())
             {
-                auto it = mVehicleComponentTracker.mTires.find(scanned.pathFor(info.tireKey));
+                auto it = mVehicleComponentTracker.mTires.find(mAttachedStage.keyFor(scanned.source().sourceKeyToString(info.tireKey)));
                 if (it != mVehicleComponentTracker.mTires.end()) tire = it->second;
             }
             if (info.suspensionKey.valid())
             {
-                auto it = mVehicleComponentTracker.mSuspensions.find(scanned.pathFor(info.suspensionKey));
+                auto it = mVehicleComponentTracker.mSuspensions.find(mAttachedStage.keyFor(scanned.source().sourceKeyToString(info.suspensionKey)));
                 if (it != mVehicleComponentTracker.mSuspensions.end()) suspension = it->second;
             }
             if (!wheel || !tire || !suspension)
@@ -2819,13 +3248,17 @@ public:
                 // parseVehicle counts it and marks the vehicle invalid.
                 CARB_LOG_ERROR("Usd Physics: wheel attachment \"%s\": a required %s%s%s reference is missing or does "
                                "not point to a prim with the matching vehicle component API applied.",
-                               path.GetText(), wheel ? "" : "wheel ", tire ? "" : "tire ", suspension ? "" : "suspension ");
+                               mAttachedStage.textFor(key), wheel ? "" : "wheel ", tire ? "" : "tire ", suspension ? "" : "suspension ");
                 continue;
             }
 
             const auto& scanWa = scanned.vehicleWheelAttachments[i];
             WheelAttachmentDesc* engineDesc = ICE_PLACEMENT_NEW(WheelAttachmentDesc)();
-            engineDesc->path                         = path;
+            // key/collisionGroupKey/shapeKey are minted by the SCAN's own source
+            // and must be re-keyed into mAttachedStage's namespace via the
+            // sourceKeyToString + keyFor round-trip (ADR-0019 increment 7; mirrors
+            // the tire-friction-table and articulation `rekey` pattern above).
+            engineDesc->key                          = key;
             engineDesc->id                           = kInvalidObjectId;
             engineDesc->state                        = scanWa->state;
             engineDesc->wheel                        = wheel;
@@ -2835,9 +3268,9 @@ public:
             engineDesc->suspension                   = suspension;
             engineDesc->suspensionId                 = kInvalidObjectId;
             // SuspensionCompliance: applied alongside on the same prim;
-            // look up by attachment path.
+            // look up by attachment key.
             {
-                auto it = mVehicleComponentTracker.mSuspensionComplianceByPath.find(path);
+                auto it = mVehicleComponentTracker.mSuspensionComplianceByPath.find(key);
                 engineDesc->suspensionCompliance =
                     (it != mVehicleComponentTracker.mSuspensionComplianceByPath.end()) ? it->second : nullptr;
             }
@@ -2852,12 +3285,12 @@ public:
             engineDesc->index                         = scanWa->index;
             engineDesc->driven                        = scanWa->driven;
             engineDesc->collisionGroupId              = kInvalidObjectId;
-            engineDesc->collisionGroupPath           = scanned.pathFor(scanWa->collisionGroupKey);
-            engineDesc->shapePath                    = scanned.pathFor(scanWa->shapeKey);
+            engineDesc->collisionGroupKey            = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanWa->collisionGroupKey));
+            engineDesc->shapeKey                     = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanWa->shapeKey));
             engineDesc->shapeId                       = kInvalidObjectId;
 
             mVehicleComponentTracker.mWheelAttachmentsOwned.push_back(engineDesc);
-            mVehicleComponentTracker.mWheelAttachmentByPath.insert({ path, engineDesc });
+            mVehicleComponentTracker.mWheelAttachmentByPath.insert({ key, engineDesc });
         }
 
         // Group EVERY scanned wheel attachment (valid or malformed) by its
@@ -2868,15 +3301,16 @@ public:
         {
             if (!owner.first.valid())
                 continue;  // attachment with no vehicle ancestor (malformed) — skip
-            mVehicleComponentTracker.mVehicleWheelAttachments[scanned.pathFor(owner.first)].push_back(
-                scanned.pathFor(owner.second));
+            const omni::physics::parse::ObjectKey ownerKey = mAttachedStage.keyFor(scanned.source().sourceKeyToString(owner.first));
+            const omni::physics::parse::ObjectKey attachmentKey = mAttachedStage.keyFor(scanned.source().sourceKeyToString(owner.second));
+            mVehicleComponentTracker.mVehicleWheelAttachments[ownerKey].push_back(attachmentKey);
         }
 
         for (size_t i = 0; i < scanned.vehicleMultiWheelDifferentials.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleMultiWheelDifferential");
-            const SdfPath path = scanned.pathFor(scanned.vehicleMultiWheelDifferentialPaths[i]);
-            if (mVehicleComponentTracker.mDifferentialsByPath.find(path) != mVehicleComponentTracker.mDifferentialsByPath.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleMultiWheelDifferentialPaths[i]));
+            if (mVehicleComponentTracker.mDifferentialsByPath.find(key) != mVehicleComponentTracker.mDifferentialsByPath.end())
                 continue;
             const auto& scanDiff = scanned.vehicleMultiWheelDifferentials[i];
             MultiWheelDifferentialDesc* engineDesc = ICE_PLACEMENT_NEW(MultiWheelDifferentialDesc)();
@@ -2884,13 +3318,13 @@ public:
             engineDesc->torqueRatios            = scanDiff->torqueRatios;
             engineDesc->averageWheelSpeedRatios = scanDiff->averageWheelSpeedRatios;
             mVehicleComponentTracker.mMultiWheelDifferentials.push_back(engineDesc);
-            mVehicleComponentTracker.mDifferentialsByPath.insert({ path, engineDesc });
+            mVehicleComponentTracker.mDifferentialsByPath.insert({ key, engineDesc });
         }
         for (size_t i = 0; i < scanned.vehicleTankDifferentials.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleTankDifferential");
-            const SdfPath path = scanned.pathFor(scanned.vehicleTankDifferentialPaths[i]);
-            if (mVehicleComponentTracker.mDifferentialsByPath.find(path) != mVehicleComponentTracker.mDifferentialsByPath.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleTankDifferentialPaths[i]));
+            if (mVehicleComponentTracker.mDifferentialsByPath.find(key) != mVehicleComponentTracker.mDifferentialsByPath.end())
                 continue;
             const auto& scanDiff = scanned.vehicleTankDifferentials[i];
             TankDifferentialDesc* engineDesc = ICE_PLACEMENT_NEW(TankDifferentialDesc)();
@@ -2902,22 +3336,8 @@ public:
             engineDesc->wheelIndicesInTrackOrder = scanDiff->wheelIndicesInTrackOrder;
             engineDesc->trackToWheelIndices     = scanDiff->trackToWheelIndices;
             mVehicleComponentTracker.mTankDifferentials.push_back(engineDesc);
-            mVehicleComponentTracker.mDifferentialsByPath.insert({ path, engineDesc });
+            mVehicleComponentTracker.mDifferentialsByPath.insert({ key, engineDesc });
         }
-        for (size_t i = 0; i < scanned.vehicleAutoGearBoxes.size(); ++i)
-        {
-            CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleAutoGearBox");
-            const SdfPath path = scanned.pathFor(scanned.vehicleAutoGearBoxPaths[i]);
-            if (mVehicleComponentTracker.mAutoGearBoxes.find(path) != mVehicleComponentTracker.mAutoGearBoxes.end())
-                continue;
-            const auto& scanAg = scanned.vehicleAutoGearBoxes[i];
-            AutoGearBoxDesc* engineDesc = ICE_PLACEMENT_NEW(AutoGearBoxDesc)();
-            engineDesc->upRatios   = scanAg->upRatios;
-            engineDesc->downRatios = scanAg->downRatios;
-            engineDesc->latency    = scanAg->latency;
-            mVehicleComponentTracker.mAutoGearBoxes.insert({ path, engineDesc });
-        }
-
         // ----- Vehicle brakes + steering (7A.5) ----------------------
         // Brakes are multi-apply (one BrakesDesc per (path, brakesIndex)).
         // Steering is single-apply (basic + Ackermann variants; consumer
@@ -2927,17 +3347,17 @@ public:
         for (size_t i = 0; i < scanned.vehicleBrakes.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleBrakes");
-            const SdfPath path = scanned.pathFor(scanned.vehicleBrakesPaths[i]);
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleBrakesPaths[i]));
             const auto& scanBrake = scanned.vehicleBrakes[i];
-            const std::pair<SdfPath, uint8_t> mapKey{ path, scanBrake->brakesIndex };
+            const std::pair<omni::physics::parse::ObjectKey, uint8_t> mapKey{ key, scanBrake->brakesIndex };
             if (mVehicleComponentTracker.mBrakesByPathIndex.find(mapKey) !=
                 mVehicleComponentTracker.mBrakesByPathIndex.end())
                 continue;
             BrakesDesc* engineDesc = ICE_PLACEMENT_NEW(BrakesDesc)();
             // 7A.6: brakes instance token (e.g. "brakes0"/"brakes1") doubles
             // as the NonlinearCmdResponse instance lookup key.
-            const TfToken brakesInst = scanned.tfTokenFor(scanned.vehicleBrakesInstanceTokens[i]);
-            engineDesc->nonlinearCmdResponse = findNcr(path, brakesInst);
+            const omni::physics::parse::TokenId brakesInst = scanned.vehicleBrakesInstanceTokens[i];
+            engineDesc->nonlinearCmdResponse = findNcr(key, brakesInst);
             engineDesc->wheels               = scanBrake->wheels;
             engineDesc->torqueMultipliers    = scanBrake->torqueMultipliers;
             engineDesc->maxBrakeTorque       = scanBrake->maxBrakeTorque;
@@ -2948,27 +3368,33 @@ public:
         for (size_t i = 0; i < scanned.vehicleSteeringBasic.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleSteeringBasic");
-            const SdfPath path = scanned.pathFor(scanned.vehicleSteeringBasicPaths[i]);
-            if (mVehicleComponentTracker.mSteeringByPath.find(path) != mVehicleComponentTracker.mSteeringByPath.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleSteeringBasicPaths[i]));
+            if (mVehicleComponentTracker.mSteeringByPath.find(key) != mVehicleComponentTracker.mSteeringByPath.end())
                 continue;
             const auto& scanSt = scanned.vehicleSteeringBasic[i];
             SteeringBasicDesc* engineDesc = ICE_PLACEMENT_NEW(SteeringBasicDesc)();
-            engineDesc->nonlinearCmdResponse = findNcr(path, PhysxSchemaTokens->steer);  // 7A.6
+            // "steer" is the fixed single-apply-schema instance name PhysxSchemaTokens->steer
+            // names; interned straight off this scan's own source, matching the "drive" swap above.
+            engineDesc->nonlinearCmdResponse =
+                findNcr(key, scanned.source().internToken("steer"));  // 7A.6
             engineDesc->wheels               = scanSt->wheels;
             engineDesc->angleMultipliers     = scanSt->angleMultipliers;
             engineDesc->maxSteerAngle        = scanSt->maxSteerAngle;
             mVehicleComponentTracker.mSteeringBasic.push_back(engineDesc);
-            mVehicleComponentTracker.mSteeringByPath.insert({ path, engineDesc });
+            mVehicleComponentTracker.mSteeringByPath.insert({ key, engineDesc });
         }
         for (size_t i = 0; i < scanned.vehicleSteeringAckermann.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicleSteeringAckermann");
-            const SdfPath path = scanned.pathFor(scanned.vehicleSteeringAckermannPaths[i]);
-            if (mVehicleComponentTracker.mSteeringByPath.find(path) != mVehicleComponentTracker.mSteeringByPath.end())
+            const omni::physics::parse::ObjectKey key = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehicleSteeringAckermannPaths[i]));
+            if (mVehicleComponentTracker.mSteeringByPath.find(key) != mVehicleComponentTracker.mSteeringByPath.end())
                 continue;
             const auto& scanSt = scanned.vehicleSteeringAckermann[i];
             SteeringAckermannDesc* engineDesc = ICE_PLACEMENT_NEW(SteeringAckermannDesc)();
-            engineDesc->nonlinearCmdResponse = findNcr(path, PhysxSchemaTokens->steer);  // 7A.6
+            // "steer" is the fixed single-apply-schema instance name PhysxSchemaTokens->steer
+            // names; interned straight off this scan's own source, matching the "drive" swap above.
+            engineDesc->nonlinearCmdResponse =
+                findNcr(key, scanned.source().internToken("steer"));  // 7A.6
             engineDesc->wheel0               = scanSt->wheel0;
             engineDesc->wheel1               = scanSt->wheel1;
             engineDesc->maxSteerAngle        = scanSt->maxSteerAngle;
@@ -2976,7 +3402,7 @@ public:
             engineDesc->trackWidth           = scanSt->trackWidth;
             engineDesc->strength             = scanSt->strength;
             mVehicleComponentTracker.mSteeringAckermann.push_back(engineDesc);
-            mVehicleComponentTracker.mSteeringByPath.insert({ path, engineDesc });
+            mVehicleComponentTracker.mSteeringByPath.insert({ key, engineDesc });
         }
 
         // ----- Vehicle chassis root pre-population (7A.13) ----------
@@ -3000,8 +3426,8 @@ public:
         for (size_t i = 0; i < scanned.vehicles.size(); ++i)
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs:vehicle");
-            const SdfPath vehiclePath = scanned.pathFor(scanned.vehiclePaths[i]);
-            if (mVehicleComponentTracker.mVehicleByPath.find(vehiclePath) !=
+            const omni::physics::parse::ObjectKey vehicleKey = mAttachedStage.keyFor(scanned.source().sourceKeyToString(scanned.vehiclePaths[i]));
+            if (mVehicleComponentTracker.mVehicleByPath.find(vehicleKey) !=
                 mVehicleComponentTracker.mVehicleByPath.end())
                 continue;
 
@@ -3011,9 +3437,10 @@ public:
             // pre-pop so legacy parseVehicle runs — the same safe fallback the
             // tracker-miss `continue`s rely on. No UsdPrim.
             const omni::physics::parse::IPhysicsSource* src = mAttachedStage.getSource();
-            const omni::physics::parse::ObjectKey vehKey =
-                src ? mAttachedStage.keyFor(vehiclePath) : omni::physics::parse::ObjectKey{};
-            if (!src || !src->exists(vehKey) || !src->hasSchema(vehKey, schemaTypeToken<PhysxSchemaPhysxVehicleAPI>(*src)))
+            if (!src || !src->exists(vehicleKey))
+                continue;  // legacy parser will report any error path
+            const omni::physics::parse::KnownTokens& tok = mAttachedStage.getKnownTokens();
+            if (!src->hasSchema(vehicleKey, tok.physxVehicleAPI))
                 continue;  // legacy parser will report any error path
 
             // ---- Drive: rel-or-API on vehicle prim --------------------
@@ -3022,48 +3449,45 @@ public:
             // applied on the vehicle prim itself.  Error paths
             // (rel with >1 targets, both DriveBasic+DriveStandard on
             // the same prim) are logged here and the vehicle is dropped.
-            SdfPath drivePath;
+            omni::physics::parse::ObjectKey driveKey;
             bool driveAuthored = false;
+            bool driveFromRel = false; // driveKey came from a physxVehicle:drive relationship target
             {
                 // physxVehicle:drive relationship targets via the source (an
                 // unauthored/absent rel reports empty — matches the legacy
-                // `if (GetDriveRel().HasAuthoredTargets()) GetTargets(...)`).
-                SdfPathVector paths;
-                {
-                    std::vector<omni::physics::parse::ObjectKey> driveKeys;
-                    src->getRelationshipTargets(
-                        vehKey, src->internToken(PhysxSchemaTokens->physxVehicleDrive.GetString()), driveKeys);
-                    paths.reserve(driveKeys.size());
-                    for (const omni::physics::parse::ObjectKey& k : driveKeys)
-                        paths.push_back(mAttachedStage.pathFor(k));
-                }
-                if (paths.size() > 1)
+                // `if (GetDriveRel().HasAuthoredTargets()) GetTargets(...)`). These
+                // are already live keys (src is mAttachedStage's own source), so no
+                // rekey round-trip is needed.
+                std::vector<omni::physics::parse::ObjectKey> driveKeys;
+                src->getRelationshipTargets(vehicleKey, tok.physxVehicleDrive, driveKeys);
+                if (driveKeys.size() > 1)
                 {
                     CARB_LOG_ERROR(
                         "Usd Physics: \"%s\" must not have more than 1 \"drive\" relationship defined.",
-                        vehiclePath.GetName().c_str());
+                        mAttachedStage.textFor(vehicleKey));
                     continue;
                 }
-                if (paths.size() == 1)
+                if (driveKeys.size() == 1)
                 {
-                    drivePath = paths[0];
+                    driveKey = driveKeys[0];
                     driveAuthored = true;
+                    driveFromRel = true;
                 }
                 else
                 {
-                    const bool standardOnSelf = src->hasSchema(vehKey, schemaTypeToken<PhysxSchemaPhysxVehicleDriveStandardAPI>(*src));
-                    const bool basicOnSelf    = src->hasSchema(vehKey, schemaTypeToken<PhysxSchemaPhysxVehicleDriveBasicAPI>(*src));
+                    const bool standardOnSelf = src->hasSchema(vehicleKey, tok.physxVehicleDriveStandardAPI);
+                    const bool basicOnSelf    = src->hasSchema(vehicleKey, tok.physxVehicleDriveBasicAPI);
                     if (standardOnSelf && basicOnSelf)
                     {
                         CARB_LOG_ERROR(
                             "Usd Physics: vehicle \"%s\" has both PhysxSchemaPhysxVehicleDriveStandardAPI and "
                             "PhysxSchemaPhysxVehicleDriveBasicAPI applied. Only one is allowed.",
-                            vehiclePath.GetName().c_str());
+                            mAttachedStage.textFor(vehicleKey));
                         continue;
                     }
                     if (standardOnSelf || basicOnSelf)
                     {
-                        drivePath = vehiclePath;
+                        driveKey = vehicleKey;
                         driveAuthored = true;
                     }
                 }
@@ -3071,29 +3495,41 @@ public:
             DriveDesc* drive = nullptr;
             if (driveAuthored)
             {
-                auto stdIt = mVehicleComponentTracker.mDrivesStandard.find(drivePath);
+                auto stdIt = mVehicleComponentTracker.mDrivesStandard.find(driveKey);
                 if (stdIt != mVehicleComponentTracker.mDrivesStandard.end())
                 {
                     drive = stdIt->second;
                 }
                 else
                 {
-                    auto basicIt = mVehicleComponentTracker.mDrivesBasic.find(drivePath);
+                    auto basicIt = mVehicleComponentTracker.mDrivesBasic.find(driveKey);
                     if (basicIt != mVehicleComponentTracker.mDrivesBasic.end())
                         drive = basicIt->second;
                 }
                 if (!drive)
-                    continue;  // per-component parser already logged the validation error
+                {
+                    // A physxVehicle:drive relationship target that resolves to no parsed drive --
+                    // typically a dangling target (references no prim) -- had no per-component
+                    // parser run for it, so nothing was logged; name it rather than drop the whole
+                    // vehicle silently. A self-applied drive API that failed was already logged by
+                    // its per-component parser.
+                    if (driveFromRel)
+                        CARB_LOG_ERROR(
+                            "Usd Physics: vehicle \"%s\" has a \"drive\" relationship target \"%s\" that does not "
+                            "resolve to a PhysxVehicleDriveStandardAPI or PhysxVehicleDriveBasicAPI; the vehicle is dropped.",
+                            mAttachedStage.textFor(vehicleKey), mAttachedStage.textFor(driveKey));
+                    continue;
+                }
             }
 
             // ---- Differential: applied directly on vehicle prim -------
             const bool diffApiApplied =
-                src->hasSchema(vehKey, schemaTypeToken<PhysxSchemaPhysxVehicleMultiWheelDifferentialAPI>(*src)) ||
-                src->hasSchema(vehKey, schemaTypeToken<PhysxSchemaPhysxVehicleTankDifferentialAPI>(*src));
+                src->hasSchema(vehicleKey, tok.physxVehicleMultiWheelDifferentialAPI) ||
+                src->hasSchema(vehicleKey, tok.physxVehicleTankDifferentialAPI);
             MultiWheelDifferentialDesc* differential = nullptr;
             if (diffApiApplied)
             {
-                auto it = mVehicleComponentTracker.mDifferentialsByPath.find(vehiclePath);
+                auto it = mVehicleComponentTracker.mDifferentialsByPath.find(vehicleKey);
                 if (it == mVehicleComponentTracker.mDifferentialsByPath.end())
                     continue;
                 differential = it->second;
@@ -3101,12 +3537,12 @@ public:
 
             // ---- Steering: applied directly on vehicle prim -----------
             const bool steeringApiApplied =
-                src->hasSchema(vehKey, schemaTypeToken<PhysxSchemaPhysxVehicleSteeringAPI>(*src)) ||
-                src->hasSchema(vehKey, schemaTypeToken<PhysxSchemaPhysxVehicleAckermannSteeringAPI>(*src));
+                src->hasSchema(vehicleKey, tok.physxVehicleSteeringAPI) ||
+                src->hasSchema(vehicleKey, tok.physxVehicleAckermannSteeringAPI);
             SteeringDesc* steering = nullptr;
             if (steeringApiApplied)
             {
-                auto it = mVehicleComponentTracker.mSteeringByPath.find(vehiclePath);
+                auto it = mVehicleComponentTracker.mSteeringByPath.find(vehicleKey);
                 if (it == mVehicleComponentTracker.mSteeringByPath.end())
                     continue;
                 steering = it->second;
@@ -3114,15 +3550,15 @@ public:
 
             // ---- Brakes: multi-apply (brakes0 / brakes1) --------------
             std::vector<const BrakesDesc*> brakes;
-            const bool brakesApiApplied = src->hasSchema(vehKey, schemaTypeToken<PhysxSchemaPhysxVehicleBrakesAPI>(*src));
+            const bool brakesApiApplied = src->hasSchema(vehicleKey, tok.physxVehicleBrakesAPI);
             if (brakesApiApplied)
             {
                 bool brakesPrePopOk = true;
-                TfToken brakesTokens[] = { PhysxSchemaTokens->brakes0, PhysxSchemaTokens->brakes1 };
+                const omni::physics::parse::TokenId brakesTokens[] = { tok.brakes0, tok.brakes1 };
                 for (uint32_t bi = 0; bi < 2; ++bi)
                 {
                     auto it = mVehicleComponentTracker.mBrakesByPathIndex.find(
-                        { vehiclePath, static_cast<uint8_t>(bi) });
+                        { vehicleKey, static_cast<uint8_t>(bi) });
                     if (it != mVehicleComponentTracker.mBrakesByPathIndex.end())
                     {
                         brakes.push_back(it->second);
@@ -3132,10 +3568,10 @@ public:
                     // instance API was actually applied (matches legacy
                     // parseBrakes). Per-instance check via the source's
                     // multi-apply instance enumeration.
-                    static const std::string brakesBase =
-                        UsdSchemaRegistry::GetSchemaTypeName(TfType::Find<PhysxSchemaPhysxVehicleBrakesAPI>()).GetString();
-                    const std::string appliedSchema = brakesBase + ":" + brakesTokens[bi].GetString();
-                    const bool instanceApplied = src->hasSchema(vehKey, src->internToken(appliedSchema));
+                    const std::string appliedSchema =
+                        std::string(src->tokenToString(tok.physxVehicleBrakesAPI)) + ":" +
+                        std::string(src->tokenToString(brakesTokens[bi]));
+                    const bool instanceApplied = src->hasSchema(vehicleKey, src->internToken(appliedSchema));
                     if (instanceApplied)
                     {
                         brakesPrePopOk = false;
@@ -3148,7 +3584,7 @@ public:
                 {
                     CARB_LOG_ERROR(
                         "Usd Physics: \"%s\": PhysxVehicleBrakesAPI is applied but no valid instance token could be found.",
-                        vehiclePath.GetName().c_str());
+                        mAttachedStage.textFor(vehicleKey));
                     continue;
                 }
             }
@@ -3185,7 +3621,7 @@ public:
             engineDesc->limitSuspensionExpansionVelocity    = scanVeh->limitSuspensionExpansionVelocity;
 
             mVehicleComponentTracker.mVehiclesOwned.push_back(engineDesc);
-            mVehicleComponentTracker.mVehicleByPath.insert({ vehiclePath, engineDesc });
+            mVehicleComponentTracker.mVehicleByPath.insert({ vehicleKey, engineDesc });
         }
 
         // ----- Apply collected time-sampled callbacks --------------
@@ -3197,42 +3633,85 @@ public:
     // update). `excludePaths` (replicator selective load) skips those subtrees.
     // No UsdPrim / PrimIterator: the backend scanStage builds the USD ranges and
     // the post-scan passes walk via IPhysicsSource.
-    void loadFromRange(const std::vector<SdfPath>& scanRoots, const PathSet* excludePaths, bool initialStageLoad)
+    bool loadFromRange(const std::vector<std::string>& scanRoots, const PathSet* excludePaths, bool initialStageLoad)
     {
-        mStage = mAttachedStage.getStage();
+        DescriptorRuntimeTimer loadTimer("load_from_range");
         mSceneFound = false;
         mNoValidScene = false;
         mParsingFlags = 0;
         mFilteredPairsPaths.clear();
 
-        static const std::unordered_set<SdfPath, SdfPath::Hash> kNoExclude;
+        // parse::scanStage takes source-path strings, not ObjectKeys.
+        std::vector<std::string> excludeStrings;
+        if (excludePaths)
+        {
+            excludeStrings.reserve(excludePaths->size());
+            for (const omni::physics::parse::ObjectKey excludeKey : *excludePaths)
+                excludeStrings.push_back(std::string(mAttachedStage.textViewFor(excludeKey)));
+        }
 
-        omni::physics::usd::ScannedStage scanned;
+        // Incremental ovstage load: one load-cache window over the scan AND everything after it
+        // (actor setup, the mass update). The scan's merged columnar read then also serves the
+        // follow-up reads that would otherwise go back to ovstage per prim; the source's covered-miss
+        // answers stay exact because nothing in this range is written while it runs. The initial
+        // load keeps its scan-scoped window (its whole-stage read groups would otherwise be held
+        // through processScannedDescs).
+        struct ScopedOvstageLoadCache
+        {
+            omni::physics::ovstage::OvstageSource* source = nullptr;
+            ScopedOvstageLoadCache(omni::physics::parse::IPhysicsSource* src, bool open)
+                : source(open ? dynamic_cast<omni::physics::ovstage::OvstageSource*>(src) : nullptr)
+            {
+                if (source && !source->loadCacheActive())
+                    source->beginLoadCache();
+                else
+                    source = nullptr; // already someone else's window
+            }
+            ~ScopedOvstageLoadCache()
+            {
+                if (source)
+                {
+                    source->clearLoadCache();
+                    source->clearBucket();
+                }
+            }
+        } scopedLoadCache(mAttachedStage.hasExternalSource() ? mAttachedStage.getSource() : nullptr,
+                          !initialStageLoad);
+
+        // Own all parsed descriptors, source handles and auxiliary mesh data until
+        // consumption completes, including early returns and exception unwinding.
+        const omni::physics::parse::ScanOptions scanOptions = mAttachedStage.descriptorScanOptions();
+        struct TrimDescriptorPool
+        {
+            std::shared_ptr<omni::physics::parse::DescriptorBatchAllocator> pool;
+            ~TrimDescriptorPool() { if (pool) pool->trim(); }
+        } trimDescriptorPool{scanOptions.descriptorPool};
+        // Declared after the guard: descriptors return their slots before trim,
+        // including on failure. Blocks owned by other live scans remain intact.
+        omni::physics::parse::ScannedStage scanned;
+        std::vector<omni::physics::parse::DescPtr<StaticPhysxRigidBodyDesc>> generatedBodies;
         {
             CARB_PROFILE_ZONE(0, "UsdPhysics:scanStage");
-            // Single switch point (ADR-0002 M2c): scanStage(AttachTarget, ...)
-            // routes to the registered scan backend (e.g. ovstage) or the native
-            // USD walk. No backend branching here. (Subtree / incremental scans
-            // elsewhere stay on the USD-stage overloads.)
-            scanned = omni::physics::usd::scanStage(mAttachedStage.attachTarget(), scanRoots,
-                excludePaths ? *excludePaths : kNoExclude, omni::physx::usdparser::iceDescriptorAllocator());
+            // UsdLoad::attach()/attachOvstage() always register a scan backend before
+            // loadFromRange can run, so scanStage always has a backend to dispatch to;
+            // without one it silently returns an empty scan and every attach bails out
+            // at `!scanned.sourcePtr()` below.
+            scanned = mAttachedStage.scanStage(scanRoots,
+                excludeStrings, scanOptions, omni::physx::usdparser::iceDescriptorAllocator());
         }
-        if (!scanned.particleSystems.empty() || !scanned.particleSets.empty() ||
+        if (!scanned.sourcePtr())
+            return false;
+        DescriptorRuntimeTimer consumeTimer("consume_and_postscan");
+
+        // The ovstage backend borrows the attachment's source, so discovery
+        // produced by the scan is already available to runtime consumption.
+
+        if (!scanned.particleObjectCandidates.empty() ||
+            !scanned.particleSystems.empty() || !scanned.particleSets.empty() ||
             !scanned.particleSamplers.empty() || !scanned.particleAnisotropies.empty() ||
             !scanned.particleSmoothings.empty() || !scanned.particleIsosurfaces.empty())
         {
             mParsingFlags |= ParsingFlag::eParseParticles;
-        }
-
-        {
-            CARB_PROFILE_ZONE(0, "UsdPhysics:gatherPerPrimSideEffects");
-            const omni::physics::parse::AttachTarget attachTarget = mAttachedStage.attachTarget();
-            if (attachTarget.nativeStage && attachTarget.stageId == 0)
-            {
-                gatherScannedSideEffects(scanned);
-            }
-            else
-                gatherPerPrimSideEffects(scanRoots, excludePaths);
         }
 
         struct ScopedOvstageKnownKeys
@@ -3247,22 +3726,52 @@ public:
                 }
             }
         } scopedKnownKeys;
-        if (initialStageLoad)
-            scopedKnownKeys.source = seedOvstageKnownKeysForInitialLoad(mAttachedStage, scanRoots);
+
+        // Bulk hierarchy-read windows trust the complete child cache's leaf answers.
+        // Do not use beginLoadCache(): that also changes attribute covered-miss handling.
+        struct ScopedOvstageHierarchyBulkRead
+        {
+            omni::physics::ovstage::OvstageSource* source = nullptr;
+            explicit ScopedOvstageHierarchyBulkRead(omni::physics::parse::IPhysicsSource* src)
+                : source(dynamic_cast<omni::physics::ovstage::OvstageSource*>(src))
+            {
+                if (source)
+                    source->beginHierarchyBulkRead();
+            }
+            ~ScopedOvstageHierarchyBulkRead()
+            {
+                if (source)
+                    source->endHierarchyBulkRead();
+            }
+        };
 
         {
+            ScopedOvstageHierarchyBulkRead scopedHierarchyBulkRead(mAttachedStage.getSource());
+
+            {
+                CARB_PROFILE_ZONE(0, "UsdPhysics:gatherPerPrimSideEffects");
+                if (mAttachedStage.hasExternalSource())
+                {
+                    gatherScannedSideEffects(scanned);
+                    gatherSourceOnlySideEffects(scanRoots, excludePaths);
+                }
+                else
+                    gatherPerPrimSideEffects(scanRoots, excludePaths);
+            }
+
+            if (initialStageLoad)
+            {
+                scopedKnownKeys.source = seedOvstageKnownKeysForInitialLoad(mAttachedStage, scanRoots);
+            }
+
             CARB_PROFILE_ZONE(0, "UsdPhysics:processScannedDescs");
-            processScannedDescs(scanned, scanRoots, excludePaths);
+            processScannedDescs(scanned);
         }
 
         if (mNoValidScene)
-            return;
+            return true;
 
-        // We dont have a PhysX scene, PhysX should not simulate anything early exit
-        if (mNoPhysXScene)
-            return;
-
-        if(OmniPhysX::getInstance().getISettings()->getStringBuffer(kSettingForceParseOnlySingleScene) != nullptr)
+        if(!mAttachedStage.getParseOptions().forceSingleScenePath.empty())
         {
             // scristiano: do not parse particles, vehicles or internal objects when forcing single scene for inspector (for now)
             mParsingFlags = 0;
@@ -3271,7 +3780,11 @@ public:
         // require always a scene
         if (initialStageLoad && !mSceneFound)
         {
-            auto createDefaultSceneObject = [&](const SdfPath& scenePath)
+            // ObjectKey-native (ADR-0019): the engine-side creation below only ever needs the
+            // opaque source key, never a resolvable SdfPath, so it goes through
+            // PhysXUsdPhysicsInterface::createObject's ObjectKey-taking overload directly
+            // rather than the SdfPath-taking createObject() free function above.
+            auto createDefaultSceneObject = [&](omni::physics::parse::ObjectKey sceneKey)
             {
                 PhysxSceneDesc sceneDesc;
                 const omni::physics::parse::SourceUnits sceneUnits = mAttachedStage.getSourceUnits();
@@ -3280,38 +3793,55 @@ public:
                 setToDefault(sceneUnits, sceneDesc.defaultDeformableMaterialDesc);
                 setToDefault(sceneUnits, sceneDesc.defaultSurfaceDeformableMaterialDesc);
                 setToDefault(sceneDesc.defaultPBDMaterialDesc);
-                const ObjectId sceneId = createObject(mAttachedStage, scenePath, &sceneDesc, false); // deleteDesc == false
+                const ObjectId sceneId =
+                    mAttachedStage.getPhysXPhysicsInterface()->createObject(mAttachedStage, sceneKey, sceneDesc);
                 if (sceneId != kInvalidObjectId)
                 {
+                    mAttachedStage.getObjectDatabase()->findOrCreateEntry(sceneKey, sceneDesc.type, sceneId);
                     mSceneFound = true;
-                    mNoPhysXScene = false;
                     mNumScenes++;
                 }
             };
 
-            const SdfPath tempPhysicsScenePath = OmniPhysX::getInstance().getTempPhysicsScenePath();
-            const bool updateToUsd = OmniPhysX::getInstance().getCachedSettings().updateToUsd;
+            // Opaque ObjectDb bookkeeping identity. PhysXStageUpdate.cpp's physXReset()
+            // inlines the same literal as an SdfPath for its UsdStage::RemovePrim().
+            const omni::physics::parse::ObjectKey tempPhysicsSceneKey =
+                mAttachedStage.keyFor("/PhysicsScene_16e12ee3daea");
+            const bool updateToUsd = mAttachedStage.getCachedSettings().updateToUsd;
             if (updateToUsd)
             {
-                PhysXUsdPhysicsInterface::reportLoadError(ErrorCode::eInfo,
-                    "Physics USD: Physics scene not found. A temporary default PhysicsScene prim was added automatically!");
-
-                const SdfPath authoredPath =
-                    omni::physics::usd::createDefaultPhysicsScene(mStage, tempPhysicsScenePath);
-                createDefaultSceneObject(authoredPath.IsEmpty() ? tempPhysicsScenePath : authoredPath);
-                OmniPhysX::getInstance().setHasTempPhysicsScene(true);
+                // The temp-scene flag schedules the matching session-layer removal in
+                // physXReset(), so it must record whether the prim was ACTUALLY authored:
+                // setting it after a failed author leaves every later reset retrying a
+                // removal that can never find its prim.
+                const bool authored = mAttachedStage.createDefaultPhysicsScenePlaceholder(tempPhysicsSceneKey);
+                if (authored)
+                {
+                    PhysXUsdPhysicsInterface::reportLoadError(ErrorCode::eInfo,
+                        "Physics USD: Physics scene not found. A temporary default PhysicsScene prim was added automatically!");
+                    createDefaultSceneObject(tempPhysicsSceneKey);
+                    mAttachedStage.setTempPhysicsSceneKey(tempPhysicsSceneKey);
+                }
+                else
+                {
+                    // No stage to author into: the default scene still exists in the
+                    // simulation, it just has no USD counterpart to remove later.
+                    PhysXUsdPhysicsInterface::reportLoadError(ErrorCode::eInfo,
+                        "Physics USD: Physics scene not found. A default PhysicsScene was created for the simulation only (no stage to author it into).");
+                    createDefaultSceneObject(tempPhysicsSceneKey);
+                }
             }
             else
             {
-                createDefaultSceneObject(tempPhysicsScenePath);
+                createDefaultSceneObject(tempPhysicsSceneKey);
             }
         }
 
         // create deformable materials first
         {
-            for (const std::pair<SdfPath, PBDMaterialDesc*>& pair : mPDBMatrialsDescs)
+            for (const std::pair<omni::physics::parse::ObjectKey, PBDMaterialDesc*>& pair : mPDBMatrialsDescs)
             {
-                createObject(mAttachedStage, pair.first, pair.second);
+                createObject(mAttachedStage, pair.first, pair.second, false);
             }
             mPDBMatrialsDescs.clear();
         }
@@ -3320,20 +3850,28 @@ public:
         {
             for (size_t i = 0; i < mMaterials.size(); i++)
             {
-                createObject(mAttachedStage, mMaterials[i].first, mMaterials[i].second);
+                createObject(mAttachedStage, mMaterials[i].first, mMaterials[i].second, false);
             }
         }
         mMaterials.clear();
+        scanned.materials.clear();
+        scanned.pbdMaterials.clear();
 
         // create shapes next
         {
+            ScopedOvstageHierarchyBulkRead scopedHierarchyBulkRead(
+                initialStageLoad ? mAttachedStage.getSource() : nullptr);
             for (const ShapeDescAndMaterials& shapeDesc : mShapes)
             {
+                // createShape's own registration still resolves attachedStage.pathFor(key)
+                // under USD so ObjectDb's SdfPath-keyed maps stay populated.
                 finalizeShape(mAttachedStage, shapeDesc.desc, shapeDesc.materials);
                 PhysxRigidBodyDesc* bodyDesc = createShape(mAttachedStage, shapeDesc.path, shapeDesc.desc, nullptr);
                 // standalone collision -> static body
                 if (bodyDesc)
                 {
+                    generatedBodies.push_back(omni::physics::parse::adoptDesc(
+                        iceDescriptorAllocator(), static_cast<StaticPhysxRigidBodyDesc*>(bodyDesc)));
                     if (mBodyMap.find(shapeDesc.path) == mBodyMap.end())
                     {
                         BodyDescAndColliders& bdCol = mBodyMap[shapeDesc.path];
@@ -3349,6 +3887,7 @@ public:
             }
         }
         mShapes.clear();
+        scanned.shapes.clear();
 
         // finalize bodies
         {
@@ -3356,7 +3895,7 @@ public:
             {
                 finalizeRigidBody(mAttachedStage, ref.second);
             }
-            for (std::pair<SdfPath, BodyDescAndColliders>& ref : mAdditionalBodyVector)
+            for (std::pair<omni::physics::parse::ObjectKey, BodyDescAndColliders>& ref : mAdditionalBodyVector)
             {
                 finalizeRigidBody(mAttachedStage, ref.second);
             }
@@ -3365,7 +3904,9 @@ public:
         // create articulation links
         {
             CARB_PROFILE_ZONE(0,"OmniPhysX:createArticulationLinks");
-            SdfChangeBlock changeBlock; // add change block to get transforms sanitation changes grouped
+            // Group transform-sanitation changes into one write batch (a USD backend's
+            // SdfChangeBlock); no-op without a write sink.
+            DataWriteScope writeScope(mAttachedStage.getDataWrite());
             createArticulationLinks(mAttachedStage, mBodyMap, mJointVector, mArticulationMap, mJointPathIndexMap);
         }
 
@@ -3378,18 +3919,24 @@ public:
         // create rigid bodies
         {
             CARB_PROFILE_ZONE(0, "OmniPhysX:createBodies");
-            SdfChangeBlock changeBlock; // add change block to get transforms sanitation changes grouped
+            // See the createArticulationLinks block above.
+            DataWriteScope writeScope(mAttachedStage.getDataWrite());
             createBodies(mAttachedStage, mBodyMap, mAdditionalBodyVector);
+            scanned.bodies.clear();
+            generatedBodies.clear();
+            mArticulationMap.clear();
+            scanned.articulations.clear();
         }
 
         // deformable materials
         {
             for (size_t i = 0; i < mDeformableMaterials.size(); i++)
             {
-                createObject(mAttachedStage, mDeformableMaterials[i].first, mDeformableMaterials[i].second);
+                createObject(mAttachedStage, mDeformableMaterials[i].first, mDeformableMaterials[i].second, false);
             }
         }
         mDeformableMaterials.clear();
+        scanned.deformableMaterials.clear();
 
         // finalize and create deformable bodies
         {
@@ -3401,8 +3948,10 @@ public:
                 // group lookup during scanStage returns kInvalidObjectId;
                 // this late re-resolution still lands before
                 // createDeformableBody wires the filter group up in PhysX.
-                if (!deformableDesc.desc->collisionMeshPath.IsEmpty())
-                    deformableDesc.desc->collisionGroup = getCollisionGroup(mAttachedStage, deformableDesc.desc->collisionMeshPath);
+                if (deformableDesc.desc->collisionMeshKey.valid())
+                    deformableDesc.desc->collisionGroup = getCollisionGroup(mAttachedStage, deformableDesc.desc->collisionMeshKey);
+                // finalizeDeformableBody is ObjectKey-native (ADR-0019); simMeshMaterial is
+                // already an ObjectKey, so no path round-trip needed.
                 finalizeDeformableBody(mAttachedStage, deformableDesc.desc, deformableDesc.simMeshMaterial);
                 createDeformableBody(mAttachedStage, deformableDesc.desc, deformableDesc.path);
             }
@@ -3411,9 +3960,9 @@ public:
         // create forces
         {
             CARB_PROFILE_ZONE(0, "OmniPhysX:createForces");
-            for (const std::pair<SdfPath, PhysxForceDesc*>& pair : mPhysxForceDescs)
+            for (const std::pair<omni::physics::parse::ObjectKey, PhysxForceDesc*>& pair : mPhysxForceDescs)
             {
-                finalizePhysxForce(mAttachedStage, mAttachedStage.keyFor(pair.first), *pair.second);
+                finalizePhysxForce(mAttachedStage, pair.first, *pair.second);
                 createObject(mAttachedStage, pair.first, pair.second);
             }
             mPhysxForceDescs.clear();
@@ -3423,6 +3972,9 @@ public:
         {
             CARB_PROFILE_ZONE(0, "OmniPhysX:createJoints");
             createJoints(mAttachedStage, mJointVector, initialStageLoad);
+            mJointVector.clear();
+            mJointPathIndexMap.clear();
+            scanned.joints.clear();
         }
 
         // create mimic joints (has to be done after the joints are created)
@@ -3432,159 +3984,161 @@ public:
         }
 
         // parse all instancers and particle objects
-        // A.B. TODO merge some traversals
         std::vector<ParticleSystemDesc*> particleSysDescs;
         std::vector<ParticleDesc*> particleDescs;
 
         if (mParsingFlags & ParsingFlag::eParseParticles)
         {
             CARB_PROFILE_ZONE(0, "OmniPhysX:particles");
-            std::vector<SdfPath> jointInstancerPaths;
+            KeySet jointInstancerKeys;
 
-            // Source-backed type/schema dispatch keyed by ObjectKey (no UsdPrim).
+            // Dispatch only the scan-discovered candidates (no per-render-prim type probes).
             const omni::physics::parse::IPhysicsSource* src = mAttachedStage.getSource();
+            const omni::physics::parse::KnownTokens& tok = mAttachedStage.getKnownTokens();
 
-            // The particle systems / sets / samplers were already scanned into
-            // typed parse descriptors by scanStage.  Index them by prim path
-            // (parse-time table) so the dispatch below can build the engine
-            // descriptor from scanned data instead of re-reading USD.
-            std::unordered_map<SdfPath, const omni::physics::parse::ParticleSystemDesc*, SdfPath::Hash> scannedSystems;
+            // Index by SOURCE-TEXT, not ObjectKey: the scan's source and attachedStage's
+            // persistent source are different IPhysicsSource instances, and re-keying
+            // scan-space text is not guaranteed to yield the ObjectKey forEachLoadObject
+            // hands back for the same prim (ovstage keys can be non-canonical -- see
+            // OvstageSource::canonicalHandleRaw). Comparing ObjectKeys here silently
+            // double-created particle systems/sets under ovstage. Text is the one identity
+            // stable across both sources (ADR-0004).
+            const omni::physics::parse::IPhysicsSource& scanSrc = scanned.source();
+            std::unordered_map<std::string_view, const omni::physics::parse::ParticleSystemDesc*> scannedSystems;
             for (const auto& sysUPtr : scanned.particleSystems)
-                scannedSystems[scanned.pathFor(sysUPtr->systemKey)] = sysUPtr.get();
-            std::unordered_map<SdfPath, const omni::physics::parse::ParticleSetDesc*, SdfPath::Hash> scannedSets;
+                scannedSystems[scanSrc.sourceKeyToString(sysUPtr->systemKey)] = sysUPtr.get();
+            std::unordered_map<std::string_view, const omni::physics::parse::ParticleSetDesc*> scannedSets;
             for (const auto& setUPtr : scanned.particleSets)
-                scannedSets[scanned.pathFor(setUPtr->primKey)] = setUPtr.get();
-            std::unordered_map<SdfPath, const omni::physics::parse::ParticleSamplingDesc*, SdfPath::Hash> scannedSamplers;
+                scannedSets[scanSrc.sourceKeyToString(setUPtr->primKey)] = setUPtr.get();
+            std::unordered_map<std::string_view, const omni::physics::parse::ParticleSamplingDesc*> scannedSamplers;
             for (size_t i = 0; i < scanned.particleSamplers.size(); ++i)
-                scannedSamplers[scanned.pathFor(scanned.particleSamplerKeys[i])] = scanned.particleSamplers[i].get();
-            std::unordered_set<SdfPath, SdfPath::Hash> queuedParticleSystems;
-            std::unordered_set<SdfPath, SdfPath::Hash> queuedParticleSets;
-            // Voxel-map subtrees are pruned by forEachLoadObject below (it stops descending under
+                scannedSamplers[scanSrc.sourceKeyToString(scanned.particleSamplerKeys[i])] = scanned.particleSamplers[i].get();
+            std::unordered_set<std::string_view> queuedParticleSystems;
+            std::unordered_set<std::string_view> queuedParticleSets;
+            // Voxel-map candidate subtrees are pruned below (it stops processing under
             // an InfiniteVoxelMapAPI Xform). scanStage has no voxel-map awareness, so the scanned
             // particle lists still contain prims nested under a voxel map; the catch-all loops
-            // after the walk must replicate the prune and skip them.
-            std::vector<SdfPath> voxelMapRoots;
-
-            forEachLoadObject(scanRoots, excludePaths, [&](omni::physics::parse::ObjectKey primObjKey) -> bool
+            // after the walk must replicate the prune and skip them. Text-prefix (mirrors
+            // SdfPath::HasPrefix) for the same cross-source-identity reason as the maps above.
+            std::vector<std::string_view> voxelMapRoots;
+            const auto hasTextPrefix = [](std::string_view path, std::string_view root) -> bool
             {
-                const SdfPath primPath = mAttachedStage.pathFor(primObjKey);
+                if (path == root)
+                    return true;
+                if (root.size() == 1) // root == "/" (the pseudo-root): every path is under it.
+                    return path.size() > root.size() && path[0] == '/';
+                return path.size() > root.size() && path.compare(0, root.size(), root) == 0 &&
+                       path[root.size()] == '/';
+            };
 
-                if (src->isA(primObjKey, schemaTypeToken<PhysxSchemaPhysxParticleSystem>(*src)))
+            for (const omni::physics::parse::ParticleObjectCandidate& candidate : scanned.particleObjectCandidates)
+            {
+                const std::string_view candidatePath = scanSrc.sourceKeyToString(candidate.key);
+                if (candidatePath.empty())
+                    continue;
+                // Both backends emit contiguous depth-first subtrees. Only the
+                // latest retained voxel root can contain the next candidate.
+                // Keep all roots for the unordered descriptor fallback below.
+                if (!voxelMapRoots.empty() && hasTextPrefix(candidatePath, voxelMapRoots.back()))
+                    continue;
+                const omni::physics::parse::ObjectKey primObjKey = mAttachedStage.keyFor(candidatePath);
+                using Kind = omni::physics::parse::ParticleObjectCandidate::Kind;
+                if (candidate.kind == Kind::eParticleSystem)
                 {
-                    auto sysIt = scannedSystems.find(primPath);
+                    auto sysIt = scannedSystems.find(candidatePath);
                     if (sysIt != scannedSystems.end())
                     {
                         particleSysDescs.push_back(buildParticleSystemDesc(mAttachedStage, scanned, *sysIt->second));
-                        queuedParticleSystems.insert(primPath);
+                        queuedParticleSystems.insert(sysIt->first);
                     }
                 }
-                else if (src->isA(primObjKey, schemaTypeToken<UsdGeomXform>(*src)))
+                else if (candidate.kind == Kind::eVoxelMap)
                 {
-                    if (src->hasSchema(primObjKey, src->internToken(gInfiniteVoxelMapAPI.GetString())))
-                    {
-                        InfiniteVoxelMapDesc desc(primPath);
-                        createObject(mAttachedStage, primPath, &desc, false);
-                        voxelMapRoots.push_back(primPath);
-                        return true; // avoid parsing point instancers below (prune subtree)
-                    }
-                    return false;
+                    CARB_LOG_WARN("InfiniteVoxelMapAPI on '%s' is not supported by the USD-free runtime; the voxel map is ignored",
+                                  mAttachedStage.textFor(primObjKey));
+                    voxelMapRoots.push_back(candidatePath);
+                    continue;
                 }
-                else if (src->isA(primObjKey, schemaTypeToken<UsdGeomMesh>(*src)) &&
-                         src->hasSchema(primObjKey, schemaTypeToken<PhysxSchemaPhysxParticleSamplingAPI>(*src)))
+                else if (candidate.kind == Kind::eParticleSampler)
                 {
                     cookingdataasync::CookingDataAsync* cookingDataAsync = omni::physx::OmniPhysX::getInstance().getPhysXSetup().getCookingDataAsync();
                     // Build the engine sampling descriptor from the scanned
                     // parse descriptor (no USD re-read).
-                    auto samplerIt = scannedSamplers.find(primPath);
+                    auto samplerIt = scannedSamplers.find(candidatePath);
                     const omni::physics::parse::ParticleSamplingDesc* scanSampling =
                         samplerIt != scannedSamplers.end() ? samplerIt->second : nullptr;
                     ParticleSamplingDesc samplingDesc;
-                    SdfPath particleSetPath;
+                    omni::physics::parse::ObjectKey particleKey;
                     if (scanSampling)
                     {
                         samplingDesc.samplingDistance = scanSampling->samplingDistance;
                         samplingDesc.sampleVolume = scanSampling->sampleVolume;
                         samplingDesc.maxSamples = scanSampling->maxSamples;
                         samplingDesc.pointWidth = scanSampling->pointWidth;
-                        particleSetPath = scanSampling->particleSetKey.valid() ?
-                            scanned.pathFor(scanSampling->particleSetKey) : SdfPath();
-                        samplingDesc.particleSetPath = particleSetPath;
+                        particleKey = scanSampling->particleSetKey.valid() ?
+                            mAttachedStage.keyFor(scanSrc.sourceKeyToString(scanSampling->particleSetKey)) : omni::physics::parse::ObjectKey{};
                     }
                     // check if it points to a valid particle prim
-                    const omni::physics::parse::ObjectKey particleKey = mAttachedStage.keyFor(particleSetPath);
-                    if (!scanSampling || !src->exists(particleKey) || !src->hasSchema(particleKey, schemaTypeToken<PhysxSchemaPhysxParticleSetAPI>(*src)) ||
-                        !(src->isA(particleKey, schemaTypeToken<UsdGeomPoints>(*src)) || src->isA(particleKey, schemaTypeToken<UsdGeomPointInstancer>(*src))))
+                    samplingDesc.particleSetKey = particleKey;
+                    if (!scanSampling || !src->exists(particleKey) || !src->hasSchema(particleKey, tok.physxParticleSetAPI) ||
+                        !(src->isA(particleKey, tok.pointsType) || src->isA(particleKey, tok.pointInstancerType)))
                     {
-                        CARB_LOG_WARN("%s: particle sampler does not point to a valid particle prim, needs to be set before stage parsing starts.", primPath.GetText());
+                        CARB_LOG_WARN("%s: particle sampler does not point to a valid particle prim, needs to be set before stage parsing starts.", mAttachedStage.textFor(primObjKey));
                     }
                     else if (!cookingDataAsync)
                     {
-                        CARB_LOG_WARN("%s: particle sampling failed.", primPath.GetText());
+                        CARB_LOG_WARN("%s: particle sampling failed.", mAttachedStage.textFor(primObjKey));
                     }
                     else
                     {
                         // AD: OM-89182 - we need to disallow adding new samplers during simulation: it could have been just a path change, and we don't have the setup to clean things up.
                         // we never allowed processing changes in particleAuthoring and this code is just here in case there is no PhysXUI or we need to block at the sim start for async
                         // tasks to finish.
-                        if (OmniPhysX::getInstance().getSimulationStepCount() == 0)
+                        if (mAttachedStage.simulationStepCount() == 0)
                         {
-                            omni::physx::particles::createParticleSampler(primPath, samplingDesc.particleSetPath);
+                            omni::physx::particles::createParticleSampler(mAttachedStage, primObjKey, particleKey);
                             cookingDataAsync->poissonSampleMesh(primObjKey, mAttachedStage, samplingDesc, false, false);
                         }
                         else
                         {
-                            CARB_LOG_WARN("%s: it is not allowed to add new particle samplers once simulation has been started, ignoring.", primPath.GetText());
+                            CARB_LOG_WARN("%s: it is not allowed to add new particle samplers once simulation has been started, ignoring.", mAttachedStage.textFor(primObjKey));
                         }
                     }
                 }
-                else if (src->isA(primObjKey, schemaTypeToken<UsdGeomPointBased>(*src)) &&
-                         src->hasSchema(primObjKey, schemaTypeToken<PhysxSchemaPhysxParticleSetAPI>(*src)))
+                else if (candidate.kind == Kind::eParticleSet)
                 {
-                    auto setIt = scannedSets.find(primPath);
+                    auto setIt = scannedSets.find(candidatePath);
                     if (setIt != scannedSets.end())
                     {
                         if (ParticleSetDesc* desc = buildParticleSetDesc(mAttachedStage, scanned, *setIt->second))
                         {
                             particleDescs.push_back(desc);
-                            queuedParticleSets.insert(primPath);
+                            queuedParticleSets.insert(setIt->first);
                         }
                     }
                 }
-                else if (src->isA(primObjKey, schemaTypeToken<UsdGeomPointInstancer>(*src)))
+                else if (candidate.kind == Kind::ePointInstancer)
                 {
-                    if (src->hasSchema(primObjKey, schemaTypeToken<PhysxSchemaPhysxParticleSetAPI>(*src)))
-                    {
-                        auto setIt = scannedSets.find(primPath);
-                        if (setIt != scannedSets.end())
-                        {
-                            if (ParticleSetDesc* desc = buildParticleSetDesc(mAttachedStage, scanned, *setIt->second))
-                            {
-                                particleDescs.push_back(desc);
-                                queuedParticleSets.insert(primPath);
-                            }
-                        }
-                    }
-                    else if (!src->isInstance(primObjKey) && !src->isInstanceProxy(primObjKey))
-                    {
-                        parseRigidBodyInstancer(mAttachedStage, primPath, mFilteredPairs);
-                    }
+                    if (!src->isInstance(primObjKey) && !src->isInstanceProxy(primObjKey))
+                        parseRigidBodyInstancer(mAttachedStage, primObjKey, mFilteredPairs);
                 }
-                else if (src->isA(primObjKey, schemaTypeToken<PhysxSchemaPhysxPhysicsJointInstancer>(*src)))
+                else if (candidate.kind == Kind::eJointInstancer)
                 {
                     if (!src->isInstance(primObjKey) && !src->isInstanceProxy(primObjKey))
                     {
-                        jointInstancerPaths.push_back(primPath);
+                        jointInstancerKeys.insert(primObjKey);
                     }
                 }
-                return false;
-            });
+            }
 
             // Skip scanned particle prims nested under a pruned voxel-map subtree so the catch-all
-            // does not create particle systems/sets that forEachLoadObject deliberately excluded.
-            auto underVoxelMap = [&](const SdfPath& path) -> bool
+            // does not create particle systems/sets that candidate dispatch deliberately excluded.
+            // Text-prefix rather than an ObjectKey ancestry walk: re-keying scan-space text
+            // just for this check would reintroduce the cross-source identity hazard above.
+            auto underVoxelMap = [&](std::string_view path) -> bool
             {
-                for (const SdfPath& root : voxelMapRoots)
-                    if (path.HasPrefix(root))
+                for (const std::string_view root : voxelMapRoots)
+                    if (hasTextPrefix(path, root))
                         return true;
                 return false;
             };
@@ -3606,9 +4160,9 @@ public:
                 }
             }
 
-            for (const SdfPath& jointInstancerPath : jointInstancerPaths)
+            for (const omni::physics::parse::ObjectKey jointInstancerKey : jointInstancerKeys)
             {
-                parseJointInstancer(mAttachedStage, jointInstancerPath);
+                parseJointInstancer(mAttachedStage, jointInstancerKey);
             }
 
             createParticleSystemsAndObjects(mAttachedStage, particleSysDescs, particleDescs, mFilteredPairs);
@@ -3619,31 +4173,37 @@ public:
         // AttachmentAuthoring cannot fix this in time because ScopedBlockUSDUpdates suppresses
         // USD notices during cooking.
         {
-            refreshAutoDeformableAttachments(mAttachedStage, mDeformableAttachmentVector, mDeformableCollisionFilterVector);
+            generateAutoDeformableAttachmentLayouts(mAttachedStage, mAutoDeformableAttachmentKeys,
+                mDeformableAttachmentVector, mDeformableCollisionFilterVector);
+            { refreshAutoDeformableAttachments(mAttachedStage, mDeformableAttachmentVector, mDeformableCollisionFilterVector); }
         }
 
         // create deformable attachments and filters
         {
-            createDeformableAttachments(mAttachedStage, mDeformableAttachmentVector);
+            { createDeformableAttachments(mAttachedStage, mDeformableAttachmentVector); }
         }
         {
-            createDeformableCollisionFilters(mAttachedStage, mDeformableCollisionFilterVector);
+            { createDeformableCollisionFilters(mAttachedStage, mDeformableCollisionFilterVector); }
         }
 
         // create filtered collision groups.
         {
+
             PHYSICS_PROFILE("SetupCollisionGroups");
             setupCollisionGroups(mAttachedStage, mCollisionGroupsPrims);
         }
 
         // create collision blocks
         {
+            ScopedOvstageHierarchyBulkRead scopedHierarchyBulkRead(
+                initialStageLoad ? mAttachedStage.getSource() : nullptr);
+
             createFilteredPairs(mAttachedStage, mFilteredPairs, mFilteredPairsPaths);
         }
 
         {
             CARB_PROFILE_ZONE(0, "OmniPhysX:updateMass");
-            UsdLoad::getUsdLoad()->updateRigidBodyMass();
+            mAttachedStage.updateRigidBodyMass();
         }
 
         //
@@ -3670,16 +4230,19 @@ public:
 
 	            for (size_t j = 0; j < materialPathCount; j++)
 	            {
-	                const SdfPath& materialKey = tireFrictionTableDesc->materialPaths[j];
+	                const omni::physics::parse::ObjectKey materialKey = tireFrictionTableDesc->materialPaths[j];
 	                ObjectId materialId = mAttachedStage.getObjectDatabase()->findEntry(materialKey, eMaterial);
 	                tireFrictionTableDesc->materialIds[j] = materialId;
 	            }
 
-	            createObject(mAttachedStage, tireFrictionTableDesc->path, tireFrictionTableDesc, true);
+	            createObject(mAttachedStage, tireFrictionTableDesc->key, tireFrictionTableDesc, true);
 	        }
 	
 	        VehicleComponentTracker& vehicleComponentTracker = mVehicleComponentTracker;
 	        const omni::physics::parse::IPhysicsSource* vehSrc = mAttachedStage.getSource();
+	        omni::physics::parse::KnownTokens vehTok;
+	        if (vehSrc)
+	            vehTok.intern(*vehSrc);
 	        forEachLoadObject(scanRoots, excludePaths, [&](omni::physics::parse::ObjectKey primObjKey) -> bool
 	        {
 	            // note: PhysxVehicleContextAPI needs to be set before creating vehicles. However, checking here is not that easy since
@@ -3687,7 +4250,7 @@ public:
 	            loadVehicle(mAttachedStage, primObjKey, vehicleComponentTracker);
 
 	            // skip the instancer parsing: prune the subtree rooted at a point instancer.
-	            return vehSrc && vehSrc->isA(primObjKey, schemaTypeToken<UsdGeomPointInstancer>(*vehSrc));
+	            return vehSrc && vehSrc->isA(primObjKey, vehTok.pointInstancerType);
 	        });
     	}
 
@@ -3699,19 +4262,18 @@ public:
             }
         }
         mPhysXDescCache.clear();
+        return true;
     }
 
 private:
     bool mSceneFound;
     bool mNoValidScene;
-    bool mNoPhysXScene;
     bool mCollectionsPopulated;
     uint32_t mNumScenes;
 
     uint32_t mParsingFlags;
 
     AttachedStage&  mAttachedStage;
-    UsdStageWeakPtr mStage;
     PathPhysXDescMap  mPhysXDescCache;
 
     // maps holding the descs
@@ -3725,16 +4287,17 @@ private:
     JointPathIndexMap mJointPathIndexMap;
     DeformableBodyDescsVector mDeformableBodies;
 
-    SdfPathVector mFilteredPairsPaths;
+    // A set: every consumer only ever needed distinct prims, not order or duplicates.
+    KeySet mFilteredPairsPaths;
     CollisionPairVector mFilteredPairs;
 
     // forces
-    std::vector<std::pair<SdfPath, PhysxForceDesc*>> mPhysxForceDescs;
+    std::vector<std::pair<omni::physics::parse::ObjectKey, PhysxForceDesc*>> mPhysxForceDescs;
 
     // particle materials
-    std::vector<std::pair<SdfPath, PBDMaterialDesc*>> mPDBMatrialsDescs;
+    std::vector<std::pair<omni::physics::parse::ObjectKey, PBDMaterialDesc*>> mPDBMatrialsDescs;
 
-    std::vector<SdfPath> mCollisionGroupsPrims;
+    KeySet mCollisionGroupsPrims;
 
     std::vector<VehicleContextDesc> mVehicleContextDescList;
     std::vector<TireFrictionTableDesc*> mTireFrictionTableDescList;
@@ -3754,34 +4317,95 @@ private:
     // deformable attachments and collision filters
     DeformableAttachmentVector mDeformableAttachmentVector;
     DeformableCollisionFilterVector mDeformableCollisionFilterVector;
+    // prims carrying PhysxAutoDeformableAttachmentAPI, for in-memory sub-prim generation
+    KeySet mAutoDeformableAttachmentKeys;
 };
 
-void loadFromStage(AttachedStage& attachedStage, const PathSet* excludePaths)
+// Re-mint source-local keys after each source rebuild; the descriptor owns paths,
+// not keys from an older ordinal/source generation.
+static PathSet attachmentExclusions(AttachedStage& attachedStage)
+{
+    PathSet result;
+    for (const std::string& path : attachedStage.getExcludedPaths())
+        result.insert(attachedStage.keyFor(std::string_view(path)));
+    return result;
+}
+
+bool loadFromStage(AttachedStage& attachedStage, const PathSet* excludePaths)
 {
     PHYSICS_PROFILE("Physics Load Stage");
     CARB_PROFILE_ZONE(0, "Physics Load Stage");
-    // Whole-stage load: the scan root is the pseudo-root; the backend builds the
-    // UsdTraverseInstanceProxies range internally and the post-scan passes walk
-    // via IPhysicsSource. `excludePaths` (replicator selective load) prunes the
-    // listed subtrees.
-    const std::vector<SdfPath> scanRoots{ SdfPath::AbsoluteRootPath() };
+    // Whole-stage load: the scan root is the pseudo-root, "/". `excludePaths`
+    // (replicator selective load) prunes the listed subtrees.
+    const std::vector<std::string> scanRoots{ "/" };
     PhysxUsdPhysicsListener usdPhysicsListener(attachedStage);
-    usdPhysicsListener.loadFromRange(scanRoots, excludePaths, true);
+    PathSet exclusions = attachmentExclusions(attachedStage);
+    if (excludePaths)
+        exclusions.insert(excludePaths->begin(), excludePaths->end());
+    return usdPhysicsListener.loadFromRange(scanRoots, exclusions.empty() ? nullptr : &exclusions, true);
 }
 
-void loadPhysicsFromPrimitive(AttachedStage& attachedStage, const std::set<SdfPath>& updateRoots)
+bool loadSceneFromStage(AttachedStage& attachedStage, const std::string& scenePath)
+{
+    CARB_PROFILE_ZONE(0, "Physics Load Scene");
+    PhysxSceneDesc desc;
+    return readSceneFromStage(attachedStage, attachedStage.keyFor(scenePath), desc) &&
+           createSceneFromDesc(attachedStage, desc) != kInvalidObjectId;
+}
+
+bool readSceneFromStage(AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, PhysxSceneDesc& desc)
+{
+    omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+    if (!source || !key.valid() || !source->exists(key))
+        return false;
+    // The walker's scene preparation and fill, for this one prim. Schema checks read
+    // this prim alone instead of building the stage-wide schema vocabulary.
+    std::optional<omni::physics::ovstage::OvstageSource::SinglePrimSchemaScope> singlePrim;
+    if (const auto* ovstage = dynamic_cast<const omni::physics::ovstage::OvstageSource*>(source))
+        singlePrim.emplace(*ovstage);
+    const omni::physics::parse::KnownTokens& tokens = attachedStage.getKnownTokens();
+    omni::physics::parse::SceneInfo info;
+    source->getAttribute(key, tokens.physicsGravityDirection, info.gravityDirection);
+    source->getAttribute(key, tokens.physicsGravityMagnitude, info.gravityMagnitude);
+    omni::physics::parse::ParseContext context(*source, iceDescriptorAllocator());
+    omni::physics::parse::setToDefault(desc, source->getSourceUnits());
+    if (!omni::physics::parse::fillScene(omni::physics::parse::prepareScene(context, key, info), desc))
+        return false;
+    desc.primKey = key;
+    completeSceneDesc(attachedStage, key, desc);
+    return true;
+}
+
+ObjectId createSceneFromDesc(AttachedStage& attachedStage, PhysxSceneDesc& desc)
+{
+    return createObject(attachedStage, desc.primKey, &desc, false);
+}
+
+bool loadPhysicsFromPrimitive(AttachedStage& attachedStage, const std::vector<std::string>& updateRoots,
+                              bool applyAttachmentExclusions)
 {
     PHYSICS_PROFILE("Physics Load Prims");
     CARB_PROFILE_ZONE(0, "Physics Load Prims");
     if (updateRoots.empty())
-        return;
+        return true;
 
     // Incremental re-parse: the changed-prim paths are the scan roots; the
     // backend walks each subtree (instance proxies) and the post-scan passes
     // walk via IPhysicsSource. No PrimIterator.
-    const std::vector<SdfPath> scanRoots(updateRoots.begin(), updateRoots.end());
     PhysxUsdPhysicsListener usdPhysicsListener(attachedStage);
-    usdPhysicsListener.loadFromRange(scanRoots, nullptr, false);
+    const PathSet exclusions = applyAttachmentExclusions ? attachmentExclusions(attachedStage) : PathSet{};
+    const PathSet* excluded = exclusions.empty() ? nullptr : &exclusions;
+    // A cache candidate proves the common root has no existing runtime records
+    // and audits its complete selected inputs. On a miss, parse that admitted
+    // unit once instead of every notified physics leaf; a hit loads nothing.
+    bool loaded = true;
+    const auto loadUnit = [&](const std::string& root) {
+        loaded = usdPhysicsListener.loadFromRange({ root }, excluded, false);
+        return loaded;
+    };
+    if (applyAttachmentExclusions && cache::loadCompiledInsertion(attachedStage, updateRoots, loadUnit))
+        return loaded;
+    return usdPhysicsListener.loadFromRange(updateRoots, excluded, false);
 }
 
 } // namespace usdparser

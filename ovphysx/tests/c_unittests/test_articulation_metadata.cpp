@@ -1,11 +1,29 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+// DEPRECATED (tensor-binding-deprecation): these test the binding's articulation-metadata getters (their C string
+// fields, capacities, and rejection of a stale or invalid binding) and retire with the binding. The session read
+// serves the counts (dofCount, linkCount, jointCount, isFixedBase) and the names as prim paths (dofJointPath, link
+// and joint rows), including fixed (zero-DOF) joints through the prim list of an ARTICULATION_JOINT
+// physxPointer read, without dereferencing pointers.
 
 // Tests for the articulation metadata API:
+//   ovphysx_get_tensor_binding_native_device
 //   ovphysx_get_articulation_metadata
 //   ovphysx_articulation_get_dof_names
 //   ovphysx_articulation_get_body_names
 //   ovphysx_articulation_get_joint_names
+
+/**
+ * @implements REQ-CAPI-STRING-001
+ * @covers AC-3
+ *
+ * @implements REQ-CAPI-BINDING-STALE-001
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5 AC-6
+ *
+ * @implements REQ-CAPI-ARTICULATION-NAMES-001
+ * @covers AC-1 AC-2 AC-3 AC-4
+ */
 
 #include <gtest/gtest.h>
 #include "ovphysx/ovphysx.h"
@@ -16,11 +34,11 @@
 
 using namespace test_utils;
 
-static bool wait_am_op(ovphysx_handle_t handle, ovphysx_op_index_t op_index)
+static bool wait_am_op(ovphysx_instance_handle_t handle, ovphysx_enqueue_result_t task)
 {
-    ovphysx_op_wait_result_t wr{};
-    ovphysx_result_t r = ovphysx_wait_op(handle, op_index, 10'000'000'000ULL, &wr);
-    ovphysx_destroy_wait_result(&wr);
+    ovphysx_wait_task_result_t wr{};
+    ovphysx_result_t r = ovphysx_wait_task(handle, task, 10'000'000'000ULL, &wr);
+    ovphysx_destroy_wait_task_result(&wr);
     return r.status == OVPHYSX_API_SUCCESS;
 }
 
@@ -30,6 +48,13 @@ static bool wait_am_op(ovphysx_handle_t handle, ovphysx_op_index_t op_index)
 // ---------------------------------------------------------------------------
 class ArticulationMetadataTest : public PhysXTestFixture {
 protected:
+    using ArticulationNameGetter = ovphysx_result_t (*)(
+        ovphysx_instance_handle_t,
+        ovphysx_tensor_binding_handle_t,
+        ovphysx_string_t*,
+        uint32_t,
+        uint32_t*);
+
     ovphysx_tensor_binding_handle_t m_binding = 0;
 
     void LoadAndBind(const char* usd_path, const char* pattern,
@@ -42,6 +67,38 @@ protected:
         desc.tensor_type = tensor_type;
         ovphysx_result_t r = ovphysx_create_tensor_binding(m_handle, &desc, &m_binding);
         ASSERT_EQ(r.status, OVPHYSX_API_SUCCESS) << "Failed to create binding";
+    }
+
+    void ExpectNameGetterTruncation(ArticulationNameGetter get_names, uint32_t demand)
+    {
+        ASSERT_GT(demand, 1u);
+
+        std::vector<ovphysx_string_t> complete(demand);
+        uint32_t complete_count = 0;
+        ovphysx_result_t r = get_names(m_handle, m_binding, complete.data(), demand, &complete_count);
+        ASSERT_EQ(r.status, OVPHYSX_API_SUCCESS);
+        ASSERT_EQ(complete_count, demand);
+
+        const uint32_t capacity = demand - 1;
+        std::vector<ovphysx_string_t> truncated(demand);
+        const ovphysx_string_t canary = make_ovx_string("unchanged");
+        truncated[capacity] = canary;
+
+        uint32_t out_count = 0;
+        r = get_names(m_handle, m_binding, truncated.data(), capacity, &out_count);
+        EXPECT_EQ(r.status, OVPHYSX_API_BUFFER_TOO_SMALL);
+        EXPECT_EQ(out_count, demand);
+        for (uint32_t index = 0; index < capacity; ++index)
+        {
+            ASSERT_NE(truncated[index].ptr, nullptr);
+            EXPECT_EQ(truncated[index].ptr[truncated[index].length], '\0');
+            EXPECT_EQ(truncated[index].length, complete[index].length);
+            EXPECT_EQ(
+                std::string(truncated[index].ptr, truncated[index].length),
+                std::string(complete[index].ptr, complete[index].length));
+        }
+        EXPECT_EQ(truncated[capacity].ptr, canary.ptr);
+        EXPECT_EQ(truncated[capacity].length, canary.length);
     }
 
     void TearDown() override
@@ -86,9 +143,15 @@ TEST_F(ArticulationMetadataTest, GetDofNamesCountAndContent)
     ASSERT_EQ(r.status, OVPHYSX_API_SUCCESS);
 
     EXPECT_EQ(out_count, static_cast<uint32_t>(meta.dof_count));
+    for (uint32_t index = 0; index < out_count; ++index)
+    {
+        ASSERT_NE(names[index].ptr, nullptr);
+        EXPECT_EQ(names[index].ptr[names[index].length], '\0');
+    }
 }
 
-// Requesting zero names should return 0 and succeed (or INVALID_ARGUMENT — both OK).
+// A NULL output buffer is invalid even when its advertised capacity is zero.
+// A non-NULL zero-capacity buffer reports the full demand without writing.
 TEST_F(ArticulationMetadataTest, GetDofNamesZeroCapacity)
 {
     LoadAndBind("tests/data/links_chain_sample.usda", "/World/articulation",
@@ -97,10 +160,21 @@ TEST_F(ArticulationMetadataTest, GetDofNamesZeroCapacity)
     uint32_t out_count = 42;
     ovphysx_result_t r = ovphysx_articulation_get_dof_names(
         m_handle, m_binding, nullptr, 0, &out_count);
-    if (r.status == OVPHYSX_API_SUCCESS)
-        EXPECT_EQ(out_count, 0u);
-    else
-        EXPECT_EQ(r.status, OVPHYSX_API_INVALID_ARGUMENT);
+    EXPECT_EQ(r.status, OVPHYSX_API_INVALID_ARGUMENT);
+
+    ovphysx_articulation_metadata_t meta{};
+    ASSERT_EQ(ovphysx_get_articulation_metadata(m_handle, m_binding, &meta).status,
+              OVPHYSX_API_SUCCESS);
+    ASSERT_GT(meta.dof_count, 0);
+
+    const ovphysx_string_t canary = make_ovx_string("unchanged");
+    ovphysx_string_t name = canary;
+    out_count = 0;
+    r = ovphysx_articulation_get_dof_names(m_handle, m_binding, &name, 0, &out_count);
+    EXPECT_EQ(r.status, OVPHYSX_API_BUFFER_TOO_SMALL);
+    EXPECT_EQ(out_count, static_cast<uint32_t>(meta.dof_count));
+    EXPECT_EQ(name.ptr, canary.ptr);
+    EXPECT_EQ(name.length, canary.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +199,11 @@ TEST_F(ArticulationMetadataTest, GetBodyNamesCountAndContent)
     ASSERT_EQ(r.status, OVPHYSX_API_SUCCESS);
 
     EXPECT_EQ(out_count, static_cast<uint32_t>(meta.body_count));
+    for (uint32_t index = 0; index < out_count; ++index)
+    {
+        ASSERT_NE(names[index].ptr, nullptr);
+        EXPECT_EQ(names[index].ptr[names[index].length], '\0');
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +228,31 @@ TEST_F(ArticulationMetadataTest, GetJointNamesCountAndContent)
     ASSERT_EQ(r.status, OVPHYSX_API_SUCCESS);
 
     EXPECT_EQ(out_count, static_cast<uint32_t>(meta.joint_count));
+    for (uint32_t index = 0; index < out_count; ++index)
+    {
+        ASSERT_NE(names[index].ptr, nullptr);
+        EXPECT_EQ(names[index].ptr[names[index].length], '\0');
+    }
+}
+
+TEST_F(ArticulationMetadataTest, NameGettersReportDemandAndBufferTooSmall)
+{
+    LoadAndBind("tests/data/links_chain_sample.usda", "/World/articulation",
+                OVPHYSX_TENSOR_ARTICULATION_DOF_POSITION_F32);
+
+    ovphysx_articulation_metadata_t meta{};
+    ASSERT_EQ(ovphysx_get_articulation_metadata(m_handle, m_binding, &meta).status,
+              OVPHYSX_API_SUCCESS);
+    ASSERT_GT(meta.dof_count, 1);
+    ASSERT_GT(meta.body_count, 1);
+    ASSERT_GT(meta.joint_count, 1);
+
+    ExpectNameGetterTruncation(
+        ovphysx_articulation_get_dof_names, static_cast<uint32_t>(meta.dof_count));
+    ExpectNameGetterTruncation(
+        ovphysx_articulation_get_body_names, static_cast<uint32_t>(meta.body_count));
+    ExpectNameGetterTruncation(
+        ovphysx_articulation_get_joint_names, static_cast<uint32_t>(meta.joint_count));
 }
 
 TEST_F(ArticulationMetadataTest, GetPrimPathsReturnsArticulationRoots)
@@ -163,8 +267,134 @@ TEST_F(ArticulationMetadataTest, GetPrimPathsReturnsArticulationRoots)
     ASSERT_EQ(r.status, OVPHYSX_API_SUCCESS);
 
     EXPECT_EQ(out_count, 1u);
+    ASSERT_NE(path.ptr, nullptr);
+    EXPECT_EQ(path.ptr[path.length], '\0');
     EXPECT_EQ(std::string(path.ptr ? path.ptr : "", path.ptr ? path.length : 0),
               "/World/articulation");
+}
+
+TEST_F(ArticulationMetadataTest, GetPrimPathsReportsDemandAndBufferTooSmall)
+{
+    LoadAndBind("tests/data/two_articulations.usda", "/World/articulation*",
+                OVPHYSX_TENSOR_ARTICULATION_DOF_POSITION_F32);
+
+    ovphysx_tensor_spec_t spec{};
+    ASSERT_EQ(ovphysx_get_tensor_binding_spec(m_handle, m_binding, &spec).status,
+              OVPHYSX_API_SUCCESS);
+    ASSERT_EQ(spec.shape[0], 2);
+    const uint32_t demand = static_cast<uint32_t>(spec.shape[0]);
+
+    std::vector<ovphysx_string_t> complete(demand);
+    uint32_t out_count = 0;
+    ASSERT_EQ(
+        ovphysx_tensor_binding_get_prim_paths(
+            m_handle, m_binding, complete.data(), demand, &out_count).status,
+        OVPHYSX_API_SUCCESS);
+    ASSERT_EQ(out_count, demand);
+
+    std::vector<ovphysx_string_t> truncated(demand);
+    const ovphysx_string_t canary = make_ovx_string("unchanged");
+    truncated[1] = canary;
+    out_count = 0;
+    ovphysx_result_t r = ovphysx_tensor_binding_get_prim_paths(
+        m_handle, m_binding, truncated.data(), 1, &out_count);
+    EXPECT_EQ(r.status, OVPHYSX_API_BUFFER_TOO_SMALL);
+    EXPECT_EQ(out_count, demand);
+    ASSERT_NE(truncated[0].ptr, nullptr);
+    EXPECT_EQ(truncated[0].ptr[truncated[0].length], '\0');
+    EXPECT_EQ(
+        std::string(truncated[0].ptr, truncated[0].length),
+        std::string(complete[0].ptr, complete[0].length));
+    EXPECT_EQ(truncated[1].ptr, canary.ptr);
+    EXPECT_EQ(truncated[1].length, canary.length);
+}
+
+// ---------------------------------------------------------------------------
+// Stale binding after detach/reattach (GitLab issue #30, MR !8085). The
+// metadata getters must reject a binding retained across detach/reattach
+// instead of returning the previous attach's shape, counts and names, the
+// same way ovphysx_read_tensor_binding and ovphysx_tensor_binding_get_prim_paths do.
+// ---------------------------------------------------------------------------
+
+TEST_F(ArticulationMetadataTest, MetadataGettersRejectBindingStaleAfterReattach)
+{
+    LoadAndBind("tests/data/links_chain_sample.usda", "/World/articulation",
+                OVPHYSX_TENSOR_ARTICULATION_DOF_POSITION_F32);
+
+    // Baseline: the binding is live pre-detach, so every getter succeeds.
+    ovphysx_articulation_metadata_t meta{};
+    ASSERT_EQ(ovphysx_get_articulation_metadata(m_handle, m_binding, &meta).status,
+              OVPHYSX_API_SUCCESS);
+    ASSERT_GT(meta.dof_count, 0);
+
+    ovphysx_tensor_spec_t spec{};
+    ASSERT_EQ(ovphysx_get_tensor_binding_spec(m_handle, m_binding, &spec).status,
+              OVPHYSX_API_SUCCESS);
+
+    DLDevice device{};
+    ASSERT_EQ(ovphysx_get_tensor_binding_native_device(m_handle, m_binding, &device).status,
+              OVPHYSX_API_SUCCESS);
+
+    std::vector<ovphysx_string_t> dof_names(meta.dof_count);
+    uint32_t out_count = 0;
+    ASSERT_EQ(ovphysx_articulation_get_dof_names(
+                  m_handle, m_binding, dof_names.data(), meta.dof_count, &out_count).status,
+              OVPHYSX_API_SUCCESS);
+
+    std::vector<ovphysx_string_t> body_names(meta.body_count);
+    ASSERT_EQ(ovphysx_articulation_get_body_names(
+                  m_handle, m_binding, body_names.data(), meta.body_count, &out_count).status,
+              OVPHYSX_API_SUCCESS);
+
+    std::vector<ovphysx_string_t> joint_names(meta.joint_count);
+    ASSERT_EQ(ovphysx_articulation_get_joint_names(
+                  m_handle, m_binding, joint_names.data(), meta.joint_count, &out_count).status,
+              OVPHYSX_API_SUCCESS);
+
+    // Detach and reattach the same USD: instance->attachHandle changes while
+    // m_binding stays in the instance's tensor_bindings map (never destroyed).
+    ASSERT_TRUE(destroy_ovstage_test_attachments(m_handle)) << "Failed to detach ovstage";
+    ASSERT_TRUE(attach_usd_with_ovstage(m_handle, "tests/data/links_chain_sample.usda"))
+        << "Failed to reattach ovstage USD";
+
+    // Every metadata getter must now reject the stale binding, matching the
+    // already-guarded data-path entry points below.
+    EXPECT_EQ(ovphysx_get_articulation_metadata(m_handle, m_binding, &meta).status,
+              OVPHYSX_API_NOT_FOUND);
+    EXPECT_EQ(ovphysx_get_tensor_binding_spec(m_handle, m_binding, &spec).status,
+              OVPHYSX_API_NOT_FOUND);
+    EXPECT_EQ(ovphysx_get_tensor_binding_native_device(m_handle, m_binding, &device).status,
+              OVPHYSX_API_NOT_FOUND);
+    EXPECT_EQ(ovphysx_articulation_get_dof_names(
+                  m_handle, m_binding, dof_names.data(), static_cast<uint32_t>(dof_names.size()), &out_count).status,
+              OVPHYSX_API_NOT_FOUND);
+    EXPECT_EQ(ovphysx_articulation_get_body_names(
+                  m_handle, m_binding, body_names.data(), static_cast<uint32_t>(body_names.size()), &out_count).status,
+              OVPHYSX_API_NOT_FOUND);
+    EXPECT_EQ(ovphysx_articulation_get_joint_names(
+                  m_handle, m_binding, joint_names.data(), static_cast<uint32_t>(joint_names.size()), &out_count).status,
+              OVPHYSX_API_NOT_FOUND);
+
+    // The already-guarded siblings reject the same stale handle, so the
+    // getters are consistent with the data-path contract.
+    ovphysx_string_t prim_path{};
+    EXPECT_EQ(ovphysx_tensor_binding_get_prim_paths(m_handle, m_binding, &prim_path, 1, &out_count).status,
+              OVPHYSX_API_NOT_FOUND);
+
+    // Control: a fresh binding created after the reattach still works, so
+    // the guard is attach-specific rather than a global regression.
+    ovphysx_tensor_binding_handle_t fresh_binding = 0;
+    ovphysx_tensor_binding_desc_t desc{};
+    desc.pattern     = make_ovx_string("/World/articulation");
+    desc.tensor_type = OVPHYSX_TENSOR_ARTICULATION_DOF_POSITION_F32;
+    ASSERT_EQ(ovphysx_create_tensor_binding(m_handle, &desc, &fresh_binding).status, OVPHYSX_API_SUCCESS);
+
+    ovphysx_articulation_metadata_t fresh_meta{};
+    EXPECT_EQ(ovphysx_get_articulation_metadata(m_handle, fresh_binding, &fresh_meta).status,
+              OVPHYSX_API_SUCCESS);
+    EXPECT_EQ(fresh_meta.dof_count, meta.dof_count);
+
+    ovphysx_destroy_tensor_binding(m_handle, fresh_binding);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,28 +1,5 @@
-## Redistribution and use in source and binary forms, with or without
-## modification, are permitted provided that the following conditions
-## are met:
-##  * Redistributions of source code must retain the above copyright
-##    notice, this list of conditions and the following disclaimer.
-##  * Redistributions in binary form must reproduce the above copyright
-##    notice, this list of conditions and the following disclaimer in the
-##    documentation and/or other materials provided with the distribution.
-##  * Neither the name of NVIDIA CORPORATION nor the names of its
-##    contributors may be used to endorse or promote products derived
-##    from this software without specific prior written permission.
-##
-## THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-## EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-## IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-## PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-## CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-## EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-## PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-## PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-## OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-## (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-##
-## Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+## SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+## SPDX-License-Identifier: Apache-2.0
 
 #
 # Build PhysXCommon common
@@ -40,7 +17,6 @@ SET(PXCOMMON_PLATFORM_LINK_FLAGS_RELEASE " ")
 
 # Include here after the directories are defined so that the platform specific file can use the variables.
 include(${PHYSX_ROOT_DIR}/${PROJECT_CMAKE_FILES_DIR}/${TARGET_BUILD_PLATFORM}/PhysXCommon.cmake)
-
 
 SET(PHYSX_COMMON_SOURCE
 	${COMMON_SRC_DIR}/CmPtrTable.cpp
@@ -149,6 +125,19 @@ SET(PHYSXCOMMON_COLLISION_HEADERS
 	${PHYSX_ROOT_DIR}/include/collision/PxCollisionDefs.h	
 )
 SOURCE_GROUP(include\\collision FILES ${PHYSXCOMMON_COLLISION_HEADERS})
+
+SET(PHYSXCOMMON_COOKING_HEADERS
+	${PHYSX_ROOT_DIR}/include/cooking/PxBVH33MidphaseDesc.h
+	${PHYSX_ROOT_DIR}/include/cooking/PxBVH34MidphaseDesc.h
+	${PHYSX_ROOT_DIR}/include/cooking/PxConvexMeshDesc.h
+	${PHYSX_ROOT_DIR}/include/cooking/PxCooking.h
+	${PHYSX_ROOT_DIR}/include/cooking/PxMidphaseDesc.h
+	${PHYSX_ROOT_DIR}/include/cooking/PxTriangleMeshDesc.h
+	${PHYSX_ROOT_DIR}/include/cooking/PxTetrahedronMeshDesc.h
+	${PHYSX_ROOT_DIR}/include/cooking/PxBVHDesc.h
+	${PHYSX_ROOT_DIR}/include/cooking/PxSDFDesc.h
+)
+SOURCE_GROUP(include\\cooking FILES ${PHYSXCOMMON_COOKING_HEADERS})
 
 SET(PHYSXCOMMON_GU_HEADERS
 	${GU_SOURCE_DIR}/include/GuBox.h
@@ -596,6 +585,7 @@ SET(PHYSXCOMMON_GU_COOKING_SOURCE
 	${GU_SOURCE_DIR}/src/cooking/GuCookingBigConvexDataBuilder.cpp
 	${GU_SOURCE_DIR}/src/cooking/GuCookingSDF.h
 	${GU_SOURCE_DIR}/src/cooking/GuCookingSDF.cpp
+	${GU_SOURCE_DIR}/src/cooking/GuCooking.cpp
 )
 SOURCE_GROUP(geomutils\\src\\cooking FILES ${PHYSXCOMMON_GU_COOKING_SOURCE})
 
@@ -607,6 +597,7 @@ ADD_LIBRARY(PhysXCommon ${PHYSXCOMMON_LIBTYPE}
 	${PHYSXCOMMON_GEOMETRY_HEADERS}
 	${PHYSXCOMMON_GEOMUTILS_HEADERS}
 	${PHYSXCOMMON_COLLISION_HEADERS}
+	${PHYSXCOMMON_COOKING_HEADERS}
 	
 	${PXCOMMON_PLATFORM_SRC_FILES}
 	
@@ -632,19 +623,25 @@ ADD_LIBRARY(PhysXCommon ${PHYSXCOMMON_LIBTYPE}
 IF(NOT DEFINED PX_ENABLE_INSTALL OR PX_ENABLE_INSTALL)
 	INSTALL(FILES ${PHYSXCOMMON_GEOMETRY_HEADERS} DESTINATION include/geometry)
 	INSTALL(FILES ${PHYSXCOMMON_GEOMUTILS_HEADERS} DESTINATION include/geomutils)
+	INSTALL(FILES ${PHYSXCOMMON_COOKING_HEADERS} DESTINATION include/cooking)
 ENDIF()
 
 TARGET_INCLUDE_DIRECTORIES(PhysXCommon 
 	PRIVATE ${PXCOMMON_PLATFORM_INCLUDES}
 
-	PUBLIC 
+	PUBLIC
 		$<BUILD_INTERFACE:${PHYSX_ROOT_DIR}/include>
 		$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 
+	# The geomutils headers (GuQuerySystem.h, ...) are part of the public
+	# surface and were previously exported through the PhysXCooking target.
+	PUBLIC
+		$<BUILD_INTERFACE:${PHYSX_SOURCE_DIR}/geomutils/include>
+		$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/geomutils>
+
 	PRIVATE ${PHYSX_SOURCE_DIR}/common/include
 	PRIVATE ${PHYSX_SOURCE_DIR}/common/src
-	
-	PRIVATE ${PHYSX_SOURCE_DIR}/geomutils/include
+
 	PRIVATE ${PHYSX_SOURCE_DIR}/geomutils/src
 	PRIVATE ${PHYSX_SOURCE_DIR}/geomutils/src/contact
 	PRIVATE ${PHYSX_SOURCE_DIR}/geomutils/src/common
@@ -726,6 +723,7 @@ IF(PX_GENERATE_SOURCE_DISTRO)
 	LIST(APPEND SOURCE_DISTRO_FILE_LIST ${PHYSXCOMMON_GU_PRUNERS_SOURCE})
 	LIST(APPEND SOURCE_DISTRO_FILE_LIST ${PHYSXCOMMON_GU_COOKING_SOURCE})
 	LIST(APPEND SOURCE_DISTRO_FILE_LIST ${PHYSXCOMMON_COLLISION_HEADERS})
+	LIST(APPEND SOURCE_DISTRO_FILE_LIST ${PHYSXCOMMON_COOKING_HEADERS})	
 ENDIF()
 
 

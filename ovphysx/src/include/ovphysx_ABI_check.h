@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+// @implements REQ-CAPI-OMNIPVD-CAPTURE-001
+// @covers AC-1
 
 #ifndef OVPHYSX_ABI_CHECK_H
 #define OVPHYSX_ABI_CHECK_H
@@ -27,6 +30,33 @@ enum ovphysx_config_entry_field
     OVPHYSX_CE_KEY_TYPE = 0,
     OVPHYSX_CE_KEY = 1,
     OVPHYSX_CE_VALUE = 2
+};
+
+// Field indices for ovphysx_config_value_t
+enum ovphysx_config_value_field
+{
+    OVPHYSX_CV_TYPE = 0,
+    OVPHYSX_CV_VALUE = 1
+};
+
+// Field indices for ovphysx_omnipvd_destination_t
+enum ovphysx_omnipvd_destination_field
+{
+    OVPHYSX_OD_TRANSPORT = 0,
+    OVPHYSX_OD_FILE_PATH = 1,
+    OVPHYSX_OD_TCP_ADDRESS = 2,
+    OVPHYSX_OD_TCP_PORT = 3,
+    OVPHYSX_OD_TCP_TIMEOUT_MS = 4
+};
+
+enum ovphysx_omnipvd_recording_options_field
+{
+    OVPHYSX_ORO_RECORD_SECONDARY_DATA = 0,
+    OVPHYSX_ORO_SCENE_PATHS = 1,
+    OVPHYSX_ORO_SCENE_COUNT = 2,
+    OVPHYSX_ORO_OBJECT_PATHS = 3,
+    OVPHYSX_ORO_OBJECT_COUNT = 4,
+    OVPHYSX_ORO_WAIT_FOR_SELECTION = 5
 };
 
 
@@ -57,42 +87,42 @@ enum dl_tensor_field
     DL_TENSOR_BYTE_OFFSET = 6
 };
 
-// Field indices for ovphysx_contact_event_header_t
-// (must match the field order in python/ovphysx/contact_types.py:ContactEventHeader)
-enum ovphysx_contact_event_header_field
+// Field indices for ovphysx_read_attribute_result_t
+enum ovphysx_read_attribute_result_field
 {
-    OVPHYSX_CEH_TYPE = 0,
-    OVPHYSX_CEH_STAGE_ID = 1,
-    OVPHYSX_CEH_ACTOR0 = 2,
-    OVPHYSX_CEH_ACTOR1 = 3,
-    OVPHYSX_CEH_COLLIDER0 = 4,
-    OVPHYSX_CEH_COLLIDER1 = 5,
-    OVPHYSX_CEH_CONTACT_DATA_OFFSET = 6,
-    OVPHYSX_CEH_NUM_CONTACT_DATA = 7,
-    OVPHYSX_CEH_FRICTION_ANCHORS_DATA_OFFSET = 8,
-    OVPHYSX_CEH_NUM_FRICTION_ANCHORS_DATA = 9,
-    OVPHYSX_CEH_PROTO_INDEX0 = 10,
-    OVPHYSX_CEH_PROTO_INDEX1 = 11
+    OVPHYSX_RA_ATTRIBUTE = 0,
+    OVPHYSX_RA_GROUP_COUNT = 1,
+    OVPHYSX_RA_OMISSION_REASONS = 2
 };
 
-// Field indices for ovphysx_contact_point_t
-enum ovphysx_contact_point_field
+// Field indices for ovphysx_read_result_t
+enum ovphysx_read_result_field
 {
-    OVPHYSX_CP_POSITION = 0,
-    OVPHYSX_CP_NORMAL = 1,
-    OVPHYSX_CP_IMPULSE = 2,
-    OVPHYSX_CP_SEPARATION = 3,
-    OVPHYSX_CP_FACE_INDEX0 = 4,
-    OVPHYSX_CP_FACE_INDEX1 = 5,
-    OVPHYSX_CP_MATERIAL0 = 6,
-    OVPHYSX_CP_MATERIAL1 = 7
+    OVPHYSX_RR_TOTAL_PRIM_COUNT = 0,
+    OVPHYSX_RR_ATTRIBUTE_COUNT = 1,
+    OVPHYSX_RR_ATTRIBUTES = 2
 };
 
-// Field indices for ovphysx_friction_anchor_t
-enum ovphysx_friction_anchor_field
+// Field indices for ovphysx_write_attribute_result_t
+enum ovphysx_write_attribute_result_field
 {
-    OVPHYSX_FA_POSITION = 0,
-    OVPHYSX_FA_IMPULSE = 1
+    OVPHYSX_WA_ATTRIBUTE = 0,
+    OVPHYSX_WA_GROUP_COUNT = 1
+};
+
+// Field indices for ovphysx_write_result_t
+enum ovphysx_write_result_field
+{
+    OVPHYSX_WR_TOTAL_PRIM_COUNT = 0,
+    OVPHYSX_WR_ATTRIBUTE_COUNT = 1,
+    OVPHYSX_WR_ATTRIBUTES = 2
+};
+
+// Field indices for ovphysx_fetched_write_group_t
+enum ovphysx_fetched_write_group_field
+{
+    OVPHYSX_FWG_GROUP = 0,
+    OVPHYSX_FWG_ATTRIBUTE_INDEX = 1
 };
 
 // ABI helpers for struct layout verification from Python (internal)
@@ -103,6 +133,18 @@ OVPHYSX_API size_t ovphysx_internal_create_args_offset(int field);
 OVPHYSX_API size_t ovphysx_internal_config_entry_sizeof();
 OVPHYSX_API size_t ovphysx_internal_config_entry_alignof();
 OVPHYSX_API size_t ovphysx_internal_config_entry_offset(int field);
+
+OVPHYSX_API size_t ovphysx_internal_config_value_sizeof();
+OVPHYSX_API size_t ovphysx_internal_config_value_alignof();
+OVPHYSX_API size_t ovphysx_internal_config_value_offset(int field);
+
+OVPHYSX_API size_t ovphysx_internal_omnipvd_destination_sizeof();
+OVPHYSX_API size_t ovphysx_internal_omnipvd_destination_alignof();
+OVPHYSX_API size_t ovphysx_internal_omnipvd_destination_offset(int field);
+
+OVPHYSX_API size_t ovphysx_internal_omnipvd_recording_options_sizeof();
+OVPHYSX_API size_t ovphysx_internal_omnipvd_recording_options_alignof();
+OVPHYSX_API size_t ovphysx_internal_omnipvd_recording_options_offset(int field);
 
 OVPHYSX_API size_t ovphysx_internal_dl_data_type_sizeof();
 OVPHYSX_API size_t ovphysx_internal_dl_data_type_alignof();
@@ -116,17 +158,25 @@ OVPHYSX_API size_t ovphysx_internal_dl_tensor_sizeof();
 OVPHYSX_API size_t ovphysx_internal_dl_tensor_alignof();
 OVPHYSX_API size_t ovphysx_internal_dl_tensor_offset(int field);
 
-OVPHYSX_API size_t ovphysx_internal_contact_event_header_sizeof();
-OVPHYSX_API size_t ovphysx_internal_contact_event_header_alignof();
-OVPHYSX_API size_t ovphysx_internal_contact_event_header_offset(int field);
+OVPHYSX_API size_t ovphysx_internal_read_attribute_result_sizeof();
+OVPHYSX_API size_t ovphysx_internal_read_attribute_result_alignof();
+OVPHYSX_API size_t ovphysx_internal_read_attribute_result_offset(int field);
 
-OVPHYSX_API size_t ovphysx_internal_contact_point_sizeof();
-OVPHYSX_API size_t ovphysx_internal_contact_point_alignof();
-OVPHYSX_API size_t ovphysx_internal_contact_point_offset(int field);
+OVPHYSX_API size_t ovphysx_internal_read_result_sizeof();
+OVPHYSX_API size_t ovphysx_internal_read_result_alignof();
+OVPHYSX_API size_t ovphysx_internal_read_result_offset(int field);
 
-OVPHYSX_API size_t ovphysx_internal_friction_anchor_sizeof();
-OVPHYSX_API size_t ovphysx_internal_friction_anchor_alignof();
-OVPHYSX_API size_t ovphysx_internal_friction_anchor_offset(int field);
+OVPHYSX_API size_t ovphysx_internal_write_attribute_result_sizeof();
+OVPHYSX_API size_t ovphysx_internal_write_attribute_result_alignof();
+OVPHYSX_API size_t ovphysx_internal_write_attribute_result_offset(int field);
+
+OVPHYSX_API size_t ovphysx_internal_write_result_sizeof();
+OVPHYSX_API size_t ovphysx_internal_write_result_alignof();
+OVPHYSX_API size_t ovphysx_internal_write_result_offset(int field);
+
+OVPHYSX_API size_t ovphysx_internal_fetched_write_group_sizeof();
+OVPHYSX_API size_t ovphysx_internal_fetched_write_group_alignof();
+OVPHYSX_API size_t ovphysx_internal_fetched_write_group_offset(int field);
 
 #ifdef __cplusplus
 }

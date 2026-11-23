@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PxgCommonDefines.h"
 #include "common/PxPhysXCommonConfig.h"
@@ -160,6 +137,16 @@ extern "C" __global__ void writebackBlocksTGS(
 		//Get block header
 		const PxgBlockConstraintBatch& batch = batchHeaders[k];
 
+		//The rigid 1D writeback reconstructs the reported impulse with the bodies' sqrt-inverse-inertia
+		//tensors (see writeBack1DBlockTGS). Loaded warp-cooperatively, like the solve kernels do.
+		PxgSolverTxIData iData0, iData1;
+		if(batch.constraintType == PxgSolverConstraintDesc::eCONSTRAINT_1D)
+		{
+			const PxgSolverTxIData* PX_RESTRICT iData = constraintPrepDesc->solverBodyTxIDataPool;
+			loadTxInertia(FULL_MASK, iData, batch.bodyAIndex[threadIndexInWarp], batch.mDescStride, threadIndexInWarp, iData0);
+			loadTxInertia(FULL_MASK, iData, batch.bodyBIndex[threadIndexInWarp], batch.mDescStride, threadIndexInWarp, iData1);
+		}
+
 		if(threadIndexInWarp < batch.mDescStride)
 		{
 			if(batch.constraintType==PxgSolverConstraintDesc::eCONTACT || batch.constraintType == PxgSolverConstraintDesc::eARTICULATION_CONTACT)
@@ -169,8 +156,7 @@ extern "C" __global__ void writebackBlocksTGS(
 			}
 			else
 			{
-				//Do nothing (for now)
-				writeBack1DBlockTGS(batch, threadIndexInWarp, jointHeaders, jointRowsCon, constraintWriteBack);
+				writeBack1DBlockTGS(batch, threadIndexInWarp, jointHeaders, jointRowsCon, constraintWriteBack, iData0, iData1);
 			}
 		}
 

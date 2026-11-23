@@ -1,26 +1,44 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
-"""Advanced PhysX instance tests: handle property, warmup_gpu CPU behavior,
+"""Advanced PhysX instance tests: handle property, warmup CPU behavior,
 update_articulations_kinematic CPU mode, attach_ovstage / update_from_ovstage error paths,
-detach_ovstage on a non-attached stage, and get_config_string / runtime
-config round-trips.
+detach_ovstage on a non-attached stage, and global config round-trips.
 
 Isolation note: the session-scoped physx_sdk fixture is reused across the
 whole pytest session. The per-test reset() in its teardown clears USD stage
-state, DOF positions, and detach/attach state — but does NOT restore
-process-global config values written via set_config_int32 / set_config_bool.
-Tests that mutate config must cache the original value with get_config_*
-and restore it in a finally block (see test_set_config_int32_then_get_config_int32
-and test_set_config_bool_then_get_config_bool below).
+state, DOF positions, and detach/attach state, but does NOT restore
+process-global config values. Tests that mutate config must cache the original
+value with get_global_config() and restore it in a finally block.
 """
 
 import os
 
 import numpy as np
 import pytest
-from ovphysx.types import ConfigBool, ConfigInt32, ConfigString, TensorType
-from test_utils import load_usd_with_ovstage
+from ovphysx import ConfigKey, GlobalConfigKey, TaskError, get_global_config, set_global_config
+from ovphysx.types import ObjectScope, SimObjectType
+from test_utils import load_usd_with_ovstage, register_physx_schemas_with_ovstage
+
+
+def _to_host(column):
+    """A read column as host NumPy, whether it came back as NumPy (CPU) or a Warp array (GPU)."""
+    return column if isinstance(column, np.ndarray) else column.numpy()
+
+
+def _fill(t, block):
+    """Write `block` into a write column in place (host NumPy or device Warp)."""
+    if isinstance(t, np.ndarray):
+        t.reshape(block.shape)[:] = block
+        return
+    t.assign(np.ascontiguousarray(block).reshape(t.shape))
+
+
+def _read_link_positions(physx):
+    """Every articulation link's position as one host array, in prim order."""
+    with physx.read_sync(SimObjectType.ARTICULATION_LINK, ["position"], scope=ObjectScope.ALL) as result:
+        return np.concatenate([_to_host(g.tensors[0]).reshape(g.prim_count, -1) for g in result.groups])
+
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -42,23 +60,23 @@ def test_handle_property_returns_nonzero_int(physx_sdk):
 
 
 # ---------------------------------------------------------------------------
-# warmup_gpu on CPU mode
+# warmup on CPU mode
 # ---------------------------------------------------------------------------
 
 
-def test_warmup_gpu_on_cpu_mode_is_noop(physx_sdk):
-    """warmup_gpu() on a CPU-mode instance must not raise (it is a no-op)."""
+def test_warmup_on_cpu_mode_runs_and_is_idempotent(physx_sdk):
+    """warmup() on a CPU-mode instance must run (not no-op) and not raise."""
     load_usd_with_ovstage(physx_sdk, data_path("basic_simulation.usda"))
     physx_sdk.wait_all()
-    physx_sdk.warmup_gpu()  # must not raise
+    physx_sdk.warmup()
+    physx_sdk.warmup()  # The second call must not raise either.
 
 
-def test_warmup_gpu_twice_idempotent(physx_sdk):
-    """Calling warmup_gpu() twice must not raise."""
+def test_instance_config_change_after_attach_is_rejected(physx_sdk):
+    """Pre-attach instance config must reject mutation after stage attachment."""
     load_usd_with_ovstage(physx_sdk, data_path("basic_simulation.usda"))
-    physx_sdk.wait_all()
-    physx_sdk.warmup_gpu()
-    physx_sdk.warmup_gpu()
+    with pytest.raises(RuntimeError):
+        physx_sdk.set_config(ConfigKey.ACTIVE_CUDA_GPUS, "")
 
 
 # ---------------------------------------------------------------------------
@@ -79,47 +97,44 @@ def test_update_articulations_kinematic_changes_link_pose(physx_sdk):
     load_usd_with_ovstage(physx_sdk, data_path("two_articulations.usda"))
     physx_sdk.wait_all()
 
-    dof_b = physx_sdk.create_tensor_binding(
-        pattern="/World/articulation*",
-        tensor_type=TensorType.ARTICULATION_DOF_POSITION,
-    )
-    link_b = physx_sdk.create_tensor_binding(
-        pattern="/World/articulation*",
-        tensor_type=TensorType.ARTICULATION_LINK_POSE,
-    )
-    try:
-        if dof_b.count == 0:
+    physx_sdk.warmup()
+    physx_sdk.wait_all()
+
+    with physx_sdk.read_sync(SimObjectType.ARTICULATION_JOINT, ["jointPosition"], scope=ObjectScope.ALL) as r:
+        if not r.groups or sum(g.prim_count for g in r.groups) == 0:
             pytest.skip("No articulations found")
 
-        # Read baseline link poses
-        before = np.zeros(link_b.shape, dtype=np.float32)
-        link_b.read(before)
+    before = _read_link_positions(physx_sdk)
 
-        # Set all DOFs to a non-zero position
-        dof_vals = np.full(dof_b.shape, 0.3, dtype=np.float32)
-        dof_b.write(dof_vals)
+    # Drive every DOF to a clearly non-zero joint position. The session's angular units are
+    # degrees, so 17.19 deg is about 0.3 rad. warmup() is the portable recipe (DirectGPU
+    # refuses a pre-step write; CPU applies it -- REQ-CAPI-WRITE-001 AC-5a).
+    groups_written = 0
+    with physx_sdk.write_sync(SimObjectType.ARTICULATION_JOINT, "jointPosition") as w:
+        for g in w.groups:
+            # ARTICULATION_JOINT is an array group with one tensor per joint. Commit publishes the
+            # whole group, so every tensor has to be filled or that joint is driven with garbage.
+            for t in g.tensors:
+                _fill(t, np.full(tuple(t.shape), 17.19, dtype=np.float32))
+            w.commit_sync(g)
+            groups_written += 1
+    assert groups_written > 0, "write session produced no groups; jointPosition was never driven"
 
-        # Kinematic update — no physics step, just FK
-        physx_sdk.update_articulations_kinematic()
+    # FK only, no full physics step.
+    physx_sdk.update_articulations_kinematic()
 
-        # Read updated link poses
-        after = np.zeros(link_b.shape, dtype=np.float32)
-        link_b.read(after)
+    after = _read_link_positions(physx_sdk)
 
-        # At least one link pose must have changed
-        assert not np.allclose(
-            before, after, atol=1e-6
-        ), "Link poses should change after FK update with non-zero DOF positions"
-    finally:
-        dof_b.destroy()
-        link_b.destroy()
+    assert not np.allclose(
+        before, after, atol=1e-6
+    ), "Link poses should change after FK update with non-zero DOF positions"
 
 
 def test_update_articulations_kinematic_no_articulations(physx_sdk):
     """update_articulations_kinematic() on a scene with no articulations must not raise."""
     load_usd_with_ovstage(physx_sdk, data_path("basic_simulation.usda"))
     physx_sdk.wait_all()
-    physx_sdk.update_articulations_kinematic()  # no articulations — must be a no-op
+    physx_sdk.update_articulations_kinematic()  # no articulations, so this is a no-op
 
 
 # ---------------------------------------------------------------------------
@@ -129,75 +144,74 @@ def test_update_articulations_kinematic_no_articulations(physx_sdk):
 
 def test_detach_ovstage_when_not_attached_is_noop(physx_sdk):
     """detach_ovstage() on an instance that has no attached stage must not raise."""
-    physx_sdk.detach_ovstage()  # must succeed silently
+    physx_sdk.wait_task(physx_sdk.detach_ovstage())
 
 
 def test_attach_ovstage_none_raises(physx_sdk):
-    """attach_ovstage(None) must raise RuntimeError."""
-    with pytest.raises(RuntimeError):
-        physx_sdk.attach_ovstage(None)
+    """High-level attachment requires an owner-aware Stage."""
+    with pytest.raises(TypeError, match="owner-aware ovstage.Stage"):
+        physx_sdk.wait_task(physx_sdk.attach_ovstage(None))
 
 
 def test_attach_ovstage_zero_handle_raises(physx_sdk):
-    """attach_ovstage(0) must raise RuntimeError (null handle)."""
-    with pytest.raises(RuntimeError):
-        physx_sdk.attach_ovstage(0)
+    """Raw pointers belong to the low-level C integration, including null."""
+    with pytest.raises(TypeError, match="owner-aware ovstage.Stage"):
+        physx_sdk.wait_task(physx_sdk.attach_ovstage(0))
 
 
 def test_update_from_ovstage_invalid_range_raises(physx_sdk):
     """update_from_ovstage requires an ordered ordinal range."""
     with pytest.raises(ValueError):
-        physx_sdk.update_from_ovstage(2, 1)
+        physx_sdk.wait_task(physx_sdk.update_from_ovstage(2, 1))
 
 
 def test_update_from_ovstage_without_ovstage_raises(physx_sdk):
-    """update_from_ovstage requires a prior attach_ovstage call."""
-    with pytest.raises(RuntimeError):
-        physx_sdk.update_from_ovstage(1, 1)
+    """update_from_ovstage requires a prior attach_ovstage call; the queued update's task fails."""
+    task = physx_sdk.update_from_ovstage(1, 1)
+    with pytest.raises(TaskError, match="no ovstage is attached"):
+        physx_sdk.wait_task(task)
 
 
 def test_attach_ovstage_and_update_range(physx_sdk):
     """Attach a populated stage, then drain a subsequent ordinal range."""
     ovstage = pytest.importorskip("ovstage")
+    from ovphysx.population import physics_population_descs
     if not ovstage.population.available():
         pytest.skip("ovstage population bridge is unavailable")
 
     try:
+        register_physx_schemas_with_ovstage()
         stage = ovstage.Stage("ovphysx-attach-test")
     except Exception as exc:
         pytest.skip(f"ovstage runtime is unavailable: {exc}")
 
     try:
         ordinal = 1
-        ovstage.population.open_usd(
+        ovstage.population.open_usd_with_desc(
             stage,
             data_path("basic_simulation.usda"),
             ordinal=ordinal,
-            domains=ovstage.PopulationDomain.PHYSICS,
+            time=ovstage.population.DEFAULT_TIME,
+            descs=physics_population_descs(),
         )
-        # Population does not seal: the caller owns ordinal lifecycle, and
-        # attach_ovstage() reads at a sealed ordinal.
         stage.advance_write_floor(ordinal=ordinal).wait()
-        physx_sdk.attach_ovstage(stage, read_ordinal=ordinal)
-        physx_sdk.update_from_ovstage(ordinal + 1, ordinal + 1)
+        physx_sdk.wait_task(physx_sdk.attach_ovstage(stage, read_ordinal=ordinal))
+        stage.advance_write_floor(ordinal=ordinal + 1).wait()
+        physx_sdk.wait_task(physx_sdk.update_from_ovstage(ordinal + 1, ordinal + 1))
     finally:
-        try:
-            physx_sdk.detach_ovstage()
-        except RuntimeError:
-            pass
+        physx_sdk.wait_task(physx_sdk.detach_ovstage())
         stage.destroy()
 
 
 # ---------------------------------------------------------------------------
-# get_config_string returns None when not set
+# Unset string global config returns None
 # ---------------------------------------------------------------------------
 
 
-def test_get_config_string_unset_returns_none(physx_sdk):
-    """get_config_string for OMNIPVD_OVD_RECORDING_DIRECTORY when not configured
-    must return None (not raise)."""
-    result = physx_sdk.get_config_string(ConfigString.OMNIPVD_OVD_RECORDING_DIRECTORY)
-    # May be None or an empty string; must not raise
+def test_get_global_config_string_unset_returns_none(physx_sdk):
+    """An unset PROFILER_OUTPUT_PATH returns None instead of raising."""
+    result = get_global_config(GlobalConfigKey.PROFILER_OUTPUT_PATH)
+    # May be None or an empty string.
     assert result is None or isinstance(result, str)
 
 
@@ -206,35 +220,21 @@ def test_get_config_string_unset_returns_none(physx_sdk):
 # ---------------------------------------------------------------------------
 
 
-def test_set_config_bool_then_get_config_bool(physx_sdk):
-    """set_config_bool then get_config_bool must round-trip.
+def test_set_global_config_bool_round_trip(physx_sdk):
+    """A boolean global config value must round-trip.
 
-    set_config_bool is process-global and persists across the session-scoped
+    Global config persists across the session-scoped
     physx_sdk fixture, so the original value must be cached and restored.
     """
-    original = physx_sdk.get_config_bool(ConfigBool.DISABLE_CONTACT_PROCESSING)
+    key = GlobalConfigKey.DISABLE_CONTACT_PROCESSING
+    original = get_global_config(key)
     try:
-        physx_sdk.set_config_bool(ConfigBool.DISABLE_CONTACT_PROCESSING, True)
-        val = physx_sdk.get_config_bool(ConfigBool.DISABLE_CONTACT_PROCESSING)
+        set_global_config(key, True)
+        val = get_global_config(key)
         assert val is True
 
-        physx_sdk.set_config_bool(ConfigBool.DISABLE_CONTACT_PROCESSING, False)
-        val = physx_sdk.get_config_bool(ConfigBool.DISABLE_CONTACT_PROCESSING)
+        set_global_config(key, False)
+        val = get_global_config(key)
         assert val is False
     finally:
-        physx_sdk.set_config_bool(ConfigBool.DISABLE_CONTACT_PROCESSING, original)
-
-
-def test_set_config_int32_then_get_config_int32(physx_sdk):
-    """set_config_int32 then get_config_int32 must round-trip.
-
-    set_config_int32 is process-global and persists across the session-scoped
-    physx_sdk fixture, so the original value must be cached and restored.
-    """
-    original = physx_sdk.get_config_int32(ConfigInt32.NUM_THREADS)
-    try:
-        physx_sdk.set_config_int32(ConfigInt32.NUM_THREADS, 2)
-        val = physx_sdk.get_config_int32(ConfigInt32.NUM_THREADS)
-        assert val == 2
-    finally:
-        physx_sdk.set_config_int32(ConfigInt32.NUM_THREADS, original)
+        set_global_config(key, original)

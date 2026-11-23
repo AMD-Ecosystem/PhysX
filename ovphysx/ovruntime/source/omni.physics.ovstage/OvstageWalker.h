@@ -1,12 +1,32 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
+// @implements REQ-SIM-LOCALVELOCITY-001
+// @covers AC-8
+
+/**
+ * @implements REQ-SOURCE-IDENTITY-001
+ * @covers AC-1 AC-4
+ */
+
+/**
+ * @implements REQ-PARSE-INSTANCER-DISPATCH-001
+ * @covers AC-1 AC-2
+ */
+
+/**
+ * @implements REQ-PARSE-BACKEND-001
+ * @covers AC-12
+ */
 #pragma once
 
 #include <omni/physics/parse/Allocator.h>
+#include <omni/physics/parse/DescriptorRangeExecutor.h>
+#include <omni/physics/parse/DescriptorBatchAllocator.h>
 #include <omni/physics/parse/Descriptors.h>
 #include <omni/physics/parse/IPhysicsSource.h>
 #include <omni/physics/parse/ParseApi.h>
+#include <omni/physics/parse/ScannedStage.h>
 
 #include <ovstage/ovstage.h>
 #include <ovstage/ovx_path_dictionary.h>
@@ -19,6 +39,8 @@
 namespace omni::physics::ovstage
 {
 using namespace omni::physics::parse;
+
+class OvstageSource;
 
 // ---------------------------------------------------------------------------
 // OvstageWalker (ADR-0002 Milestone 2, slice 1).
@@ -51,24 +73,45 @@ struct OvstageScanFilter
     std::vector<std::string> excludePaths;
     bool prunePointInstancerDescendants = true;
     DescendantScope descendantScope = DescendantScope::eActiveInstanced;
+    std::shared_ptr<DescriptorBatchAllocator> descriptorPool;
+    DescriptorExecutionOptions descriptorExecution;
+    bool outputVelocitiesLocalSpaceDefault = false;
 };
 
 struct OvstageScanResult
 {
+    OvstageScanResult() = default;
+    OvstageScanResult(OvstageScanResult&&) noexcept = default;
+    OvstageScanResult& operator=(OvstageScanResult&& other) noexcept
+    {
+        if (this != &other)
+        {
+            // Default member assignment would replace the pool/source before
+            // destroying the old descriptor lists that still depend on them.
+            this->~OvstageScanResult();
+            new (this) OvstageScanResult(std::move(other));
+        }
+        return *this;
+    }
+
+    // Declared before descriptor/auxiliary owners so the pool is destroyed last.
+    std::shared_ptr<DescriptorBatchAllocator> descriptorPool;
     // The exact source that mints descriptor handles. Declared first so it is
     // destroyed after every descriptor and moved into ScannedStage on attach.
+    // Null when the scan ran through a caller-owned source (`borrowedSource`).
     std::unique_ptr<IPhysicsSource> source;
+    OvstageSource* borrowedSource = nullptr;
     std::vector<DescPtr<PhysxSceneDesc>> scenes;
     std::vector<DescPtr<PhysxMaterialDesc>> materials;
     std::vector<DescPtr<PBDMaterialDesc>> pbdMaterials;
     std::vector<DescPtr<PhysxDeformableMaterialDesc>> deformableMaterials;
     std::vector<DescPtr<PhysxRigidBodyDesc>> bodies;
-    std::vector<DescPtr<PhysxShapeDesc>> shapes;
     // Owned-storage for mesh-shape MergeMeshDesc data (bounding-sphere/cube
     // approximations): the emitted Bounding{Sphere,Box}PhysxShapeDesc point at
     // these via mergedMesh, so they must outlive the shape descriptors. Moved
     // into the ScannedStage (retainOwnedMesh) in OvstageScan.cpp.
     std::vector<DescPtr<MergeMeshDesc>> ownedMeshes;
+    std::vector<DescPtr<PhysxShapeDesc>> shapes;
     std::vector<DescPtr<PhysxJointDesc>> joints;
     std::vector<DescPtr<MimicJointDesc>> mimicJoints;
     std::vector<DescPtr<CollisionGroupDesc>> collisionGroups;
@@ -123,7 +166,9 @@ struct OvstageScanResult
     std::vector<DescPtr<ParticleSetDesc>> particleSets;
     std::vector<DescPtr<ParticleSamplingDesc>> particleSamplers;
     std::vector<ObjectKey> particleSamplerKeys;
+    std::vector<DescPtr<CapsuleCctDesc>> ccts;
     bool hasPointInstancerPrims = false;
+    std::vector<ParticleObjectCandidate> particleObjectCandidates;
 
     // Collision prims that matched but whose geometry type is not handled.
     // Surfaced so callers/tests can see coverage gaps rather than silently
@@ -131,11 +176,25 @@ struct OvstageScanResult
     size_t skippedShapes = 0;
 };
 
+// Transfer completed walker outputs while preserving exception-safe ownership.
+ScannedStage finishOvstageScan(OvstageScanResult&& scan);
+
+// With `attached` (an attach's live source over the same instance) the scan reads through it
+// instead of a fresh OvstageSource: its units, schema / type / hierarchy memos stay warm across
+// drains, and the change feed keeps them exact. `readOrdinal` / `usdStageId` are then the
+// attached source's own. A load-cache window or concept bucket the caller has open is preserved
+// across the scan; otherwise the scan's own are cleared when it returns.
 OvstageScanResult scanOvstage(ovstage_instance_t* instance,
                               ovx_path_dictionary_t* dict,
                               IDescriptorAllocator& allocator,
                               ovstage_ordinal_t readOrdinal = 1,
                               const OvstageScanFilter* filter = nullptr,
-                              uint64_t usdStageId = 0);
+                              uint64_t usdStageId = 0,
+                              OvstageSource* attached = nullptr);
+
+// The physics-input identity's read plan, generated from the population contract
+// (PopulationReads.inl): exact ovstage column names, and prefixes ending in '*'.
+// Capture audits every later read against it.
+const std::vector<std::string>& physicsInputColumns();
 
 } // namespace omni::physics::ovstage

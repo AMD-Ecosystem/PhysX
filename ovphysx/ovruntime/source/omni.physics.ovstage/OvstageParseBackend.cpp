@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+/** @implements REQ-CACHE-ATTACH-001
+ * @covers AC-9
+ */
 
 /**
  * @implements REQ-PARSE-BACKEND-001
- * @covers AC-2
+ * @covers AC-2 AC-6
  */
 
 #include <omni/physics/ovstage/OvstageParseBackend.h>
@@ -25,6 +29,9 @@ namespace
 class OvstageParseBackend final : public parse::IParseBackend
 {
 public:
+    explicit OvstageParseBackend(bool defer) : mDeferInitialBaseline(defer)
+    {
+    }
     std::string_view id() const override
     {
         return "ovstage";
@@ -36,12 +43,12 @@ public:
         if (!target.nativeStage)
             return bundle;
 
-        // nativeStage is a const OvstageAttach* (instance + path dictionary +
-        // raw backing candidate). Backing identity is classified once, before
-        // session mutation, and carried on AttachTarget. Do not query the raw
-        // payload here: an error or nonresident id must not become a local USD
-        // fallback after attach has started.
+        // nativeStage carries the instance and dictionary. An optional explicit
+        // developer backing id is classified by the runtime before source creation;
+        // zero never asks ovstage for its private USD stage.
         const OvstageAttach* attach = static_cast<const OvstageAttach*>(target.nativeStage);
+        if (!attach->instance)
+            return bundle;
 
         ovx_path_dictionary_t* dict = attach->dict ? attach->dict : ovstage_get_path_dictionary(attach->instance);
         const ovstage_ordinal_t readOrdinal =
@@ -51,37 +58,21 @@ public:
         // Change feed (ADR-0003 M3): pull-based, drained over an explicit ordinal
         // range via IPhysxSimulation::updateFromOvStage. Null for an unconfigured
         // source. The write sink stays null (no ovstage write path, by design).
-        bundle.changeFeed = source->createChangeFeed();
+        bundle.changeFeed = source->createChangeFeed(mDeferInitialBaseline);
+        mDeferInitialBaseline = false;
         bundle.source = std::move(source);
         return bundle;
     }
+
+private:
+    bool mDeferInitialBaseline;
 };
 
 } // namespace
 
-std::unique_ptr<parse::IParseBackend> makeOvstageParseBackend()
+std::unique_ptr<parse::IParseBackend> makeOvstageParseBackend(bool deferInitialChangeFeedBaseline)
 {
-    return std::make_unique<OvstageParseBackend>();
-}
-
-ovstage_api_status_t queryBackingUsdStageId(const void* attachPayload, uint64_t& outStageId)
-{
-    outStageId = 0;
-    if (!attachPayload)
-        return OVSTAGE_ERROR_INVALID_ARGUMENT;
-    const OvstageAttach* attach = static_cast<const OvstageAttach*>(attachPayload);
-    if (!attach->instance)
-        return OVSTAGE_ERROR_INVALID_ARGUMENT;
-
-    // Preserve an explicit consumer-supplied candidate. Residency and zero-id
-    // validation belong to the attach-time runtime classifier, not this query.
-    if (attach->usdStageId != 0)
-    {
-        outStageId = attach->usdStageId;
-        return OVSTAGE_OK;
-    }
-
-    return ovstage_get_usd_stage_id(attach->instance, &outStageId);
+    return std::make_unique<OvstageParseBackend>(deferInitialChangeFeedBaseline);
 }
 
 } // namespace ovstage

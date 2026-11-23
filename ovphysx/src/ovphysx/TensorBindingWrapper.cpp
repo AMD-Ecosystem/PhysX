@@ -1,9 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 
 // Implementation of C++ RAII wrapper for ovphysx tensor binding
 // See: ovphysx/experimental/TensorBinding.hpp
+
+/**
+ * @implements REQ-CAPI-BINDING-DEVICE-001
+ * @covers AC-5
+ */
 
 #include "ovphysx/experimental/TensorBinding.hpp"
 #include "carb/logging/Log.h"
@@ -27,7 +32,7 @@ inline bool ensureBinding(ovphysx_tensor_binding_handle_t h, const char* fn) {
 TensorBinding::TensorBinding()
     : m_instanceHandle(0), m_bindingHandle(0) {}
 
-TensorBinding::TensorBinding(ovphysx_handle_t instanceHandle, ovphysx_tensor_binding_handle_t bindingHandle)
+TensorBinding::TensorBinding(ovphysx_instance_handle_t instanceHandle, ovphysx_tensor_binding_handle_t bindingHandle)
     : m_instanceHandle(instanceHandle), m_bindingHandle(bindingHandle) {}
 
 TensorBinding::~TensorBinding() {
@@ -58,6 +63,12 @@ TensorBinding& TensorBinding::operator=(TensorBinding&& other) noexcept {
 ovphysx_api_status_t TensorBinding::spec(ovphysx_tensor_spec_t& out_spec) const {
     if (!ensureBinding(m_bindingHandle, "TensorBinding::spec")) return OVPHYSX_API_ERROR;
     ovphysx_result_t r = ovphysx_get_tensor_binding_spec(m_instanceHandle, m_bindingHandle, &out_spec);
+    return r.status;
+}
+
+ovphysx_api_status_t TensorBinding::nativeDevice(DLDevice& out_device) const {
+    if (!ensureBinding(m_bindingHandle, "TensorBinding::nativeDevice")) return OVPHYSX_API_ERROR;
+    ovphysx_result_t r = ovphysx_get_tensor_binding_native_device(m_instanceHandle, m_bindingHandle, &out_device);
     return r.status;
 }
 

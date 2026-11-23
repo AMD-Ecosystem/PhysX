@@ -1,5 +1,21 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+// @implements REQ-ATTACH-RESOLVE-001
+// @covers AC-4
+
+/**
+ * @implements REQ-PROPS-MAT-001
+ * @covers AC-2
+ */
+
+/**
+ * @implements REQ-SIM-ACTIVEACTOR-001
+ * @covers AC-1 AC-3
+ */
+
+// @implements REQ-LOAD-JOINTLIMIT-001
+// @covers AC-9
 
 #pragma once
 
@@ -7,11 +23,8 @@
 #    define __forceinline __attribute__((always_inline))
 #endif
 
-#include "UsdPCH.h"
-
 #include "Internal.h"
 #include "InternalVehicle.h"
-#include "InternalVoxelMap.h"
 #include "InternalActor.h"
 
 #include <MeshCache.h>
@@ -33,6 +46,8 @@
 #include <common/utilities/Utilities.h>
 
 
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace omni
@@ -40,6 +55,11 @@ namespace omni
 namespace physx
 {
 class PhysXScene;
+
+namespace usdparser
+{
+class AttachedStage;
+}
 
 namespace deformables
 {
@@ -51,7 +71,7 @@ namespace internal
 {
 
 const uint32_t kInvalidUint32_t = 0xFFFFFFFF;
-using CctMap = std::unordered_map<PXR_NS::SdfPath, InternalCct*, PXR_NS::SdfPath::Hash>;
+using CctMap = std::unordered_map<omni::physics::parse::ObjectKey, InternalCct*, omni::physics::parse::ObjectKey::Hash>;
 
 class InternalMimicJoint;
 
@@ -84,6 +104,8 @@ public:
 
     ~InternalShape() = default;
 
+    // Geometry used for initial material resolution, which may be below the collider.
+    omni::physics::parse::ObjectKey mSourceGprim;
     carb::Float3 mScale;
     usdparser::ObjectId mMaterialId;
     PhysXUsdPhysicsInterface::MassInformation mMassInfo;
@@ -143,6 +165,23 @@ public:
     PhysXScene* mPhysxScene;
 };
 
+// Axis instance-name text for PhysxJointStateAPI's multi-apply "state:<axis>:..."
+// properties. Shared so InternalScene.cpp's per-step updateJointState and
+// InternalPhysXDatabase.cpp's initial-state restore agree on one definition.
+const char* jointStateAxisName(usdparser::ObjectType jointType, ::physx::PxArticulationAxis::Enum physxAxis);
+
+// InternalJoint::InternalJointState's usdToken member type. Pinned to std::string: this header
+// is included directly by OvruntimeUnitTests, so the layout must match in every TU.
+using JointUsdTokenHandle = std::string;
+static_assert(sizeof(JointUsdTokenHandle) == sizeof(std::string),
+              "JointUsdTokenHandle must stay ABI-identical to std::string");
+
+// InternalTendonAxis/InternalTendonAttachment's instanceName, pinned to a single type for
+// the same cross-target layout reason as JointUsdTokenHandle above.
+using TendonInstanceNameHandle = std::string;
+static_assert(sizeof(TendonInstanceNameHandle) == sizeof(std::string),
+              "TendonInstanceNameHandle must stay ABI-identical to std::string");
+
 class InternalJoint : public Allocateable
 {
 public:
@@ -177,18 +216,31 @@ public:
 
     struct InternalJointState
     {
-        PXR_NS::TfToken usdToken;
+        // usdToken is only ever written by createArticulationJoint; it stores a plain
+        // axis-name literal ("angular"/"linear"/"rotX"/...). Nothing reads it currently,
+        // but the member must stay declared unconditionally -- see JointUsdTokenHandle's
+        // own comment for the cross-target layout reason.
+        JointUsdTokenHandle usdToken;
         bool enabled = false;
         bool convertToDegrees = false;
         ::physx::PxArticulationAxis::Enum physxAxis = ::physx::PxArticulationAxis::eTWIST;
         InternalJointInitialState initialState;
 
-        PXR_NS::PhysxSchemaJointStateAPI getCachedJointStateAPI(PXR_NS::UsdPrim jointPrim, usdparser::ObjectType jointType);
-
-    private:
-        PXR_NS::PhysxSchemaJointStateAPI cachedJointStateAPI;
+        // Position/Velocity initial-state restore goes through IPhysicsDataWrite::writeData
+        // rather than a cached PhysxSchemaJointStateAPI, so this struct needs no non-trivial
+        // copy/assign/dtor and no per-instance cache member.
     };
     InternalJointState mJointStates[6];
+
+    // The authored low and high bound of each limit pair as last delivered by a live update, NaN
+    // until one is: entry 0 for a revolute or prismatic limit, and for a D6 limit the entry of its
+    // axis in the order transX, transY, transZ, rotX, rotY, rotZ. A live change to one bound is set
+    // together with the other one from here. Reading the other bound back from the source instead
+    // would resolve at the source's latest state, which is not necessarily the state the change
+    // being processed belongs to (REQ-LOAD-JOINTLIMIT-001 AC-9). A clone copies them, and an
+    // articulation joint passes them on through InternalLink::mInboundJointLiveLimits when its
+    // InternalJoint is rebuilt around the same PhysX joint.
+    JointLiveLimitBounds mLiveLimits[6];
 
     void copy(const InternalJoint& cpJoint)
     {
@@ -203,6 +255,7 @@ public:
         {
             mJointStates[i] = cpJoint.mJointStates[i];
             mJointDrives[i] = cpJoint.mJointDrives[i];
+            mLiveLimits[i] = cpJoint.mLiveLimits[i];
         }
     }
 
@@ -222,10 +275,12 @@ public:
     void updateArticulationJointLimitHigh(::physx::PxArticulationJointReducedCoordinate* joint,
                                           ::physx::PxArticulationAxis::Enum axis,
                                           float usdHighLimit) const;
+    // Resolve diagnostic text only in the warning branch.
     void setArticulationDrivePositionTarget(::physx::PxArticulationJointReducedCoordinate* joint,
                                             ::physx::PxArticulationAxis::Enum axis,
                                             float positionTarget,
-                                            const PXR_NS::SdfPath jointKey = PXR_NS::SdfPath()) const;
+                                            const usdparser::AttachedStage* owner = nullptr,
+                                            omni::physics::parse::ObjectKey jointKey = {}) const;
     void setArticulationDriveVelocityTarget(::physx::PxArticulationJointReducedCoordinate* joint,
                                             ::physx::PxArticulationAxis::Enum axis,
                                             float velocityTarget) const;
@@ -241,53 +296,47 @@ public:
                                        ::physx::PxArticulationAxis::Enum axis) const;
 };
 
+// instanceName is unconditionally TendonInstanceNameHandle (std::string) for the same
+// cross-TU layout reason as InternalJointState::usdToken above.
 class InternalTendonAxis : public Allocateable
 {
 public:
-    InternalTendonAxis() : instanceName()
-    {
-    }
-
+    InternalTendonAxis() = default;
     ~InternalTendonAxis() = default;
 
-    PXR_NS::TfToken instanceName;
+    TendonInstanceNameHandle instanceName;
 };
 
 class InternalTendonAttachment : public Allocateable
 {
 public:
     InternalTendonAttachment()
-        : instanceName(),
-          globalPos(0.f),
+        : globalPos(0.f),
           initLength(-FLT_MAX)
     {
     }
 
     ~InternalTendonAttachment() = default;
 
-    PXR_NS::TfToken instanceName;
+    TendonInstanceNameHandle instanceName;
     ::physx::PxVec3 globalPos;
     float initLength;
 };
 
-struct InternalInfiniteVoxelMap : public Allocateable
-{
-    InternalInfiniteVoxelMap(::physx::PxScene* scene,
-                             ::PXR_NS::UsdStageRefPtr stage,
-                             const usdparser::InfiniteVoxelMapDesc& desc)
-        : mInfiniteVoxelMap(scene, stage, desc){};
-
-    virtual ~InternalInfiniteVoxelMap() = default;
-    InfiniteVoxelMap mInfiniteVoxelMap;
-};
+// The Mineways voxel map (InfiniteVoxelMapAPI) is unsupported in the USD-free runtime;
+// there is no internal record type for it.
 
 class InternalScene : public Allocateable
 {
+    usdparser::AttachedStage& mAttachedStage;
+
 public:
-    InternalScene(const usdparser::PhysxSceneDesc& desc, ::physx::PxScene* scene);
+    InternalScene(usdparser::AttachedStage& attachedStage, const usdparser::PhysxSceneDesc& desc, ::physx::PxScene* scene);
     ~InternalScene();
 
     void release();
+
+    usdparser::AttachedStage& getAttachedStage() const { return mAttachedStage; }
 
     const usdparser::PhysxSceneDesc& getSceneDesc() const
     {
@@ -307,6 +356,27 @@ public:
     ::physx::PxScene* getScene() const
     {
         return mScene;
+    }
+
+    void trackReleasedActiveActor(const ::physx::PxActor* actor)
+    {
+        if (actor)
+            mReleasedActiveActors.insert(actor);
+    }
+
+    bool hasReleasedActiveActors() const
+    {
+        return !mReleasedActiveActors.empty();
+    }
+
+    bool isReleasedActiveActor(const ::physx::PxActor* actor) const
+    {
+        return mReleasedActiveActors.find(actor) != mReleasedActiveActors.end();
+    }
+
+    void clearReleasedActiveActors()
+    {
+        mReleasedActiveActors.clear();
     }
 
     uint32_t clampPosIterationCount(uint32_t inCount) const
@@ -361,7 +431,8 @@ public:
         return mVehicleContext;
     }
 
-    usdparser::ObjectId addVehicle(InternalVehicle&, const uint32_t wheelCount, const PXR_NS::UsdPrim&, const bool enabled);
+    usdparser::ObjectId addVehicle(InternalVehicle&, const uint32_t wheelCount,
+                                   omni::physics::parse::ObjectKey vehicleKey, const bool enabled);
     void removeVehicle(InternalVehicle&);
     void setVehicleEnabledState(InternalVehicle&, const bool enabled);
     __forceinline bool isVehicleEnabled(const InternalVehicle& internalVehicle) const
@@ -381,8 +452,23 @@ public:
         }
     }
 
+    // Hands every force attached to `actor` over to `target`. mForces membership has to follow the
+    // body: the entry decides which scene applies the force each step, so a force left behind writes
+    // to an actor another scene now simulates (NVBugs 6583666).
+    void moveForcesForActor(const ::physx::PxRigidActor* actor, InternalScene& target, PhysXScene& targetPhysXScene);
+
     CUstream getDeformableCopyStream();
     void syncDeformableCopyStream(::physx::PxCudaContextManager* cudaContextManager);
+
+    // actors
+    // mActors owns the InternalActor entries of this scene. Membership has to stay in sync with
+    // InternalActor::mPhysXScene: the removal paths locate an actor through mPhysXScene, so an entry
+    // left behind in another scene's list becomes a dangling pointer once the actor is deleted
+    // (NVBugs 6504495).
+    void addActor(InternalActor& actor);
+
+    // Removes the actor from mActors. Returns false if it was not registered with this scene.
+    bool removeActor(const InternalActor& actor);
 
     // mimic joints
     void addMimicJoint(InternalMimicJoint&);
@@ -396,7 +482,11 @@ private:
     void setVehicleAtPosition(const uint32_t index, InternalVehicle&);
     void moveVehicleToBack(const uint32_t sourceIndex);
     void moveVehicleToPosition(const uint32_t sourceIndex, const uint32_t targetIndex);
-    void updateJointState(PXR_NS::UsdStageWeakPtr stage, const InternalDatabase::Record& record, bool updateVelocitiesToUsd);
+    // Publishes InternalJointState's per-axis PhysxJointStateAPI Position/Velocity values
+    // through IPhysicsDataWrite::writeData (attribute names built as literal
+    // "state:<axis>:physics:position"/"...:velocity" strings, matching the schema's
+    // propertyNamespacePrefix). A no-op when there is no write sink.
+    void updateJointState(usdparser::AttachedStage* attachedStage, const InternalDatabase::Record& record, bool updateVelocitiesToUsd);
     void addMimicJointMapEntries(InternalMimicJoint&);
     void removeMimicJointMapEntries(InternalMimicJoint&);
     void removeMimicJointMapEntry(const ::physx::PxArticulationJointReducedCoordinate*, InternalMimicJoint*);
@@ -427,6 +517,12 @@ public:
 
     uint32_t mEnabledVehicleCount;
 
+    // Bumped whenever what is enumerable from mVehicles changes: membership, order, or any vehicle's
+    // set of live wheel attachments. None of those touches the object database, so the object-lifetime
+    // epoch that validates every other such cache does not move for them, and a consumer caching rows
+    // derived from this array has no other way to learn its rows were retired.
+    uint64_t mVehicleSetEpoch;
+
     ::physx::PxVec3 mGravityDirection;
     float mGravityMagnitude;
 
@@ -437,6 +533,7 @@ public:
 private:
     InternalVehicleContext mVehicleContext;
     ::physx::PxScene* mScene;
+    std::unordered_set<const ::physx::PxActor*> mReleasedActiveActors;
 
     typedef std::unordered_set<InternalMimicJoint*> MimicJointSet;
     MimicJointSet mMimicJointSet;
@@ -448,6 +545,17 @@ private:
     bool mDeformableCopyStreamDirty;
 };
 
+// Retargets every InternalForce back pointer naming actor0 to actor1 (null to drop it), across all
+// scenes.
+//
+// moveForcesForActor above keeps mForces membership with the body, so the owning scene is the
+// expected place to find a force. This sweep is the defensive counterpart: it does not depend on
+// that invariant holding, and it covers the release paths that have no InternalActor handle to
+// resolve a scene from - changeRigidActorType() releases sourceActor whether or not it is still in
+// a scene. Membership originally did not follow a simulation owner change at all, which is how a
+// force ended up registered with a different scene than InternalActor::mPhysXScene named; the
+// scene-scoped fixup then missed it and left mRigidActor naming a released actor (NVBugs 6583666).
+void swapForceActorsAllScenes(const usdparser::AttachedStage& attachedStage, ::physx::PxRigidActor* actor0, ::physx::PxRigidActor* actor1);
 
 } // namespace internal
 } // namespace physx

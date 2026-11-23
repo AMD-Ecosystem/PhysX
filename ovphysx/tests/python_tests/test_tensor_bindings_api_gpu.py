@@ -1,16 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
+
+# @implements REQ-PYTHON-BINDING-DEVICE-001
+# @covers AC-1 AC-2 AC-3 AC-4
+# @maps_to TEST-PYTHON-BINDING-DEVICE-001
+# @implements REQ-TENSOR-CONTACT-002
+# @covers AC-2 AC-3
+# @maps_to TEST-TENSOR-CONTACT-002
+# @implements REQ-CAPI-CONTACT-003
+# @covers AC-1 AC-3
+# @maps_to TEST-CAPI-CONTACT-003
+# @implements REQ-CAPI-TIMESTEP-002
+# @covers AC-2
+# @maps_to TEST-CAPI-TIMESTEP-002
+# DEPRECATED (tensor-binding-deprecation): a deprecated tensor-binding test. Removed with the binding.
 
 """GPU-mode tests for TensorBindingsAPI features.
 
-Covers DOF properties, body properties, shape properties, dynamics tensors,
-link wrench, fixed tendons, and spatial tendons in GPU mode with actual
-simulation stepping where needed.
+Covers DOF properties, body properties, shape properties, inverse dynamics tensors,
+contact force components, link wrench, fixed tendons, and spatial tendons in GPU
+mode with actual simulation stepping where needed.
 
-GPU-state tensors (dynamics, wrench, tendons) require kDLCUDA buffers.
-We use a minimal CudaArray helper that allocates device memory via the
-CUDA driver API (cuMemAlloc/cuMemFree) and exposes a __dlpack__-compatible
-DLTensor. No torch/cupy dependency.
+GPU-state tensors (inverse dynamics, wrench, tendons) require kDLCUDA buffers.
+A minimal CudaArray helper allocates device memory via the CUDA driver API
+(cuMemAlloc/cuMemFree) and exposes a __dlpack__-compatible DLTensor. No
+torch/cupy dependency.
 
 CPU-property tensors (DOF stiffness/damping/limits, body mass/COM/inertia,
 shape material/contact/rest offsets) accept numpy even in GPU mode.
@@ -20,14 +34,15 @@ import ctypes
 import math
 import subprocess
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
 import pytest
 from ovphysx.dlpack import DLDataType, DLDataTypeCode, DLDevice, DLDeviceType, DLTensor
-from ovphysx.types import TensorType
+from ovphysx.types import LogLevel, TensorType
 from test_utils import NP_TO_DL_DTYPE, CudaArray, data_path, get_cuda_driver
-from test_utils import load_usd_with_ovstage
+from test_utils import contact_test_case, load_usd_with_ovstage
 
 
 def _require_cuda_driver():
@@ -86,16 +101,42 @@ DT = 1.0 / 60.0
 def _load_and_step(sdk, scene="two_articulations.usda", n_steps=5):
     load_usd_with_ovstage(sdk, data_path(scene))
     sdk.wait_all()
-    sdk.warmup_gpu()
+    sdk.warmup()
     for _ in range(n_steps):
         sdk.step(DT)
     sdk.wait_all()
 
 
-def _make_cube_pair_contact_binding(sdk):
+def _link_vx_after_wrench(sdk, indices, reverse_paths=False):
+    """Read padded link x velocities after distinct per-articulation pushes on a fresh scene."""
+    load_usd_with_ovstage(sdk, data_path("mixed_link_count_articulations.usda"))
+    sdk.wait_all()
+    sdk.warmup()
+    paths = ["/World/articulation_short", "/World/articulation_long"]
+    if reverse_paths:
+        paths.reverse()
+    wrench = sdk.create_tensor_binding(prim_paths=paths, tensor_type=TensorType.ARTICULATION_LINK_WRENCH)
+    velocity = sdk.create_tensor_binding(prim_paths=paths, tensor_type=TensorType.ARTICULATION_LINK_VELOCITY)
+    host = np.zeros(wrench.shape, dtype=np.float32)
+    host[0, :, 0] = 100.0
+    host[1, :, 0] = 200.0  # distinct forces expose swapped rows in reordered writes
+    host[..., 8] = 5.0  # applied at (0, 0, 5), on the line through all link centers
+    if indices is None:
+        _gpu_write(wrench, host)
+    else:
+        _gpu_write_with_indices(wrench, host, indices)
+    sdk.step(DT)
+    sdk.wait_all()
+    result = _gpu_read(velocity)
+    wrench.destroy()
+    velocity.destroy()
+    return result[..., 0]
+
+
+def _make_cube_pair_contact_binding(sdk, max_contact_data_count=256):
     load_usd_with_ovstage(sdk, data_path("boxes_falling_on_groundplane.usda"))
     sdk.wait_all()
-    sdk.warmup_gpu()
+    sdk.warmup()
 
     cube1_pose = sdk.create_tensor_binding(pattern="/World/Cube1", tensor_type=TensorType.RIGID_BODY_POSE)
     cube2_pose = sdk.create_tensor_binding(pattern="/World/Cube2", tensor_type=TensorType.RIGID_BODY_POSE)
@@ -115,7 +156,7 @@ def _make_cube_pair_contact_binding(sdk):
         sensor_patterns=["/World/Cube1"],
         filter_patterns=["/World/Cube2"],
         filters_per_sensor=1,
-        max_contact_data_count=256,
+        max_contact_data_count=max_contact_data_count,
     )
 
     sdk.step(DT)
@@ -127,12 +168,12 @@ def _make_usd_with_authored_dof_max_velocity(tmp_path, max_velocity_rad=5.0):
     src = Path(data_path("two_articulations.usda"))
     text = src.read_text()
     text = text.replace(
-        'apiSchemas = ["PhysicsDriveAPI:angular"]', 'apiSchemas = ["PhysicsDriveAPI:angular", "PhysxJointAPI"]'
+        'apiSchemas = ["PhysicsDriveAPI:angular"]', 'apiSchemas = ["PhysicsDriveAPI:angular", "PhysxJointAxisAPI:angular"]'
     )
     max_velocity_deg = max_velocity_rad * 180.0 / math.pi
     text = text.replace(
         'uniform token physics:axis = "Y"',
-        f"float physxJoint:maxJointVelocity = {max_velocity_deg:.9f}\n" '            uniform token physics:axis = "Y"',
+        f"float physxJointAxis:angular:maxJointVelocity = {max_velocity_deg:.9f}\n" '            uniform token physics:axis = "Y"',
     )
     dst = tmp_path / "two_articulations_authored_max_velocity.usda"
     dst.write_text(text)
@@ -153,27 +194,33 @@ def _cpu_read(binding) -> np.ndarray:
 
 class TestArticulationKinematicUpdateGpu:
 
-    def test_first_fk_update_auto_warmups_gpu(self, physx_sdk):
-        """First GPU FK refresh should initialize DirectGPU buffers itself."""
-        from ovphysx._bindings import _lib, ovphysx_log_fn
+    def test_fk_update_before_the_first_step_is_refused_gpu(self, physx_sdk, native_log_callback_factory):
+        """A DirectGPU FK refresh never warms the scene up: before a first step it is refused without
+        reaching PhysX, and after an explicit warmup it runs cleanly (ADR-0052)."""
+        from ovphysx._bindings import _lib
 
         load_usd_with_ovstage(physx_sdk, data_path("two_articulations.usda"))
         physx_sdk.wait_all()
 
         records = []
 
-        @ovphysx_log_fn
-        def collector(level, message, user_data):
-            text = message.decode("utf-8", errors="replace") if message else ""
+        @native_log_callback_factory
+        def collector(level, message, channel, timestamp, user_data):
+            text = ctypes.string_at(message.ptr, message.length).decode("utf-8", errors="replace")
             records.append((level, text))
 
-        result = _lib.ovphysx_register_log_callback(collector, None)
+        result = _lib.ovphysx_set_log_callback(
+            LogLevel.VERBOSE, None, ctypes.cast(collector, ctypes.c_void_p), None
+        )
         assert result.status == 0, "Failed to register native log callback"
 
         try:
+            with pytest.raises(RuntimeError, match="simulation step"):
+                physx_sdk.update_articulations_kinematic()
+            physx_sdk.warmup()
             physx_sdk.update_articulations_kinematic()
         finally:
-            _lib.ovphysx_unregister_log_callback(collector, None)
+            _lib.ovphysx_set_log_callback(LogLevel.DEFAULT, None, None, None)
 
         direct_gpu_errors = [
             text
@@ -214,6 +261,39 @@ class TestArticulationKinematicUpdateGpu:
 
 class TestRigidBodyStateGpu:
 
+    def test_native_device_reports_cuda_state(self, physx_sdk):
+        load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
+        physx_sdk.wait_all()
+
+        state = physx_sdk.create_tensor_binding(
+            pattern="/World/Cube1", tensor_type=TensorType.RIGID_BODY_POSE
+        )
+        assert state.native_device.device_type.value == DLDeviceType.kDLCUDA
+        assert state.native_device.device_id == 0
+        state.destroy()
+
+    @pytest.mark.parametrize(
+        ("scene", "pattern", "tensor_type"),
+        [
+            ("boxes_falling_on_groundplane.usda", "/World/Cube1", TensorType.RIGID_BODY_CONTACT_OFFSET),
+            ("boxes_falling_on_groundplane.usda", "/World/Cube1", TensorType.RIGID_BODY_REST_OFFSET),
+            ("boxes_falling_on_groundplane.usda", "/World/Cube1", TensorType.RIGID_BODY_DISABLE_GRAVITY),
+            ("two_articulations.usda", ARTI_PATTERN, TensorType.ARTICULATION_CONTACT_OFFSET),
+            ("two_articulations.usda", ARTI_PATTERN, TensorType.ARTICULATION_REST_OFFSET),
+            ("two_articulations.usda", ARTI_PATTERN, TensorType.ARTICULATION_DOF_DRIVE_MODEL),
+            ("two_articulations.usda", ARTI_PATTERN, TensorType.ARTICULATION_DOF_DRIVE_TYPE),
+            ("two_articulations.usda", ARTI_PATTERN, TensorType.ARTICULATION_BODY_DISABLE_GRAVITY),
+        ],
+    )
+    def test_reported_cpu_only_types_are_native_cpu(self, physx_sdk, scene, pattern, tensor_type):
+        load_usd_with_ovstage(physx_sdk, data_path(scene))
+        physx_sdk.wait_all()
+
+        binding = physx_sdk.create_tensor_binding(pattern=pattern, tensor_type=tensor_type)
+        assert binding.native_device.device_type.value == DLDeviceType.kDLCPU
+        assert binding.native_device.device_id == 0
+        binding.destroy()
+
     def test_acceleration_readable_on_gpu(self, physx_sdk):
         _load_and_step(physx_sdk, scene="boxes_falling_on_groundplane.usda")
         b = physx_sdk.create_tensor_binding(pattern="/World/Cube*", tensor_type=TensorType.RIGID_BODY_ACCELERATION)
@@ -224,7 +304,7 @@ class TestRigidBodyStateGpu:
 
 
 # ---------------------------------------------------------------------------
-# Shape properties (100-112) -- CPU-property tensors
+# Shape properties (100-112): CPU-property tensors
 # ---------------------------------------------------------------------------
 
 
@@ -288,23 +368,173 @@ class TestShapePropertiesGpu:
         b.destroy()
 
     def test_shape_property_cross_device_read_to_cuda_buffer(self, physx_sdk):
-        # Shape-property tensors are CPU-only on the runtime side. Reading into
-        # a CUDA dst uses cross-device staging (CPU staging buffer + memcpyHtoD).
+        # OMPE-103213: shape-property tensors are CPU-only, so reading into a
+        # CUDA dst must be refused (no silent HtoD staging).
         _load_and_step(physx_sdk, scene="simple_physics_scene.usda")
         b = physx_sdk.create_tensor_binding(
             pattern="/World/Cube*", tensor_type=TensorType.RIGID_BODY_SHAPE_FRICTION_AND_RESTITUTION
         )
-        ga = _gpu_tensor(b.shape)
-        b.read(ga.dltensor)
-        b.destroy()
+        try:
+            ga = _gpu_tensor(b.shape)
+            with pytest.raises(RuntimeError, match="(?i)device mismatch|CPU-only|host"):
+                b.read(ga.dltensor)
+        finally:
+            b.destroy()
 
 
 # ---------------------------------------------------------------------------
-# Contact bindings -- GPU-state detailed contact/friction buffers
+# Contact bindings: force components and detailed contact/friction buffers
 # ---------------------------------------------------------------------------
 
 
 class TestContactBindingGpu:
+
+    @staticmethod
+    def _read_component(binding, reader, is_matrix=False):
+        shape = ((binding.sensor_count, binding.filter_count, 3) if is_matrix
+                 else (binding.sensor_count, 3))
+        output = _gpu_tensor(shape)
+        getattr(binding, reader)(output.dltensor)
+        return output.numpy()
+
+    def test_force_components(self, physx_sdk):
+        """Friction includes unfiltered contacts and is independent of detailed capacity."""
+        # boxes_falling_on_groundplane_forces_once_per_step.usda is boxes_falling_on_groundplane.usda
+        # with external forces applied once per step, which this test expects.
+        load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane_forces_once_per_step.usda"))
+        physx_sdk.wait_all()
+        physx_sdk.warmup()
+        with ExitStack() as stack:
+            unfiltered = stack.enter_context(physx_sdk.create_contact_binding(
+                sensor_patterns=["/World/Cube1"], max_contact_data_count=0,
+            ))
+            bindings = []
+            for capacity in (0, 1, 64):
+                with contact_test_case(capacity=capacity):
+                    excluded = stack.enter_context(physx_sdk.create_contact_binding(
+                        sensor_patterns=["/World/Cube1"],
+                        filter_patterns=["/World/GroundPlane/CollisionPlane"],
+                        filters_per_sensor=1, max_contact_data_count=capacity,
+                    ))
+                    support = stack.enter_context(physx_sdk.create_contact_binding(
+                        sensor_patterns=["/World/Cube1"], filter_patterns=["/World/BigBase"],
+                        filters_per_sensor=1, max_contact_data_count=capacity,
+                    ))
+                    bindings.append((capacity, excluded, support))
+
+            # All capacities observe the same simulation step after one settling run.
+            for _ in range(120):
+                physx_sdk.step(DT)
+            physx_sdk.wait_all()
+            with physx_sdk.create_tensor_binding(
+                pattern="/World/Cube1", tensor_type=TensorType.RIGID_BODY_VELOCITY,
+            ) as velocity:
+                values = np.zeros(velocity.shape, dtype=np.float32)
+                values[0, 0] = 0.5
+                _gpu_write(velocity, values)
+                physx_sdk.wait_all()
+                physx_sdk.step_sync(DT)
+
+            normal = self._read_component(unfiltered, "read_net_normal_forces")
+            friction = self._read_component(unfiltered, "read_net_friction_forces")
+            assert normal[0, 2] > 0.0
+            assert friction[0, 0] < -0.1
+            np.testing.assert_allclose(normal[:, 0], 0.0, atol=1e-3)
+            np.testing.assert_allclose(friction[:, 2], 0.0, atol=1e-3)
+
+            for capacity, excluded, support in bindings:
+                for component, net in (("normal", normal), ("friction", friction)):
+                    with contact_test_case(capacity=capacity, component=component):
+                        net_reader = f"read_net_{component}_forces"
+                        matrix_reader = f"read_{component}_force_matrix"
+                        np.testing.assert_allclose(self._read_component(excluded, net_reader), net, rtol=1e-5, atol=1e-4)
+                        np.testing.assert_allclose(self._read_component(support, net_reader), net, rtol=1e-5, atol=1e-4)
+                        matrix = self._read_component(support, matrix_reader, is_matrix=True)
+                        np.testing.assert_allclose(matrix[:, 0], net, rtol=1e-5, atol=1e-4)
+                        np.testing.assert_array_equal(self._read_component(excluded, matrix_reader, is_matrix=True), 0.0)
+
+    @pytest.mark.parametrize("zero_step", ["sync", "async"])
+    def test_contact_reads_unchanged_across_zero_dt_step(self, physx_sdk, zero_step):
+        """A zero-dt step simulates nothing, so it must not change a GPU contact read.
+
+        GPU arm of the NVBug 6904332 regression (the CPU arm is in
+        cpu_tests/test_tensor_bindings_api.py): both step paths used to overwrite the
+        cached impulse-to-force divisor with 1.0 on a zero-dt step, which left the
+        preceding step's impulses divided by 1.0 instead of that step's dt.
+        """
+        load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
+        physx_sdk.wait_all()
+        physx_sdk.warmup()
+        settle_dt = 1.0 / 240.0  # far from the 1.0 the defect substituted
+        with physx_sdk.create_contact_binding(
+            sensor_patterns=["/World/Cube1"], filter_patterns=["/World/BigBase"],
+            filters_per_sensor=1,
+        ) as binding:
+            for _ in range(720):
+                physx_sdk.step_sync(settle_dt)
+
+            def read_both():
+                return (self._read_component(binding, "read_net_normal_forces"),
+                        self._read_component(binding, "read_normal_force_matrix", is_matrix=True))
+
+            before_net, before_matrix = read_both()
+            # Guard: an all-zero baseline would make every comparison below vacuous.
+            assert before_net[0, 2] > 1.0, f"Cube1 should rest on BigBase: {before_net}"
+
+            if zero_step == "sync":
+                physx_sdk.step_sync(0.0)
+            else:
+                physx_sdk.step(0.0)
+                physx_sdk.wait_all()
+
+            after_net, after_matrix = read_both()
+            np.testing.assert_allclose(after_net, before_net, rtol=1e-5, atol=1e-4)
+            np.testing.assert_allclose(after_matrix, before_matrix, rtol=1e-5, atol=1e-4)
+
+            # Anchor to a step that really simulated: "unchanged" alone would also hold
+            # if both reads had moved to the same wrong value.
+            physx_sdk.step_sync(settle_dt)
+            resumed_net, resumed_matrix = read_both()
+            np.testing.assert_allclose(after_net, resumed_net, rtol=0.05, atol=1.0)
+            np.testing.assert_allclose(after_matrix, resumed_matrix, rtol=0.05, atol=1.0)
+
+    def test_component_validation(self, physx_sdk):
+        """CUDA bindings reject host output, invalid CUDA tensors, and use after destruction."""
+        load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
+        physx_sdk.wait_all()
+        physx_sdk.warmup()
+        readers = (
+            ("read_net_normal_forces", False), ("read_net_friction_forces", False),
+            ("read_normal_force_matrix", True), ("read_friction_force_matrix", True),
+        )
+        outputs = []
+        with physx_sdk.create_contact_binding(
+            sensor_patterns=["/World/Cube1"], filter_patterns=["/World/BigBase"],
+            filters_per_sensor=1,
+        ) as binding:
+            physx_sdk.step_sync(DT)
+            for reader, is_matrix in readers:
+                with contact_test_case(reader=reader):
+                    shape = (1, 1, 3) if is_matrix else (1, 3)
+                    method = getattr(binding, reader)
+                    output = _gpu_tensor(shape)
+                    method(output.dltensor)
+
+                    # This also ensures the binding uses the GPU tensor backend.
+                    with pytest.raises(RuntimeError, match="device mismatch"):
+                        method(np.zeros(shape, dtype=np.float32))
+                    wrong_dtype = CudaArray(shape, dtype=np.int32)
+                    with pytest.raises(RuntimeError, match="float32"):
+                        method(wrong_dtype.dltensor)
+                    wrong_shape = _gpu_tensor(shape[:-1] + (2,))
+                    with pytest.raises(RuntimeError, match="expected dst shape"):
+                        method(wrong_shape.dltensor)
+                    method(output.dltensor)
+                    outputs.append((reader, method, output))
+
+        for reader, method, output in outputs:
+            with contact_test_case(reader=reader), pytest.raises(RuntimeError, match="destroyed"):
+                method(output.dltensor)
 
     def test_cuda_output_without_directgpu_mentions_opt_in(self):
         _require_cuda_driver()
@@ -331,7 +561,7 @@ assert cb.sensor_count > 0, "Expected ContactBinding to resolve at least one sen
 dst = CudaArray((cb.sensor_count, 3), dtype=np.float32)
 
 try:
-    cb.read_net_forces(dst.dltensor)
+    cb.read_net_normal_forces(dst.dltensor)
 except RuntimeError as exc:
     msg = str(exc)
     assert "DirectGPU" in msg, msg
@@ -358,7 +588,7 @@ else:
         counts = CudaArray((cb.sensor_count, cb.filter_count), dtype=np.int32)
         starts = CudaArray((cb.sensor_count, cb.filter_count), dtype=np.int32)
 
-        cb.read_contact_data(
+        cb.read_normal_contact_data(
             contact_forces.dltensor,
             positions.dltensor,
             normals.dltensor,
@@ -397,7 +627,7 @@ else:
         counts = CudaArray((cb.sensor_count, cb.filter_count), dtype=np.int32)
         starts = CudaArray((cb.sensor_count, cb.filter_count), dtype=np.int32)
 
-        cb.read_friction_data(friction_forces.dltensor, friction_points.dltensor, counts.dltensor, starts.dltensor)
+        cb.read_friction_contact_data(friction_forces.dltensor, friction_points.dltensor, counts.dltensor, starts.dltensor)
 
         friction_forces_np = friction_forces.numpy()
         friction_points_np = friction_points.numpy()
@@ -415,9 +645,43 @@ else:
         assert pair_start + pair_count <= c
         cb.destroy()
 
+    def test_read_friction_contact_data_overflow_does_not_write_past_capacity_on_gpu(self, physx_sdk):
+        cb = _make_cube_pair_contact_binding(physx_sdk, max_contact_data_count=1)
+
+        guard = np.float32(1234.5)
+        friction_forces = CudaArray((2, 3), dtype=np.float32)
+        friction_points = CudaArray((2, 3), dtype=np.float32)
+        friction_forces.upload(np.full((2, 3), guard, dtype=np.float32))
+        friction_points.upload(np.full((2, 3), guard, dtype=np.float32))
+        # Present capacity-1 tensors; the extra row is a canary for an OOB kernel write.
+        friction_forces._shape_arr[0] = 1
+        friction_points._shape_arr[0] = 1
+
+        counts = CudaArray((cb.sensor_count, cb.filter_count), dtype=np.int32)
+        starts = CudaArray((cb.sensor_count, cb.filter_count), dtype=np.int32)
+
+        required = cb.read_friction_contact_data(
+            friction_forces.dltensor, friction_points.dltensor, counts.dltensor, starts.dltensor
+        )
+
+        counts_np = counts.numpy()
+        starts_np = starts.numpy()
+        friction_forces_np = friction_forces.numpy()
+        friction_points_np = friction_points.numpy()
+
+        assert required > cb.max_contact_data_count
+        assert np.all(counts_np >= 0)
+        assert np.all(starts_np >= 0)
+        assert int(counts_np.sum()) == cb.max_contact_data_count
+        assert np.all(starts_np + counts_np <= cb.max_contact_data_count)
+        assert np.all(friction_forces_np[1] == guard)
+        assert np.all(friction_points_np[1] == guard)
+
+        cb.destroy()
+
 
 # ---------------------------------------------------------------------------
-# DOF properties (35-41) -- CPU-property tensors, numpy works in GPU mode
+# DOF properties (35-41): CPU-property tensors, numpy works in GPU mode
 # ---------------------------------------------------------------------------
 
 
@@ -468,7 +732,7 @@ class TestDofPropertiesGpu:
         usd_path = _make_usd_with_authored_dof_max_velocity(tmp_path, max_velocity_rad=5.0)
         load_usd_with_ovstage(physx_sdk, str(usd_path))
         physx_sdk.wait_all()
-        physx_sdk.warmup_gpu()
+        physx_sdk.warmup()
         physx_sdk.wait_all()
 
         b = physx_sdk.create_tensor_binding(pattern=ARTI_PATTERN, tensor_type=TensorType.ARTICULATION_DOF_MAX_VELOCITY)
@@ -522,7 +786,7 @@ class TestDofPropertiesGpu:
 
 
 # ---------------------------------------------------------------------------
-# Body properties (60-62) -- CPU-property tensors
+# Body properties (60-62): CPU-property tensors
 # ---------------------------------------------------------------------------
 
 
@@ -578,7 +842,7 @@ class TestBodyPropertiesGpu:
 
 
 # ---------------------------------------------------------------------------
-# Body inverse mass/inertia (63-64) -- CPU-property, read-only
+# Body inverse mass/inertia (63-64): CPU-property, read-only
 # ---------------------------------------------------------------------------
 
 
@@ -621,11 +885,11 @@ class TestBodyInverseGpu:
 
 
 # ---------------------------------------------------------------------------
-# Dynamics tensors (70-75) -- GPU-state, read-only, requires CUDA buffers
+# Inverse dynamics tensors (70-75): GPU-state, read-only, requires CUDA buffers
 # ---------------------------------------------------------------------------
 
 
-class TestDynamicsTensorsGpu:
+class TestInverseDynamicsTensorsGpu:
 
     def test_jacobian_readable(self, physx_sdk):
         _load_and_step(physx_sdk)
@@ -684,7 +948,7 @@ class TestDynamicsTensorsGpu:
         assert np.all(np.isfinite(buf))
         b.destroy()
 
-    _DYNAMICS_TYPES = [
+    _INVERSE_DYNAMICS_TYPES = [
         TensorType.ARTICULATION_JACOBIAN,
         TensorType.ARTICULATION_MASS_MATRIX,
         TensorType.ARTICULATION_CORIOLIS_AND_CENTRIFUGAL_FORCE,
@@ -695,10 +959,10 @@ class TestDynamicsTensorsGpu:
 
     @pytest.mark.parametrize(
         "tensor_type",
-        _DYNAMICS_TYPES,
+        _INVERSE_DYNAMICS_TYPES,
         ids=["jacobian", "mass_matrix", "coriolis", "gravity", "link_incoming_joint_force", "projected_joint_force"],
     )
-    def test_dynamics_write_rejected(self, physx_sdk, tensor_type):
+    def test_inverse_dynamics_write_rejected(self, physx_sdk, tensor_type):
         _load_and_step(physx_sdk)
         b = physx_sdk.create_tensor_binding(pattern=ARTI_PATTERN, tensor_type=tensor_type)
         ga = _gpu_tensor(b.shape)
@@ -708,7 +972,7 @@ class TestDynamicsTensorsGpu:
 
 
 # ---------------------------------------------------------------------------
-# Link wrench (52) -- GPU write-only + effect on simulation
+# Link wrench (52): GPU write-only + effect on simulation
 # ---------------------------------------------------------------------------
 
 
@@ -758,9 +1022,28 @@ class TestLinkWrenchGpu:
         _gpu_write_with_indices(b, host, indices)
         b.destroy()
 
+    @pytest.mark.parametrize(
+        "reverse_paths, selected",
+        [(False, [1]), (True, [1]), (False, [1, 0])],
+        ids=["long-subset", "short-subset", "reordered"],
+    )
+    def test_indexed_write_reaches_only_the_selected_articulations(self, physx_sdk, reverse_paths, selected):
+        """Selected links match a full write, including mixed link counts and reordered indices."""
+        moved = _link_vx_after_wrench(physx_sdk, indices=None, reverse_paths=reverse_paths)
+        link_counts = [3, 2] if reverse_paths else [2, 3]
+        for row, count in enumerate(link_counts):
+            np.testing.assert_array_less(0.0, moved[row, :count], err_msg="full write")
+        indices = np.array(selected, dtype=np.int32)
+        pushed = _link_vx_after_wrench(physx_sdk, indices=indices, reverse_paths=reverse_paths)
+        for row, count in enumerate(link_counts):
+            expected = moved[row, :count] if row in selected else 0.0
+            np.testing.assert_allclose(
+                pushed[row, :count], expected, rtol=1e-5, atol=1e-6, err_msg=f"articulation row {row}"
+            )
+
 
 # ---------------------------------------------------------------------------
-# Fixed tendons (80-85) -- GPU roundtrip with T>0 scene
+# Fixed tendons (80-85): GPU roundtrip with T>0 scene
 # ---------------------------------------------------------------------------
 
 
@@ -771,7 +1054,7 @@ class TestFixedTendonGpu:
     def _load(self, sdk):
         load_usd_with_ovstage(sdk, data_path("FixedTendonTest.usda"))
         sdk.wait_all()
-        sdk.warmup_gpu()
+        sdk.warmup()
         for _ in range(3):
             sdk.step(DT)
         sdk.wait_all()
@@ -837,7 +1120,7 @@ class TestFixedTendonGpu:
 
 
 # ---------------------------------------------------------------------------
-# Spatial tendons (90-93) -- GPU roundtrip with T>0 scene
+# Spatial tendons (90-93): GPU roundtrip with T>0 scene
 # ---------------------------------------------------------------------------
 
 
@@ -848,7 +1131,7 @@ class TestSpatialTendonGpu:
     def _load(self, sdk, scene="SpatialTendonTest.usda"):
         load_usd_with_ovstage(sdk, data_path(scene))
         sdk.wait_all()
-        sdk.warmup_gpu()
+        sdk.warmup()
         for _ in range(3):
             sdk.step(DT)
         sdk.wait_all()
@@ -917,11 +1200,11 @@ class TestSpatialTendonGpu:
 
 
 # ---------------------------------------------------------------------------
-# Articulation metadata and dynamics -- GPU
+# Articulation metadata and inverse dynamics: GPU
 # ---------------------------------------------------------------------------
 
 
-class TestArticulationMetadataAndDynamicsGpu:
+class TestArticulationMetadataAndInverseDynamicsGpu:
 
     def test_metadata(self, physx_sdk):
         """Verify all 6 metadata fields via direct TensorBinding (GPU simulation mode)."""
@@ -935,13 +1218,17 @@ class TestArticulationMetadataAndDynamicsGpu:
         assert b.spatial_tendon_count == 0
         b.destroy()
 
+    # CATEGORY-3 GAP (retires with the binding, no session port): the binding reads articulation metadata
+    # BEFORE the first simulate on DirectGPU. A session articulation read serves nothing until the first
+    # step has inserted the articulation, so this pre-warmup read has no session form. See
+    # PLAN-tensor-binding-deprecation (Blocked/deferred).
     def test_metadata_readable_before_warmup(self, physx_sdk):
-        """Articulation metadata is CPU-side topology data; it must be readable before
-        warmup_gpu() and without any simulation steps.  If this regresses it means
-        someone accidentally gated metadata behind the GPU readback path."""
+        """Articulation metadata is CPU-side topology data. It must be readable before
+        warmup() and without any simulation steps. A regression here means metadata
+        got gated behind the GPU readback path."""
         load_usd_with_ovstage(physx_sdk, data_path("two_articulations.usda"))
         physx_sdk.wait_all()
-        # Deliberately NO warmup_gpu(), NO step() -- GPU buffers are uninitialised
+        # Deliberately NO warmup() and NO step(), so GPU buffers are uninitialised.
         b = physx_sdk.create_tensor_binding(pattern=ARTI_PATTERN, tensor_type=TensorType.ARTICULATION_DOF_POSITION)
         assert b.dof_count == 2, "dof_count must be available before warmup"
         assert b.body_count == 3, "body_count must be available before warmup"
@@ -955,8 +1242,8 @@ class TestArticulationMetadataAndDynamicsGpu:
         assert m1 is m2, "metadata should be cached after first call"
         b.destroy()
 
-    def test_dynamics_binding_shapes(self, physx_sdk):
-        """Verify dynamics tensor shapes via direct TensorBinding creation."""
+    def test_inverse_dynamics_binding_shapes(self, physx_sdk):
+        """Verify inverse dynamics tensor shapes via direct TensorBinding creation."""
         _load_and_step(physx_sdk)
 
         jac = physx_sdk.create_tensor_binding(pattern=ARTI_PATTERN, tensor_type=TensorType.ARTICULATION_JACOBIAN)
@@ -986,12 +1273,12 @@ class TestArticulationMetadataAndDynamicsGpu:
 # Cross-device staging copy must respect DLTensor.byte_offset
 # ---------------------------------------------------------------------------
 #
-# Regression: the cross-device staging path used to copy from/to the
-# DLTensor's raw `data` pointer, ignoring `byte_offset`. Sliced views (where
-# the caller exposes a contiguous tail of a larger allocation by setting
-# byte_offset != 0) silently corrupted other rows or read sentinel data.
-# `dlToTensorDesc` already applies `data + byte_offset` to the TensorDesc;
-# the staging memcpy on both sides must use that same adjusted pointer.
+# Regression: a staging copy from or to the DLTensor's raw `data` pointer
+# ignores `byte_offset`, so a sliced view (a contiguous tail of a larger
+# allocation exposed via byte_offset != 0) corrupts other rows or reads
+# sentinel data. `dlToTensorDesc` applies `data + byte_offset` to the
+# TensorDesc. The staging memcpy on both sides must use that same adjusted
+# pointer.
 
 
 class TestCrossDeviceStagingByteOffset:
@@ -1000,7 +1287,7 @@ class TestCrossDeviceStagingByteOffset:
     def _build_offset_dltensor(host_buf: np.ndarray, byte_offset: int, shape: tuple, dtype=np.float32) -> DLTensor:
         """Build a CPU DLTensor pointing at ``host_buf`` with ``byte_offset`` baked in.
 
-        ``host_buf`` is the underlying numpy allocation; the returned DLTensor
+        ``host_buf`` is the underlying numpy allocation. The returned DLTensor
         keeps a reference to ``host_buf`` via the shape array's lifetime in
         the test scope. The caller must keep ``host_buf`` alive until the
         write/read completes.
@@ -1032,10 +1319,11 @@ class TestCrossDeviceStagingByteOffset:
         """Cross-device write must read from data + byte_offset, not from base.
 
         Construct a CPU host buffer with a sentinel row at index 0 and the
-        intended values at index 1; pass a DLTensor with byte_offset pointing
-        at row 1 to a GPU rigid-body pose binding. Without the fix, the
-        staging memcpy reads the sentinel row, the binding ends up holding
-        sentinel poses, and the next read of the binding returns sentinels.
+        intended values at index 1. Pass a DLTensor with byte_offset pointing
+        at row 1 to a GPU rigid-body pose binding. If the staging memcpy
+        ignores byte_offset it reads the sentinel row, the binding ends up
+        holding sentinel poses, and the next read of the binding returns
+        sentinels.
         """
         _load_and_step(physx_sdk, scene="simple_physics_scene.usda")
         b = physx_sdk.create_tensor_binding(pattern="/World/Cube*", tensor_type=TensorType.RIGID_BODY_POSE)
@@ -1071,10 +1359,10 @@ class TestCrossDeviceStagingByteOffset:
     def test_cross_device_read_respects_byte_offset(self, physx_sdk):
         """Cross-device read must write into data + byte_offset, not into base.
 
-        Construct a CPU host buffer that has a guard row at index 0; pass
+        Construct a CPU host buffer that has a guard row at index 0. Pass
         a DLTensor with byte_offset pointing at row 1 as the read destination
-        for a GPU rigid-body pose binding. Without the fix, memcpyDtoH writes
-        into row 0 and clobbers the guard, while row 1 stays uninitialized.
+        for a GPU rigid-body pose binding. If byte_offset is ignored, memcpyDtoH
+        writes into row 0 and clobbers the guard, while row 1 stays uninitialized.
         """
         _load_and_step(physx_sdk, scene="simple_physics_scene.usda")
         b = physx_sdk.create_tensor_binding(pattern="/World/Cube*", tensor_type=TensorType.RIGID_BODY_POSE)
@@ -1088,7 +1376,7 @@ class TestCrossDeviceStagingByteOffset:
         # destination where the binding's pose data must land.
         GUARD = np.float32(-77.0)
         host = np.full((2 * n, cols), GUARD, dtype=np.float32)
-        # Pre-fill row 1 with a different value so we can detect "didn't write".
+        # Pre-fill row 1 with a different value so a missing write is detectable.
         host[n:] = np.float32(42.0)
 
         dl = self._build_offset_dltensor(host, byte_offset=n * row_bytes, shape=(n, cols))

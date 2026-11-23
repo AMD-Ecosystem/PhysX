@@ -1,9 +1,27 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+// @implements REQ-SIM-LOCALVELOCITY-001
+// @covers AC-8
+
+/** @implements REQ-PARSE-PARALLEL-001
+ * @covers AC-3 AC-4
+ */
+
+/**
+ * @implements REQ-ATTACH-BACKENDS-001
+ * @covers AC-1 AC-4
+ */
+
+/**
+ * @implements REQ-BUILD-UNIBUILD-001
+ * @covers AC-6
+ */
 
 #pragma once
 
 #include <omni/physics/parse/Allocator.h>
+#include <omni/physics/parse/DescriptorRangeExecutor.h>
 #include <omni/physics/parse/IPhysicsSource.h> // parse::DescendantScope
 #include <omni/physics/parse/IParseBackend.h> // parse::AttachTarget
 
@@ -15,6 +33,7 @@ namespace omni::physics::parse
 {
 
 class ScannedStage;
+class DescriptorBatchAllocator;
 
 struct ScanOptions
 {
@@ -27,6 +46,14 @@ struct ScanOptions
     // path-driven stage-load and prototype scans that descend through instance
     // proxies.
     DescendantScope descendantScope = DescendantScope::eActiveInstanced;
+
+    // Optional attach-owned pool; an ovstage scan retains it with its descriptors.
+    // Its upstream must match the scan allocator. Other backends may ignore it.
+    std::shared_ptr<DescriptorBatchAllocator> descriptorPool;
+    DescriptorExecutionOptions descriptorExecution;
+
+    // Consumer fallback for bodies without localSpaceVelocities metadata.
+    bool outputVelocitiesLocalSpaceDefault = false;
 };
 
 // One registered whole-stage walker.
@@ -48,10 +75,23 @@ public:
 };
 
 // Install `backend` as the single active scan backend, replacing any previous
-// one. null restores the default (native USD walk).
+// one. null leaves the registry empty (scanStage then returns an empty scan).
 void setScanBackend(std::unique_ptr<IScanBackend> backend);
 
-// The active scan backend, or null when none is installed (use the native walk).
+// The active scan backend, or null when none is installed.
 IScanBackend* scanBackend();
+
+// Move the active scan backend out of the registry, transferring ownership to the
+// caller and leaving the registry empty. An ovstage attach stashes the previous
+// backend this way so detach reinstalls the exact same instance.
+std::unique_ptr<IScanBackend> takeScanBackend();
+
+// Dispatches to the explicitly selected provider. Null or a throwing provider
+// returns an empty scan; attachment calls pass their own backend.
+ScannedStage scanStage(IScanBackend* backend, const parse::AttachTarget& target,
+                       const std::vector<std::string>& scanRoots,
+                       const std::vector<std::string>& excludePaths,
+                       const parse::ScanOptions& options,
+                       parse::IDescriptorAllocator& allocator);
 
 } // namespace omni::physics::parse

@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved. 
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef PXG_SOFTBODY_H
 #define PXG_SOFTBODY_H
@@ -32,6 +9,9 @@
 #include "foundation/PxMat33.h"
 #include "foundation/PxBounds3.h"
 #include <vector_types.h>
+
+// Defines PxgDeformablePairInfo, used by a member below.
+#include "PxgSimulationCoreDesc.h"
 
 #define MAX_SELF_COLLISION_CONTACTS		1000
 #define NUM_BLOCK_PER_SOFTBODY_SOLVE_TETRA	2
@@ -55,7 +35,6 @@ namespace physx
 
 	struct PxgMat33Block;
 	struct PxgSpatialVectorBlock;
-	class PxgNonRigidFilterPair;
 	struct PxgAllocatorDesc;
 
 #if PX_VC 
@@ -101,7 +80,12 @@ namespace physx
 		const float4*			mSimKinematicTarget;
 		bool*					mVertsAreDeformed;
 		bool*					mVertsCanNotDeform;
-		float4*					mSimDeltaPos; //sizeof mNumVertsGM, store the deltaPos change for the grid model verts
+
+		// Accumulated position delta of the sim verts since step start (integration plus
+		// constraint corrections), sizeof mNumVertsGM. Advances in position iterations
+		// only and stays frozen through velocity iterations. The contact solves read it
+		// for computing the separation.
+		float4*					mSimDeltaPos;
 		PxgMat33Block*			mSimTetraRestPoses;
 		PxgMat33Block*			mOrigQinv;
 		
@@ -127,19 +111,26 @@ namespace physx
 
 		PxgSpatialVectorBlock*	mSimTetraMultipliers;
 
-		// .xyz: position-delta accumulator. .w: per-vertex refCount (populated by
-		// the count+prep kernels, read for deformable-side mass-splitting).
-		// Zeroed at the start of each iter by the apply-delta kernel.
+		// Per-iteration solve scratch. The solves scatter their deltas into .xyz and
+		// the count+prep kernels put the mass-splitting refCount into .w. Every
+		// iteration sb_gm_applyExternalDeltasLaunch consumes and zeroes it, updating
+		// mSimVelocity_InvMass always and mSimPosition_InvMass plus mSimDeltaPos in
+		// position iterations only.
 		float4*					mSimDelta;
 
 		PxBounds3*				mPackedNodeBounds;
 
-		PxU16*					mOrderedMaterialIndices; //indices to global material array ordered by partition, size of mNumVertsGM(simulation mesh)
-		PxU16*					mMaterialIndices; //indices to global material array, size of mNumVertsGM(simulation mesh)
+		PxU16*					mOrderedMaterialIndices; //indices to global material array ordered by partition, size of mNumTetsGM(simulation mesh)
+		PxU16*					mMaterialIndices; //indices to global material array, size of mNumTetsGM(simulation mesh)
 
-		//filter pair for myself and other soft body. Index0 is myself and vertId. Index1 is other soft body and tetId
-		PxgNonRigidFilterPair*	mFilteringPairs; 
-		PxU32					mNumFilterPairs;
+		// Element filter pairs of this volume, one sorted array per pair type. The type order of each
+		// pair matches the type order expected by the find helpers in deformableElementFilter.cuh.
+		PxgDeformablePairInfo*	mRigidVolumeFilterPairs;
+		PxgDeformablePairInfo*	mVolumeVolumeFilterPairs;
+		PxgDeformablePairInfo*	mVolumeSurfaceFilterPairs;
+		PxU32					mNumRigidVolumeFilterPairs;
+		PxU32					mNumVolumeVolumeFilterPairs;
+		PxU32					mNumVolumeSurfaceFilterPairs;
 
 		PxReal					mLinearDamping;
 		PxReal					mMaxLinearVelocity;
@@ -171,7 +162,7 @@ namespace physx
 		PxU32					mNumTetsPerElement;
 		PxU32					mNumJacobiVertices;
 
-		PxReal					mRestDistance;
+		PxReal					mRestOffset;
 		PxReal					mOriginalContactOffset;
 		PxReal					mJacobiScale;
 		

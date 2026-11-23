@@ -1,5 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * @implements REQ-ATTACH-SERVICES-001
+ * @covers AC-3
+ */
 
 #pragma once
 
@@ -18,10 +23,10 @@
 
 #include <carb/ujitso/UjitsoUtils.inl>
 #include <omni/physx/IPhysxCookingService.h>
-#include <common/utilities/Utilities.h> // intToPath
+
+#include <atomic>
 
 using namespace carb::ujitso;
-using namespace PXR_NS;
 using namespace physx;
 
 namespace omni
@@ -38,29 +43,6 @@ typedef UjitsoProcessManager    UjitsoAsyncContext;
 static void addExtDep(RequestBuilder<>& req)
 {
     req.add(carb::ujitso::IRegistry::Extension, "omni.physx.cooking");
-}
-
-// Uses copyUsdMeshDataAndRespan to create a new copy of data pointed to by a view, and modifies the view
-// to point to the new copy
-static void buildUsdMeshAndRemakeView(CookingInputUSDRigidMesh& mesh, PhysxCookingMeshView& view)
-{
-    // Copy carb::Float3 -> PXR_NS::GfVec3f; both have a simple 3-float layout with no inheritance, so
-    // reinterpret-casting is safe even though GfVec3 may not be trivially copyable by its strict definition
-    static_assert(sizeof(GfVec3f) == sizeof(carb::Float3), "copyIntDataAndRespan: Data size mismatch");
-    mesh.pointsValue.assign(reinterpret_cast<const GfVec3f*>(view.points.data()),
-                            reinterpret_cast<const GfVec3f*>(view.points.data()) + view.points.size());
-
-    // Cast and assign to mesh arrays, int and uint32_t alias (assuming they're the same size)
-    static_assert(sizeof(int) == sizeof(uint32_t), "copyIntDataAndRespan: Data size mismatch");
-    mesh.indicesValue.assign(reinterpret_cast<const int*>(view.indices.data()),
-                             reinterpret_cast<const int*>(view.indices.data()) + view.indices.size());
-    mesh.facesValue.assign(reinterpret_cast<const int*>(view.faces.data()),
-                           reinterpret_cast<const int*>(view.faces.data()) + view.faces.size());
-    mesh.holesValue.assign(reinterpret_cast<const int*>(view.holeIndices.data()),
-                           reinterpret_cast<const int*>(view.holeIndices.data()) + view.holeIndices.size());
-
-    // These are the same data type
-    mesh.faceMaterials.assign(view.faceMaterials.begin(), view.faceMaterials.end());
 }
 
 /**
@@ -83,15 +65,16 @@ struct MeshCookingContext : public UjitsoProcessContext
      * \param[in]   cookingResult               The physx cooking result, which must also point to a valid cooking
      *                                          request through its request field.
      * \param[in]   cookingDataVersion          The data version requested for the cooking type given in the request.
-     * \param[in]   collisionTypeSchemaToken    The USD schema token for the cooked data type.
+     * \param[in]   collisionTypeSchemaToken    The USD schema token text (e.g. PhysxSchemaTokens->triangleMesh.GetText())
+     *                                          for the cooked data type. Stored, currently unread by this class.
      * \param[in]   canHaveMultipleBuffers      Whether or not the data type may be stored using multiple buffers.
      *                                          Currently only convex decomposition requires that this be true.
-     * 
+     *
      * \return a new MeshCookingContext.
      */
     static MeshCookingContext* create(UjitsoResourceManager* resourceManager, CacheBehaviorType cacheBehavior,
                                       const PhysxCookingComputeResult& cookingResult, int cookingDataVersion,
-                                      TfToken collisionTypeSchemaToken, bool canHaveMultipleBuffers = false)
+                                      const char* collisionTypeSchemaToken, bool canHaveMultipleBuffers = false)
     {
         return new MeshCookingContext(resourceManager, cacheBehavior, cookingResult, cookingDataVersion,
                                       collisionTypeSchemaToken, canHaveMultipleBuffers);
@@ -147,7 +130,7 @@ private:
     // See the definition of create(...) for a description of all parameters
     MeshCookingContext(UjitsoResourceManager* resourceManager, CacheBehaviorType cacheBehavior,
                        const PhysxCookingComputeResult& cookingResult, int cookingDataVersion,
-                       TfToken collisionTypeSchemaToken, bool canHaveMultipleBuffers) :
+                       const char* collisionTypeSchemaToken, bool canHaveMultipleBuffers) :
         UjitsoProcessContext(resourceManager, cacheBehavior),
         m_cookingRequest(*cookingResult.request), m_cookingResult(cookingResult),
         m_collisionTypeSchemaToken(collisionTypeSchemaToken), m_canHaveMultipleBuffers(canHaveMultipleBuffers),
@@ -160,33 +143,24 @@ private:
 
         saveCallbackFromRequest(m_cookingRequest);
 
-        CookingStageAndPrim stageAndPrim;
+        // A deformable volume mesh cook carries its whole input in volumeMeshView and is the one
+        // data type the processor never triangulates, so an empty primMeshView is expected here.
+        const bool inputIsSelfContained = m_cookingRequest.dataType == PhysxCookingDataType::eDEFORMABLE_VOLUME_MESH;
 
-        if (m_cookingRequest.primMeshView.isEmpty())    // If user supplied optionalMeshKey then meshView will be empty
+        if (!inputIsSelfContained && m_cookingRequest.primMeshView.isEmpty())    // If user supplied optionalMeshKey then meshView will be empty
         {
-            // If the mesh view is empty we require valid prim data
-            if (m_cookingRequest.dataInputMode != PhysxCookingComputeRequest::eINPUT_MODE_FROM_PRIM_ID)
-            {
-                m_cookingResult.result = PhysxCookingResult::eERROR_INVALID_PRIM;
-                return;
-            }
-
-            if (!ICookingComputeService::getStageAndPrim(m_cookingResult, m_cookingRequest, stageAndPrim) ||
-                !ICookingComputeService::fillMeshView(m_cookingResult, m_cookingRequest, stageAndPrim))
-            {
-                m_cookingResult.result = PhysxCookingResult::eERROR_INVALID_PRIM;
-                m_cookingRequest.onFinished(m_cookingResult);
-                return;
-            }
-        }
-        else
-        {
-            // If async, we can't be sure the data referenced by the mesh view will be valid when processing
-            // actually occurs, so copy the data
-            if (m_cookingRequest.options.hasFlag(PhysxCookingComputeRequest::Options::kComputeAsynchronously))
-                buildUsdMeshAndRemakeView(stageAndPrim.rigidMesh, m_cookingRequest.primMeshView);
+            // REQ-COOK-SOURCE-001: every request is mesh-view mode now (eINPUT_MODE_FROM_PRIM_ID
+            // removed) -- an empty mesh view here is unrecoverable, there is no USD re-read fallback.
+            m_cookingResult.result = PhysxCookingResult::eERROR_INVALID_PRIM;
+            return;
         }
 
+        // An asynchronous eINPUT_MODE_FROM_PRIM_MESH_VIEW request cannot be allowed to read the
+        // caller's view once this constructor returns: the build is only queued here and first
+        // runs from a later pumpAsyncContext(), long after the submitting frame released the
+        // memory the view points at. The copy is taken by each input container's constructor --
+        // below, and still on this (the submitting) thread -- see
+        // PhysicsInputContainerBase::shouldSnapshotInputNow().
         m_triangulationContainer =
             new PhysicsTriangulationInputContainer(m_cookingResult, m_cookingRequest);
 
@@ -231,10 +205,25 @@ private:
 
     virtual ~MeshCookingContext()
     {
-        delete m_triangulationContainer;
-        delete m_volumeDeformableBodyInputContainer;
-        delete m_deformableVolumeMeshInputContainer;
-        delete m_surfaceDeformableBodyInputContainer;
+        // The registry holds a reference to each registered container; it must let go of them
+        // before they are deleted here, even on a path that reached neither postbuild() nor
+        // cancel() (e.g. agent->requestBuild() failing after prebuild() registered them).
+        unregisterContainers("~MeshCookingContext");
+
+        // The containers are reference counted and registerContainer() acquires them. Release ours
+        // instead of deleting them: when a cook is canceled while it runs, the registry can rarely
+        // still hold its reference after unregisterContainer() succeeded, and drops it only when
+        // the agent shuts down -- deleting the container here left it a dangling pointer.
+        releaseContainer(m_triangulationContainer);
+        releaseContainer(m_volumeDeformableBodyInputContainer);
+        releaseContainer(m_deformableVolumeMeshInputContainer);
+        releaseContainer(m_surfaceDeformableBodyInputContainer);
+    }
+
+    static void releaseContainer(carb::ujitso::IContainer* container)
+    {
+        if (container)
+            container->release();
     }
 
     // Using the prim ID as the process owner ID
@@ -257,6 +246,10 @@ private:
 
         // Call base context version do common state setting
         UjitsoProcessContext::onComplete();
+
+        // The build's callback has returned by now, so it can no longer overwrite the result
+        if (m_canceledBeforeFinished)
+            m_cookingResult.result = PhysxCookingResult::eERROR_CANCELED;
 
         // Keep this outside of the if () block below, so that its data is available for any callbacks that are fired
         std::vector<PhysxCookedDataSpan> spans;
@@ -296,45 +289,84 @@ private:
 
         UjitsoProcessContext::prebuild();
 
+        // Kept for unregisterContainers(), which may run after the agent has been returned
+        m_registry = getAgent()->registry;
+
         // Build the container to pass data through to the processor
-        m_containerHandle = getAgent()->registry->registerContainer(*m_triangulationContainer);
+        m_containerHandle = m_registry->registerContainer(*m_triangulationContainer);
         getRequestBuilder().add(PHYSICS_TRIANGULATION_INPUT_CONTAINER_NAME, m_containerHandle);
 
         const PhysxCookingDataType::Enum dataType =
             (PhysxCookingDataType::Enum)getRequestBuilder().getRequest().getAsDefault(DATA_TYPE_STR, (uint32_t)0);
         if (dataType == PhysxCookingDataType::eVOLUME_DEFORMABLE_BODY)
         {
-            m_volumeDeformableBodyContainerHandle = getAgent()->registry->registerContainer(*m_volumeDeformableBodyInputContainer);
+            m_volumeDeformableBodyContainerHandle = m_registry->registerContainer(*m_volumeDeformableBodyInputContainer);
             getRequestBuilder().add(PHYSICS_VOLUME_DEFORMABLE_BODY_INPUT_CONTAINER_NAME, m_volumeDeformableBodyContainerHandle);
         }
         else if (dataType == PhysxCookingDataType::eDEFORMABLE_VOLUME_MESH)
         {
-            m_deformableVolumeMeshContainerHandle = getAgent()->registry->registerContainer(*m_deformableVolumeMeshInputContainer);
+            m_deformableVolumeMeshContainerHandle = m_registry->registerContainer(*m_deformableVolumeMeshInputContainer);
             getRequestBuilder().add(PHYSICS_DEFORMABLE_VOLUME_MESH_INPUT_CONTAINER_NAME, m_deformableVolumeMeshContainerHandle);
         }
         else if (dataType == PhysxCookingDataType::eSURFACE_DEFORMABLE_BODY)
         {
-            m_surfaceDeformableBodyContainerHandle = getAgent()->registry->registerContainer(*m_surfaceDeformableBodyInputContainer);
+            m_surfaceDeformableBodyContainerHandle = m_registry->registerContainer(*m_surfaceDeformableBodyInputContainer);
             getRequestBuilder().add(PHYSICS_SURFACE_DEFORMABLE_BODY_INPUT_CONTAINER_NAME, m_surfaceDeformableBodyContainerHandle);
         }
+
+        // Publish the handles to unregisterContainers() only once all of them are stored
+        m_containersRegistered.store(true, std::memory_order_release);
     }
 
-    bool unregisterContainerWithLogging(const ContainerHandle& handle, const char* containerName)
+    bool unregisterContainerWithLogging(const ContainerHandle& handle, const char* containerName, const char* caller)
     {
         constexpr uint32_t timeout = 60000;
-        const OperationResult result = getAgent()->registry->unregisterContainer(handle, timeout);
+        const OperationResult result = m_registry->unregisterContainer(handle, timeout);
         switch (result)
         {
         case OperationResult::SUCCESS:
             return true;
         case OperationResult::TIMEOUT_ERROR:
-            CARB_LOG_ERROR("MeshCookingContext::postbuild: Unable to unregister %s in %ds.",
-                containerName, timeout / 1000);
+            CARB_LOG_ERROR("MeshCookingContext::%s: Unable to unregister %s in %ds.",
+                caller, containerName, timeout / 1000);
             return false;
         default:
-            CARB_LOG_ERROR("MeshCookingContext::postbuild: unregisterContainer returned error value %d.",
-                (uint32_t)result);
+            CARB_LOG_ERROR("MeshCookingContext::%s: unregisterContainer returned error value %d.",
+                caller, (uint32_t)result);
             return false;
+        }
+    }
+
+    // Unregisters every container prebuild() registered, exactly once.
+    //
+    // A cook canceled while it is running gets here several times: from postbuild(), on the
+    // UJITSO worker that completes the build, and from cancel(), on the thread retiring the
+    // cooking context -- which a stage detach calls more than once (cancelAllTasks, then
+    // destroyAsyncContext and ~UjitsoProcessManager) -- possibly while postbuild() is running.
+    // unregisterContainer() releases the registry's reference to the container, so a second
+    // call for the same handle is refused once the first has finished, and over-releases the
+    // registry's HandleDatabase entry while it has not: carb then aborts on the worker with
+    // "HandleDatabase::release: Precondition failure: `mapped` is already destroyed".
+    // Whichever caller claims the registration first tears the containers down; the others
+    // find it gone.
+    void unregisterContainers(const char* caller)
+    {
+        if (!m_containersRegistered.exchange(false, std::memory_order_acq_rel))
+            return;
+
+        unregisterContainerWithLogging(m_containerHandle, "triangulation container", caller);
+
+        if (m_cookingRequest.dataType == PhysxCookingDataType::eVOLUME_DEFORMABLE_BODY)
+        {
+            unregisterContainerWithLogging(m_volumeDeformableBodyContainerHandle, "volume deformable body", caller);
+        }
+        else if (m_cookingRequest.dataType == PhysxCookingDataType::eDEFORMABLE_VOLUME_MESH)
+        {
+            unregisterContainerWithLogging(m_deformableVolumeMeshContainerHandle, "deformable volume mesh", caller);
+        }
+        else if (m_cookingRequest.dataType == PhysxCookingDataType::eSURFACE_DEFORMABLE_BODY)
+        {
+            unregisterContainerWithLogging(m_surfaceDeformableBodyContainerHandle, "surface deformable body", caller);
         }
     }
 
@@ -404,24 +436,8 @@ private:
             CARB_LOG_WARN("UjitsoMeshCookingContext: cooking failure%s%s", text ? " for " : "", text ? text : "");
         }
 
-        // tear down the triangulation container
-        unregisterContainerWithLogging(m_containerHandle, "triangulation container");
-
-        if (m_cookingRequest.dataType == PhysxCookingDataType::eVOLUME_DEFORMABLE_BODY)
-        {
-            // tear down the volume deformable body cooking input container
-            unregisterContainerWithLogging(m_volumeDeformableBodyContainerHandle, "volume deformable body");
-        }
-        else if (m_cookingRequest.dataType == PhysxCookingDataType::eDEFORMABLE_VOLUME_MESH)
-        {
-            // tear down the deformable volume mesh cooking input container
-            unregisterContainerWithLogging(m_deformableVolumeMeshContainerHandle, "deformable volume mesh");
-        }
-        else if (m_cookingRequest.dataType == PhysxCookingDataType::eSURFACE_DEFORMABLE_BODY)
-        {
-            // tear down the surface deformable body cooking input container
-            unregisterContainerWithLogging(m_surfaceDeformableBodyContainerHandle, "surface deformable body");
-        }
+        // tear down the input containers, unless a concurrent cancel() already has
+        unregisterContainers("postbuild");
 
         return success;
     }
@@ -435,39 +451,23 @@ private:
         if (!invokeCallbacks)
             m_muteCallbacks = true;
 
+        // A build that has not finished yet is reported as canceled. Its callback may still be running
+        // and write m_cookingResult, so onComplete() sets the result once that has returned.
         if (getState() != Finishing)
-            m_cookingResult.result = PhysxCookingResult::eERROR_CANCELED;
+            m_canceledBeforeFinished = true;
 
         UjitsoProcessContext::cancel(invokeCallbacks);
 
-        // tear down the triangulation container if agent is available
-        // it's apparently possible to cancel before prebuild is called)
-        carb::ujitso::Agent* agent = getAgent();
-        if (agent != nullptr)
-        {
-            constexpr uint32_t timeout = 60000;
-            const OperationResult unregisterResult = agent->registry->unregisterContainer(m_containerHandle, timeout);
-            switch (unregisterResult)
-            {
-            case OperationResult::SUCCESS:
-                break;
-            case OperationResult::TIMEOUT_ERROR:
-                CARB_LOG_ERROR(
-                    "MeshCookingContext::cancel: Unable to unregister triangulation container in %ds.", timeout / 1000);
-                break;
-            default:
-                CARB_LOG_ERROR("MeshCookingContext::cancel: unregisterContainer returned error value %d.",
-                               (uint32_t)unregisterResult);
-                break;
-            }
-        }
+        // tear down the input containers; a no-op if prebuild() has not registered them yet, or if
+        // postbuild() or an earlier cancel() already did
+        unregisterContainers("cancel");
     }
 
     typedef std::vector<omni::function<void(const PhysxCookingComputeResult& result)>> CallbackRequestVector;
 
     PhysxCookingComputeRequest          m_cookingRequest;
     PhysxCookingComputeResult           m_cookingResult;
-    TfToken                             m_collisionTypeSchemaToken;
+    const char*                         m_collisionTypeSchemaToken;
     bool                                m_canHaveMultipleBuffers;
     int                                 m_cookingDataVersion;
 
@@ -485,8 +485,14 @@ private:
     PhysicsSurfaceDeformableBodyInputContainer* m_surfaceDeformableBodyInputContainer;
     ContainerHandle                             m_surfaceDeformableBodyContainerHandle;
 
+    carb::ujitso::IRegistry*            m_registry = nullptr;
+    // Set by prebuild() once the containers above are registered; claimed by unregisterContainers()
+    std::atomic<bool>                   m_containersRegistered{ false };
+
     CallbackRequestVector               m_requestCallbacks;
     bool                                m_muteCallbacks;
+    // Set by cancel() before the build finished; onComplete() then reports eERROR_CANCELED
+    bool                                m_canceledBeforeFinished = false;
 
     uint64_t                            m_contextId;
 };

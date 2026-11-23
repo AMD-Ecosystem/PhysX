@@ -1,37 +1,16 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
-// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "OmniPvdSocketReadStreamImpl.h"
 #include "OmniPvdSocketProtocol.h"
+#include <vector>
 
 OmniPvdSocketReadStreamImpl::OmniPvdSocketReadStreamImpl(uint16_t port)
 {
 	mPort = port;
+	mControlCapabilities = 0;
 }
 
 OmniPvdSocketReadStreamImpl::~OmniPvdSocketReadStreamImpl()
@@ -65,6 +44,60 @@ bool OmniPvdSocketReadStreamImpl::recvAndValidateHandshake()
 		return false;
 	if (handshake.proto > OMNI_PVD_LIVE_PROTO)
 		return false; // producer speaks a newer socket protocol than we understand
+	mControlCapabilities = static_cast<uint16_t>(handshake.flags & (OMNI_PVD_LIVE_FILTER_CONTROL | OMNI_PVD_LIVE_CAPTURE_CATALOG));
+	return true;
+}
+
+bool OMNI_PVD_CALL OmniPvdSocketReadStreamImpl::requestCapture(const OmniPvdCaptureRequest& request)
+{
+	const uint64_t count = uint64_t(request.nbScenes) + request.nbObjects;
+	if (!request.requestId || request.catalogOnly || count > OMNI_PVD_CAPTURE_MAX_SELECTORS ||
+		(request.nbScenes && !request.scenes) || (request.nbObjects && !request.objects))
+		return false;
+	std::lock_guard<std::mutex> lock(mControlSendMutex);
+	if (!(mControlCapabilities & OMNI_PVD_LIVE_FILTER_CONTROL) || !mSocket.isOpen()) return false;
+	std::vector<uint8_t> message(OMNI_PVD_CAPTURE_HEADER_BYTES + static_cast<size_t>(count) * 8);
+	omniPvdEncodeControlInteger(message.data(), OMNI_PVD_CAPTURE_MAGIC, 4);
+	omniPvdEncodeControlInteger(message.data() + 4, message.size(), 4);
+	omniPvdEncodeControlInteger(message.data() + 8, request.requestId, 8);
+	omniPvdEncodeControlInteger(message.data() + 16, request.recordSecondaryData ? 1u : 0u, 4);
+	omniPvdEncodeControlInteger(message.data() + 20, request.nbScenes, 4);
+	omniPvdEncodeControlInteger(message.data() + 24, request.nbObjects, 4);
+	size_t offset = OMNI_PVD_CAPTURE_HEADER_BYTES;
+	const OmniPvdObjectHandle* lists[] = { request.scenes, request.objects };
+	const uint32_t counts[] = { request.nbScenes, request.nbObjects };
+	for (uint32_t list = 0; list < 2; ++list)
+		for (uint32_t i = 0; i < counts[list]; ++i, offset += 8)
+			omniPvdEncodeControlInteger(message.data() + offset, lists[list][i], 8);
+	return sendControlBytes(message.data(), message.size());
+}
+
+bool OMNI_PVD_CALL OmniPvdSocketReadStreamImpl::requestCaptureCatalog(uint64_t requestId)
+{
+	if (!requestId) return false;
+	std::lock_guard<std::mutex> lock(mControlSendMutex);
+	if (!(mControlCapabilities & OMNI_PVD_LIVE_CAPTURE_CATALOG) || !mSocket.isOpen()) return false;
+	uint8_t message[OMNI_PVD_CAPTURE_HEADER_BYTES] = {};
+	omniPvdEncodeControlInteger(message, OMNI_PVD_CAPTURE_CATALOG_MAGIC, 4);
+	omniPvdEncodeControlInteger(message + 4, sizeof(message), 4);
+	omniPvdEncodeControlInteger(message + 8, requestId, 8);
+	return sendControlBytes(message, sizeof(message));
+}
+
+bool OmniPvdSocketReadStreamImpl::sendControlBytes(const uint8_t* bytes, uint64_t count)
+{
+	uint64_t sent = 0;
+	while (sent < count)
+	{
+		const int64_t written = mSocket.send(bytes + sent, count - sent);
+		if (written <= 0)
+		{
+			// A partial frame cannot be retried. Disable control until the caller closes this session.
+			mControlCapabilities = 0;
+			return false;
+		}
+		sent += static_cast<uint64_t>(written);
+	}
 	return true;
 }
 
@@ -104,10 +137,17 @@ bool OMNI_PVD_CALL OmniPvdSocketReadStreamImpl::openStream()
 		return true; // already open, so nothing to do
 
 	// Blocking server listen + accept of the connecting producer on the fixed port.
-	if (!mSocket.listenAndAccept(mPort))
+	if (!mSocket.beginListen(mPort))
+	{
+		mSocket.close();
 		return false;
+	}
+	return acceptAndValidate();
+}
 
-	if (!recvAndValidateHandshake())
+bool OmniPvdSocketReadStreamImpl::acceptAndValidate()
+{
+	if (!mSocket.acceptOne() || !recvAndValidateHandshake())
 	{
 		mSocket.close();
 		return false;
@@ -117,6 +157,7 @@ bool OMNI_PVD_CALL OmniPvdSocketReadStreamImpl::openStream()
 
 bool OMNI_PVD_CALL OmniPvdSocketReadStreamImpl::closeStream()
 {
+	mControlCapabilities = 0;
 	mSocket.close();
 	return true;
 }

@@ -1,5 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * @implements REQ-TENSOR-METATYPE-001
+ * @covers AC-1 AC-2
+ */
 
 #pragma once
 
@@ -7,6 +12,7 @@
 
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace omni
@@ -74,6 +80,10 @@ public:
     void addLink(const std::string& name);
     void addJoint(const JointDesc& desc);
     bool isDofBody0Parent(uint32_t DofIdx) const;
+    bool hasReversedDofBodyOrder() const
+    {
+        return mHasReversedDofBodyOrder;
+    }
     void setFixedBase(bool fixedBase);
     void setLinkParentIndex(uint32_t linkIdx, uint32_t parentIdx);
     void print() const;
@@ -98,6 +108,10 @@ private:
 
     bool mFixedBase = false;
 
+    // True when any DOF has body1 as its articulation parent. CPU and GPU inverse dynamics gathers use
+    // this immutable metatype fact to skip authored-basis transforms for parent-first articulations.
+    bool mHasReversedDofBodyOrder = false;
+
     friend struct ArticulationMetatypeLT;
 };
 
@@ -105,43 +119,10 @@ struct ArticulationMetatypeLT
 {
     bool operator()(const ArticulationMetatype& a, const ArticulationMetatype& b) const
     {
-        if (a.mFixedBase < b.mFixedBase)
-        {
-            return true;
-        }
-        else if (a.mFixedBase == b.mFixedBase)
-        {
-            if (a.mJointTypes < b.mJointTypes)
-            {
-                return true;
-            }
-            else if (a.mJointTypes == b.mJointTypes)
-            {
-                if (a.mJointNames < b.mJointNames)
-                {
-                    return true;
-                }
-                else if (a.mJointNames == b.mJointNames)
-                {
-                    if (a.mDofIsBody0Parent < b.mDofIsBody0Parent)
-                    {
-                        return true;
-                    }
-                    else if (a.mDofIsBody0Parent == b.mDofIsBody0Parent)
-                    {
-                        if (a.mLinkParentIndices < b.mLinkParentIndices)
-                        {
-                            return true;
-                        }
-                        else if (a.mLinkParentIndices == b.mLinkParentIndices)
-                        {
-                            return a.mLinkNames < b.mLinkNames;
-                        }
-                    }
-                }
-            }
-        }
-        return false;
+        return std::tie(a.mFixedBase, a.mJointTypes, a.mJointNames, a.mDofIsBody0Parent,
+                        a.mLinkParentIndices, a.mLinkNames, a.mJointDofCounts, a.mDofNames, a.mDofTypes) <
+               std::tie(b.mFixedBase, b.mJointTypes, b.mJointNames, b.mDofIsBody0Parent,
+                        b.mLinkParentIndices, b.mLinkNames, b.mJointDofCounts, b.mDofNames, b.mDofTypes);
     }
 };
 

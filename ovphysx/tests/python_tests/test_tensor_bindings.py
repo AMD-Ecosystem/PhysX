@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
+
+# DEPRECATED (tensor-binding-deprecation): a deprecated tensor-binding test. Removed with the binding.
 
 """Python tests for the TensorBinding API.
 
@@ -118,15 +120,22 @@ def test_tensor_binding_explicit_paths(physx_sdk):
     load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
     physx_sdk.wait_all()
 
-    # Explicit paths (unordered list)
+    # Mixed present, absent and repeated paths must select each existing body once.
     binding = physx_sdk.create_tensor_binding(
-        prim_paths=["/World/Cube3", "/World/Cube1", "/World/Cube2"],
+        prim_paths=["/World/Cube3", "/World/Missing", "/World/Cube1", "/World/Cube2", "/World/Cube3"],
         tensor_type=TensorType.RIGID_BODY_POSE,
     )
 
     assert binding.count == 3
     assert binding.shape == (3, 7)
+    assert binding.prim_paths == ["/World/Cube3", "/World/Cube1", "/World/Cube2"]
 
+    reordered = physx_sdk.create_tensor_binding(
+        prim_paths=["/World/Cube2", "/World/Cube3", "/World/Missing", "/World/Cube1", "/World/Cube3"],
+        tensor_type=TensorType.RIGID_BODY_VELOCITY,
+    )
+    assert reordered.prim_paths == ["/World/Cube2", "/World/Cube3", "/World/Cube1"]
+    reordered.destroy()
     binding.destroy()
 
 
@@ -488,7 +497,7 @@ def test_tensor_binding_no_usd_loaded(physx_sdk):
     Returns:
         None: Validates appropriate error when no USD is loaded.
     """
-    # Don't load USD - should fail
+    # No USD is loaded, so this must fail.
     with pytest.raises(RuntimeError, match="(?i)(usd|stage|not loaded)"):
         physx_sdk.create_tensor_binding(
             prim_paths=["/World/Cube"],
@@ -509,7 +518,7 @@ def test_read_cache_populated(physx_sdk):
     """After the first read(), the binding's internal _read_cache should be populated."""
     load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
     physx_sdk.wait_all()
-    physx_sdk.warmup_gpu()
+    physx_sdk.warmup()
 
     binding = physx_sdk.create_tensor_binding(
         pattern="/World/Cube*",
@@ -529,7 +538,7 @@ def test_read_different_buffer_replaces_cache(physx_sdk):
     """Switching to a different buffer object should replace the cached entry."""
     load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
     physx_sdk.wait_all()
-    physx_sdk.warmup_gpu()
+    physx_sdk.warmup()
 
     binding = physx_sdk.create_tensor_binding(
         pattern="/World/Cube*",
@@ -551,7 +560,7 @@ def test_read_after_destroy_raises_with_cache(physx_sdk):
     """After warming the cache and then destroying, read() must still raise."""
     load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
     physx_sdk.wait_all()
-    physx_sdk.warmup_gpu()
+    physx_sdk.warmup()
 
     binding = physx_sdk.create_tensor_binding(
         pattern="/World/Cube*",
@@ -570,7 +579,7 @@ def test_read_cache_cleared_on_destroy(physx_sdk):
     """destroy() must clear _read_cache and _write_cache."""
     load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
     physx_sdk.wait_all()
-    physx_sdk.warmup_gpu()
+    physx_sdk.warmup()
 
     binding = physx_sdk.create_tensor_binding(
         pattern="/World/Cube*",
@@ -589,7 +598,7 @@ def test_write_cache_populated(physx_sdk):
     """After a simple write(), _write_cache should be populated."""
     load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
     physx_sdk.wait_all()
-    physx_sdk.warmup_gpu()
+    physx_sdk.warmup()
 
     binding = physx_sdk.create_tensor_binding(
         pattern="/World/Cube*",
@@ -609,7 +618,7 @@ def test_write_with_indices_no_cache(physx_sdk):
     """write() with indices should NOT populate _write_cache."""
     load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
     physx_sdk.wait_all()
-    physx_sdk.warmup_gpu()
+    physx_sdk.warmup()
 
     binding = physx_sdk.create_tensor_binding(
         pattern="/World/Cube*",
@@ -628,7 +637,7 @@ def test_write_with_mask_no_cache(physx_sdk):
     """write() with mask should NOT populate _write_cache."""
     load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
     physx_sdk.wait_all()
-    physx_sdk.warmup_gpu()
+    physx_sdk.warmup()
 
     binding = physx_sdk.create_tensor_binding(
         pattern="/World/Cube*",
@@ -672,7 +681,7 @@ def test_read_repeated_same_buffer(physx_sdk):
     """Multiple reads into the same buffer should all succeed and use the cache."""
     load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
     physx_sdk.wait_all()
-    physx_sdk.warmup_gpu()
+    physx_sdk.warmup()
 
     binding = physx_sdk.create_tensor_binding(
         pattern="/World/Cube*",
@@ -692,7 +701,7 @@ def test_write_repeated_same_buffer(physx_sdk):
     """Multiple simple writes from the same buffer should all succeed and use the cache."""
     load_usd_with_ovstage(physx_sdk, data_path("boxes_falling_on_groundplane.usda"))
     physx_sdk.wait_all()
-    physx_sdk.warmup_gpu()
+    physx_sdk.warmup()
 
     binding = physx_sdk.create_tensor_binding(
         pattern="/World/Cube*",

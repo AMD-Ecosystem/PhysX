@@ -1,11 +1,34 @@
 // SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-// clang-format off
-#include <UsdPCH.h>
-// clang-format on
+/**
+ * @implements REQ-TENSOR-VIEW-001
+ * @covers AC-7 AC-11 AC-12 AC-15 AC-17
+ *
+ * @implements REQ-READ-CORE-001
+ * @covers AC-8
+ *
+ * @implements REQ-INPUT-CORE-001
+ * @covers AC-10
+ *
+ * @implements REQ-TENSOR-CPU-ONLY-001
+ * @covers AC-4 AC-6
+ *
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-40
+ *
+ * @implements REQ-INPUT-COVERAGE-001
+ * @covers AC-6 AC-16
+ *
+ * @implements REQ-READ-CONTACT-001
+ * @covers AC-9
+ */
 
 #include "tensors/gpu/GpuSimulationView.h"
+
+#include "tensors/gpu/GpuPointInstancerView.h"
+
+#include "tensors/base/SupersetRigidEntries.h"
 
 #include "tensors/gpu/CudaKernels.h"
 
@@ -13,7 +36,8 @@
 
 #include <PxPhysicsAPI.h>
 
-using namespace PXR_NS;
+#include <utility>
+
 using namespace physx;
 
 namespace omni
@@ -23,17 +47,63 @@ namespace physx
 namespace tensors
 {
 
-GpuSimulationView::GpuSimulationView(UsdStageRefPtr stage, GpuSimulationDataPtr gpuSimData)
-    : BaseSimulationView(stage), mGpuSimData(gpuSimData)
+namespace
+{
+
+// A simulation view keeps the data it was created with, which does not describe an articulation inserted after it: a
+// view over one would ask PhysX for more articulation blocks than the data's buffers hold. Refused at creation, naming
+// the first such articulation.
+bool refuseUndescribedArticulation(const GpuSimulationData& data, PxArticulationReducedCoordinate* arti,
+                                   const std::string& path, const char* view)
+{
+    if (!arti || data.describesArticulation(*arti))
+        return false;
+    CARB_LOG_ERROR("Failed to create %s: the articulation of '%s' was added after this simulation view was created. "
+                   "Create a new simulation view and create the view from it.",
+                   view, path.c_str());
+    return true;
+}
+
+bool hasUndescribedArticulation(const GpuSimulationData& data, const std::vector<ArticulationEntry>& entries)
+{
+    for (const ArticulationEntry& e : entries)
+        if (refuseUndescribedArticulation(data, e.arti, e.path, "articulation view"))
+            return true;
+    return false;
+}
+
+bool hasUndescribedArticulation(const GpuSimulationData& data, const std::vector<RigidBodyEntry>& entries)
+{
+    for (const RigidBodyEntry& e : entries)
+        if (e.type == RigidBodyType::eArticulationLink && e.body &&
+            refuseUndescribedArticulation(data, &static_cast<PxArticulationLink*>(e.body)->getArticulation(), e.path,
+                                          "rigid body view"))
+            return true;
+    return false;
+}
+
+} // namespace
+
+GpuSimulationView::GpuSimulationView(usdparser::AttachedStage* attachedStage,
+                                     PxScene* scene,
+                                     GpuSimulationDataPtr gpuSimData)
+    : BaseSimulationView(attachedStage, scene), mGpuSimData(gpuSimData)
 {
     if (mGpuSimData)
     {
         mDevice = mGpuSimData->mDevice;
+        mSelectionRdDisableEpoch = mGpuSimData->mRdDisableEpoch;
     }
 }
 
 GpuSimulationView::~GpuSimulationView()
 {
+}
+
+bool GpuSimulationView::isSelectionCurrent() const
+{
+    return BaseSimulationView::isSelectionCurrent() && mGpuSimData &&
+        mSelectionRdDisableEpoch == mGpuSimData->mRdDisableEpoch;
 }
 
 
@@ -65,6 +135,8 @@ GpuArticulationView* GpuSimulationView::createArticulationView(const std::vector
         }
         return nullptr;
     }
+    if (hasUndescribedArticulation(*mGpuSimData, entries))
+        return nullptr;
     GpuArticulationView* aview = new GpuArticulationView(this, entries, mDevice);
     mArtiViews.push_back(aview);
     return aview;
@@ -80,26 +152,113 @@ GpuRigidBodyView* GpuSimulationView::createRigidBodyView(const std::vector<std::
     CHECK_VALID_DATA_SIM_RETURN(mGpuSimData, this, nullptr);
     if (!mGpuSimData)
     {
-        CARB_LOG_ERROR("Failed to create articulation view: GPU data not initialized");
+        CARB_LOG_ERROR("Failed to create rigid body view: GPU data not initialized");
         return nullptr;
     }
     std::vector<RigidBodyEntry> entries;
     processRigidBodyEntries(patterns, entries);
+
+    // OMPE-103213 / REQ-TENSOR-CPU-ONLY-001 AC-6: DirectGPU has no row for
+    // eDISABLE_SIMULATION rigid dynamics. Omit them at create so a wildcard
+    // pattern that also matches disabled actors still yields a valid view over
+    // the enabled set. Re-enable is out-of-band; recreate after enable to
+    // include the body again. CPU createRigidBodyView does not filter.
+    {
+        std::vector<RigidBodyEntry> enabled;
+        enabled.reserve(entries.size());
+        for (const RigidBodyEntry& entry : entries)
+        {
+            if (entry.type == RigidBodyType::eRigidDynamic && entry.body &&
+                entry.body->getActorFlags().isSet(PxActorFlag::eDISABLE_SIMULATION))
+            {
+                continue;
+            }
+            enabled.push_back(entry);
+        }
+        entries.swap(enabled);
+    }
+
     if (entries.empty())
     {
         if (isNoMatchLoggingQuiet())
         {
-            CARB_LOG_INFO("Provided pattern list did not match any rigid bodies\n");
+            CARB_LOG_INFO("Provided pattern list did not match any enabled rigid bodies\n");
         }
         else
         {
-            CARB_LOG_ERROR("Provided pattern list did not match any rigid bodies\n");
+            CARB_LOG_ERROR("Provided pattern list did not match any enabled rigid bodies\n");
         }
         return nullptr;
     }
+    if (hasUndescribedArticulation(*mGpuSimData, entries))
+        return nullptr;
     GpuRigidBodyView* rbview = new GpuRigidBodyView(this, entries, mDevice);
     mRbViews.push_back(rbview);
     return rbview;
+}
+
+GpuArticulationView* GpuSimulationView::createArticulationViewFromEntries(const std::vector<ArticulationEntry>& entries)
+{
+    CHECK_VALID_DATA_SIM_RETURN(mGpuSimData, this, nullptr);
+    if (!mGpuSimData)
+    {
+        CARB_LOG_ERROR("Failed to create articulation view from entries: GPU data not initialized");
+        return nullptr;
+    }
+    if (entries.empty() || hasUndescribedArticulation(*mGpuSimData, entries))
+    {
+        return nullptr;
+    }
+    GpuArticulationView* aview = new GpuArticulationView(this, entries, mDevice);
+    mArtiViews.push_back(aview);
+    return aview;
+}
+
+GpuRigidBodyView* GpuSimulationView::createRigidBodyViewFromEntries(const std::vector<RigidBodyEntry>& entries)
+{
+    CHECK_VALID_DATA_SIM_RETURN(mGpuSimData, this, nullptr);
+    if (!mGpuSimData)
+    {
+        CARB_LOG_ERROR("Failed to create rigid body view from entries: GPU data not initialized");
+        return nullptr;
+    }
+    if (entries.empty() || hasUndescribedArticulation(*mGpuSimData, entries))
+    {
+        return nullptr;
+    }
+
+    // Unlike a fixed-membership tensor view, the ovstage superset retains disabled bodies as
+    // sentinel records. Its actor-to-row map stays stable across disable/re-enable; the ovstage
+    // gather exposes only enabled rows, while query discovery still reports every matching prim.
+    // This is what lets unrelated rows and a later disableSimulation=0 write keep working.
+    GpuRigidBodyView* rbview = new GpuRigidBodyView(this, entries, mDevice, /*invalidateOnDisabledRd=*/false);
+    mRbViews.push_back(rbview);
+    return rbview;
+}
+
+GpuPointInstancerView* GpuSimulationView::createPointInstancerViewFromEntries(
+    const std::vector<PointInstancerEntry>& entries)
+{
+    CHECK_VALID_DATA_SIM_RETURN(mGpuSimData, this, nullptr);
+    if (!mGpuSimData)
+    {
+        CARB_LOG_ERROR("Failed to create point instancer view from entries: GPU data not initialized");
+        return nullptr;
+    }
+    if (entries.empty())
+        return nullptr;
+
+    GpuPointInstancerView* view = new GpuPointInstancerView(this, entries);
+    // Unusable means this view no longer describes the scene (an instance with no superset row) or
+    // never got its device memory; either way the caller must rebuild rather than read holes.
+    // Checked in the factory so an unusable view never escapes it.
+    if (!view->isUsable())
+    {
+        view->release();
+        return nullptr;
+    }
+    mPointInstancerViews.push_back(view);
+    return view;
 }
 
 GpuVolumeDeformableBodyView* GpuSimulationView::createVolumeDeformableBodyView(const char* pattern)
@@ -118,6 +277,12 @@ GpuVolumeDeformableBodyView* GpuSimulationView::createVolumeDeformableBodyView(c
         return nullptr;
     }
     GpuVolumeDeformableBodyView* view = new GpuVolumeDeformableBodyView(this, entries, mDevice);
+    // Checked here, as for the point-instancer view, so a view missing its device buffers never escapes.
+    if (!view->isUsable())
+    {
+        view->release();
+        return nullptr;
+    }
     mVolumeDeformableBodyViews.push_back(view);
     return view;
 }
@@ -138,6 +303,11 @@ GpuSurfaceDeformableBodyView* GpuSimulationView::createSurfaceDeformableBodyView
         return nullptr;
     }
     GpuSurfaceDeformableBodyView* view = new GpuSurfaceDeformableBodyView(this, entries, mDevice);
+    if (!view->isUsable())
+    {
+        view->release();
+        return nullptr;
+    }
     mSurfaceDeformableBodyViews.push_back(view);
     return view;
 }
@@ -218,7 +388,18 @@ GpuRigidContactView* GpuSimulationView::createRigidContactView(const std::vector
         CARB_LOG_ERROR("Provided patterns for sensor and filters did not match any rigid contact entries\n");
         return nullptr;
     }
-    GpuRigidContactView* rcview = new GpuRigidContactView(this, entries, filterPatternSize, maxContactDataCount, mDevice);
+    GpuRigidContactView* rcview =
+        new GpuRigidContactView(this, std::move(entries), filterPatternSize, maxContactDataCount, mDevice);
+    mRcViews.push_back(rcview);
+    return rcview;
+}
+
+GpuRigidContactView* GpuSimulationView::createRigidContactViewFromEntries(
+    std::vector<RigidContactSensorEntry>&& entries, uint32_t numFilters, uint32_t maxContactDataCount)
+{
+    CHECK_VALID_DATA_SIM_RETURN(mGpuSimData, this, nullptr); // returns nullptr if mGpuSimData is null
+    GpuRigidContactView* rcview =
+        new GpuRigidContactView(this, std::move(entries), numFilters, maxContactDataCount, mDevice);
     mRcViews.push_back(rcview);
     return rcview;
 }
@@ -265,17 +446,116 @@ bool GpuSimulationView::flush()
 }
 
 
-void GpuSimulationView::updateArticulationsKinematic()
+bool gpuRefreshArticulationsKinematic(PxScene* scene)
 {
-    CHECK_VALID_DATA_SIM_NO_RETURN(mGpuSimData, this);
+    // Same DirectGPU call as the member below, but straight off the scene -- no view, no GpuSimulationData.
+    // computeArticulationData returns false when the DirectGPU API is uninitialized or the call is
+    // forbidden, and on a synchronous CUDA error; propagate that so the caller does not consume stale
+    // link transforms after an apparently successful refresh.
+    PhysxCudaContextGuard ctxGuard(scene->getCudaContextManager());
+    return scene->getDirectGPUAPI().computeArticulationData(
+        NULL, NULL, PxArticulationGPUAPIComputeType::eUPDATE_KINEMATIC, 0);
+}
+
+bool GpuSimulationView::updateArticulationsKinematic()
+{
+    CHECK_VALID_DATA_SIM_RETURN(mGpuSimData, this, false);
     PhysxCudaContextGuard ctxGuard(mGpuSimData->mCudaContextManager);
-    mGpuSimData->mScene->getDirectGPUAPI().computeArticulationData(NULL, NULL, PxArticulationGPUAPIComputeType::eUPDATE_KINEMATIC, 0);
+    return mGpuSimData->mScene->getDirectGPUAPI().computeArticulationData(
+        NULL, NULL, PxArticulationGPUAPIComputeType::eUPDATE_KINEMATIC, 0);
 }
 
 void GpuSimulationView::enableGpuUsageWarnings(bool enable)
 {
     CHECK_VALID_DATA_SIM_NO_RETURN(mGpuSimData, this);
     mGpuSimData->enableGpuUsageWarnings(enable);
+}
+
+
+GpuRigidBodyView* GpuSimulationView::supersetRigidView(
+    const std::unordered_map<const PxRigidBody*, PxU32>** outRowMap)
+{
+    if (outRowMap)
+        *outRowMap = nullptr;
+
+    if (!mSupersetRigidView)
+    {
+        std::vector<RigidBodyEntry> entries;
+        collectSupersetRigidEntries(mScene, mAttachedStage, entries);
+        if (entries.empty())
+            return nullptr;
+
+        GpuRigidBodyView* rbv = createRigidBodyViewFromEntries(entries);
+        // Actors the simulation data does not know: it does not describe this scene, so the caller
+        // must have the backend rebuild rather than read sentinel rows. Released here because it is
+        // this view's child and would otherwise outlive the failure.
+        if (!rbv || rbv->hasUnresolvedEntries())
+        {
+            if (rbv)
+                rbv->release();
+            return nullptr;
+        }
+
+        // collectSupersetRigidEntries walked the whole scene, so this view is the one that may
+        // retire the scene-wide disable hint when its refresh finds every body enabled again.
+        rbv->markAsSceneSuperset();
+
+        mSupersetRigidView = rbv;
+        mSupersetRigidRowMap.clear();
+        mSupersetRigidRowMap.reserve(entries.size());
+        for (PxU32 row = 0; row < entries.size(); ++row)
+            mSupersetRigidRowMap.emplace(entries[row].body, row);
+    }
+
+    if (outRowMap)
+        *outRowMap = &mSupersetRigidRowMap;
+    return mSupersetRigidView;
+}
+
+GpuArticulationView* GpuSimulationView::supersetArticulationView(
+    const std::unordered_map<const PxArticulationReducedCoordinate*, PxU32>** outRowMap,
+    const std::vector<ArticulationEntry>** outEntries)
+{
+    if (outRowMap)
+        *outRowMap = nullptr;
+    if (outEntries)
+        *outEntries = nullptr;
+
+    if (!mSupersetArtiView)
+    {
+        const PxU32 numArtis = mScene->getNbArticulations();
+        if (numArtis == 0)
+            return nullptr;
+        std::vector<PxArticulationReducedCoordinate*> artis(numArtis);
+        mScene->getArticulations(artis.data(), numArtis);
+
+        std::vector<ArticulationEntry> entries;
+        entries.reserve(numArtis);
+        for (PxArticulationReducedCoordinate* arti : artis)
+        {
+            ArticulationEntry e;
+            if (!arti || !buildArticulationEntry(arti, omni::physics::parse::ObjectKey{}, e))
+                return nullptr;
+            entries.push_back(std::move(e));
+        }
+
+        GpuArticulationView* av = createArticulationViewFromEntries(entries);
+        if (!av)
+            return nullptr;
+
+        mSupersetArtiView = av;
+        mSupersetArtiEntries = std::move(entries);
+        mSupersetArtiRowMap.clear();
+        mSupersetArtiRowMap.reserve(artis.size());
+        for (PxU32 row = 0; row < artis.size(); ++row)
+            mSupersetArtiRowMap.emplace(artis[row], row);
+    }
+
+    if (outRowMap)
+        *outRowMap = &mSupersetArtiRowMap;
+    if (outEntries)
+        *outEntries = &mSupersetArtiEntries;
+    return mSupersetArtiView;
 }
 
 }

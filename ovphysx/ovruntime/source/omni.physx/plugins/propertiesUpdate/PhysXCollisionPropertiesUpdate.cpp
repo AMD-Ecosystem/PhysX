@@ -1,10 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+/**
+ * @implements REQ-PARSE-CORE-003
+ * @covers AC-2
+ *
+ * @implements REQ-PROPS-COL-001
+ * @covers AC-1 AC-2
+ */
 
 #include "PhysXPropertiesUpdate.h"
-#include "../usdLoad/NewtonCompat.h"
+
+#include <omni/physics/parse/KnownTokens.h>
 
 #include <PhysXTools.h>
 #include <Setup.h>
@@ -17,17 +24,15 @@
 
 using namespace ::physx;
 using namespace carb;
-using namespace PXR_NS;
 using namespace omni::physx;
 using namespace omni::physx::usdparser;
 using namespace omni::physx::internal;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 // shape
-bool omni::physx::updateShapeEnabled(AttachedStage& attachedStage, ObjectId objectId, const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+bool omni::physx::updateShapeEnabled(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -35,13 +40,13 @@ bool omni::physx::updateShapeEnabled(AttachedStage& attachedStage, ObjectId obje
         return true;
 
 
-    auto setCollisionsEnabledForShape = [&omniPhysX](PxShape* shape, bool enabled) {
+    auto setCollisionsEnabledForShape = [&attachedStage](PxShape* shape, bool enabled) {
         if (!shape)
             return;
 
         shape->setFlag(PxShapeFlag::eSIMULATION_SHAPE, enabled);
         shape->setFlag(PxShapeFlag::eSCENE_QUERY_SHAPE, enabled);
-        if (enabled && omniPhysX.isDebugVisualizationEnabled()) {
+        if (enabled && attachedStage.isDebugVisualizationEnabled()) {
             shape->setFlag(PxShapeFlag::eVISUALIZATION, true);
         } else {
             shape->setFlag(PxShapeFlag::eVISUALIZATION, false);
@@ -83,10 +88,9 @@ bool omni::physx::updateShapeEnabled(AttachedStage& attachedStage, ObjectId obje
 }
 
 
-bool omni::physx::updateShapeDensity(AttachedStage& attachedStage, ObjectId objectId, const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+bool omni::physx::updateShapeDensity(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -107,10 +111,9 @@ bool omni::physx::updateShapeDensity(AttachedStage& attachedStage, ObjectId obje
 
 // physx shape
 bool omni::physx::updateShapeContactOffset(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId,
-    const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+    omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -158,10 +161,9 @@ bool omni::physx::updateShapeContactOffset(AttachedStage& attachedStage, omni::p
     return true;
 }
 
-bool omni::physx::updateShapeRestOffset(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+bool omni::physx::updateShapeRestOffset(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -209,6 +211,36 @@ bool omni::physx::updateShapeRestOffset(AttachedStage& attachedStage, omni::phys
     return true;
 }
 
+// Did the user actually author one of the PhysxCollisionAPI offsets, as opposed to
+// inheriting the schema fallback?
+//
+// The schema default for physxCollision:contactOffset / :restOffset is NEGATIVE inf,
+// an "unset" sentinel, so the resolved value answers this on its own. This used to ask
+// hasAuthoredAttribute, which a resolved-value backend answers `true` for everything it
+// publishes (ADR-0020) — so on ovstage the Newton fallbacks below saw PhysX as always
+// authored and silently never fired. Reading the sentinel works identically on both
+// backends: ovstage publishes the raw -inf here (measured), USD resolves the same
+// schema fallback.
+//
+// Sign matters: v < -kFiniteLimitSentinel (-inf or -FLT_MAX) is "unset". A positive inf
+// is an explicitly authored sentinel and stays authored. Threshold, not exact -inf,
+// to match ParseCollision.cpp's load-time treatment -- the same 0.5e38f value as
+// ParseMimicJoint.cpp's kFiniteLimitSentinel, NativeWalker.cpp/OvstageWalker.cpp's
+// kJointSentinelLimit, and PhysXScenePropertiesUpdate.cpp's gravityMagnitude check,
+// each a separate local copy (different modules, no shared header).
+//
+// Declared in PhysXPropertiesUpdate.h; the deformable handlers use it too.
+bool omni::physx::isPhysxOffsetAuthored(const AttachedStage& attachedStage,
+                                        const omni::physics::parse::ObjectKey& key,
+                                        omni::physics::parse::TokenId attr)
+{
+    float v;
+    if (!getValue<float>(attachedStage, key, attr, omni::physics::parse::ReadTime::defaultTime(), v))
+        return false;
+    constexpr float kFiniteLimitSentinel = 0.5e38f;
+    return !(v < -kFiniteLimitSentinel);
+}
+
 // Read the current effective rest offset from a PxShape / PhysXCompoundShape record.
 // Returns true if a value was retrieved.
 static bool getCurrentRestOffset(const InternalDatabase::Record* objectRecord,
@@ -240,31 +272,33 @@ static bool getCurrentRestOffset(const InternalDatabase::Record* objectRecord,
 // at runtime — otherwise PxShape can reject the new rest because the stale contact
 // offset is no longer greater than it.
 bool omni::physx::updateNewtonShapeContactMargin(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId,
-    const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+    omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const internal::InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
     if (!objectRecord)
         return true;
 
-    // PhysX wins: skip when physxCollision:restOffset is authored. Authored-value
-    // and Newton-fallback reads go through the source (hasAuthoredAttribute +
-    // getValue) rather than reaching into USD via the prim.
+    // PhysX wins: skip when physxCollision:restOffset is authored. Authored-ness comes
+    // from the schema's -inf "unset" sentinel in the resolved value (isPhysxOffsetAuthored),
+    // not from hasAuthoredAttribute — see that helper for why.
     const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
     const omni::physics::parse::ObjectKey key = objectRecord->mKey;
     if (!src || !src->exists(key))
         return true;
-    if (src->hasAuthoredAttribute(key, src->internToken(PhysxSchemaTokens.Get()->physxCollisionRestOffset.GetString())))
+    omni::physics::parse::KnownTokens tok;
+    tok.intern(*src);
+    if (isPhysxOffsetAuthored(attachedStage, key, tok.physxCollisionRestOffset))
         return true;
 
     // Is the contact offset also fallback-driven? If so we need to keep it = margin + gap.
     const bool physxContactAuthored =
-        src->hasAuthoredAttribute(key, src->internToken(PhysxSchemaTokens.Get()->physxCollisionContactOffset.GetString()));
+        isPhysxOffsetAuthored(attachedStage, key, tok.physxCollisionContactOffset);
     float gap = 0.0f;
     const bool hasGapFallback = !physxContactAuthored
-        && src->hasAuthoredAttribute(key, src->internToken(NewtonSchemaTokens->newtonContactGap.GetString()))
-        && getValue<float>(attachedStage, key, NewtonSchemaTokens->newtonContactGap, PXR_NS::UsdTimeCode(), gap)
+        && src->hasAuthoredAttribute(key, tok.newtonContactGap)
+        && getValue<float>(attachedStage, key, tok.newtonContactGap, omni::physics::parse::ReadTime::defaultTime(), gap)
         && isfinite(gap) && gap >= 0.0f;
     if (!hasGapFallback)
     {
@@ -317,20 +351,23 @@ bool omni::physx::updateNewtonShapeContactMargin(AttachedStage& attachedStage, o
 // Newton fallback: newton:contactGap -> physxCollision:contactOffset, where
 // contactOffset = restOffset + gap (Newton's gap is additive on top of the margin).
 bool omni::physx::updateNewtonShapeContactGap(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId,
-    const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+    omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const internal::InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
     if (!objectRecord)
         return true;
 
-    // PhysX wins: skip when physxCollision:contactOffset is authored.
+    // PhysX wins: skip when physxCollision:contactOffset is authored. Authored-ness comes
+    // from the schema's -inf "unset" sentinel in the resolved value (isPhysxOffsetAuthored),
+    // not from hasAuthoredAttribute — see that helper for why.
     const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
     if (!src || !src->exists(objectRecord->mKey))
         return true;
-    if (src->hasAuthoredAttribute(objectRecord->mKey,
-                                  src->internToken(PhysxSchemaTokens.Get()->physxCollisionContactOffset.GetString())))
+    omni::physics::parse::KnownTokens tok;
+    tok.intern(*src);
+    if (isPhysxOffsetAuthored(attachedStage, objectRecord->mKey, tok.physxCollisionContactOffset))
         return true;
 
     float gap;
@@ -370,10 +407,9 @@ bool omni::physx::updateNewtonShapeContactGap(AttachedStage& attachedStage, omni
 }
 
 bool omni::physx::updateShapeTorsionalPatchRadius(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId,
-    const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+    omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -405,10 +441,9 @@ bool omni::physx::updateShapeTorsionalPatchRadius(AttachedStage& attachedStage, 
 }
 
 bool omni::physx::updateShapeMinTorsionalPatchRadius(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId,
-    const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+    omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -441,10 +476,9 @@ bool omni::physx::updateShapeMinTorsionalPatchRadius(AttachedStage& attachedStag
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 // material
-bool omni::physx::updateMaterialDynamicFriction(AttachedStage& attachedStage, ObjectId objectId, const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+bool omni::physx::updateMaterialDynamicFriction(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -464,10 +498,9 @@ bool omni::physx::updateMaterialDynamicFriction(AttachedStage& attachedStage, Ob
     return true;
 }
 
-bool omni::physx::updateMaterialStaticFriction(AttachedStage& attachedStage, ObjectId objectId, const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+bool omni::physx::updateMaterialStaticFriction(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -490,10 +523,9 @@ bool omni::physx::updateMaterialStaticFriction(AttachedStage& attachedStage, Obj
     return true;
 }
 
-bool omni::physx::updateMaterialRestitution(AttachedStage& attachedStage, ObjectId objectId, const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+bool omni::physx::updateMaterialRestitution(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);

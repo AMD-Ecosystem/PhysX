@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
-// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PxgPBDParticleSystemCore.h"
 #include "PxgParticleSystem.h"
@@ -51,6 +28,7 @@
 #include "CmRandom.h"
 
 #include "cudamanager/PxCudaContext.h"
+#include "PxgCudaHelpers.h"
 
 #define PS_GPU_DEBUG 0
 #define PS_GPU_SPARSE_GRID_DEBUG 0
@@ -195,8 +173,15 @@ namespace physx
 		mMaxNumParticles(maxNumParticles),
 		mFlatListStartIndex(0),
 		mUniqueId(uniqueIdIndexer++)
+#if PX_SUPPORT_OMNI_PVD
+		, mOmniPvdPositionCapacity(0), mOmniPvdVelocityCapacity(0), mOmniPvdPhaseCapacity(0), mOmniPvdPhasesChanged(true)
+#endif
 	{
 		PX_ASSERT(maxNumParticles > 0);
+
+		// OMPE-93952: keep the context manager alive for the buffers below. Released in the destructor.
+		mContextManager.acquireReference();
+
 		mPositionInvMassesD = PX_DEVICE_MEMORY_ALLOC(PxVec4, contextManager, maxNumParticles);
 		mVelocitiesD = PX_DEVICE_MEMORY_ALLOC(PxVec4, contextManager, maxNumParticles);
 		mPhasesD = PX_DEVICE_MEMORY_ALLOC(PxU32, contextManager, maxNumParticles);
@@ -212,6 +197,9 @@ namespace physx
 		PX_PINNED_MEMORY_FREE(mContextManager, mPositionInvMassesH);
 		PX_PINNED_MEMORY_FREE(mContextManager, mVelocitiesH);
 		PX_PINNED_MEMORY_FREE(mContextManager, mPhasesH);
+
+		// release the reference taken in the constructor.
+		mContextManager.release();
 	}
 
 	template<class BufferClass>
@@ -226,46 +214,78 @@ namespace physx
 		mNumActiveParticles = numActiveParticles;
 	}
 
-	template<class BufferClass>
-	void PxgParticleBufferBase<BufferClass>::allocHostBuffers()
+#if PX_SUPPORT_OMNI_PVD
+	template<typename T>
+	static bool readOmniPvdParticleArray(PxCudaContextManager& manager, T*& host, PxU32& capacity,
+		const T* device, PxU32 count, PxU32 bound, PxU64& transferredBytes)
 	{
-		PX_ASSERT(mMaxNumParticles > 0);
-		if (!mPositionInvMassesH)
+		if (count > bound || capacity > bound) return false;
+		if (!count) return true;
+		if (count > capacity)
 		{
-			PX_ASSERT(!mVelocitiesH && !mPhasesH);
-			mPositionInvMassesH = PX_PINNED_MEMORY_ALLOC_FLAGS(PxVec4, mContextManager, mMaxNumParticles, CU_MEMHOSTALLOC_PORTABLE);
-			mVelocitiesH = PX_PINNED_MEMORY_ALLOC_FLAGS(PxVec4, mContextManager, mMaxNumParticles, CU_MEMHOSTALLOC_PORTABLE);
-			mPhasesH = PX_PINNED_MEMORY_ALLOC_FLAGS(PxU32, mContextManager, mMaxNumParticles, CU_MEMHOSTALLOC_PORTABLE);
+			const PxU32 grownCapacity = PxMax(count, capacity + PxMin(capacity, bound - capacity));
+			T* grown = PX_PINNED_MEMORY_ALLOC_FLAGS(T, manager, grownCapacity, CU_MEMHOSTALLOC_PORTABLE);
+			if (!grown) return false;
+			PX_PINNED_MEMORY_FREE(manager, host);
+			host = grown;
+			capacity = grownCapacity;
 		}
-
-		bool allocOk = (mPositionInvMassesH != NULL && mVelocitiesH != NULL && mPhasesH != NULL);
-
-		if(!allocOk)
-		{
-			mContextManager.getCudaContext()->setAbortMode(true);
-			PxGetFoundation().error(PxErrorCode::eOUT_OF_MEMORY, PX_FL, "PxgParticleBufferBase: failed to allocate pinned host buffers");
-		}
+		if (!host || !device) return false;
+		const PxU64 bytes = PxU64(count) * sizeof(T);
+		if (manager.getCudaContext()->memcpyDtoHAsync(host, reinterpret_cast<CUdeviceptr>(device), bytes, 0) != CUDA_SUCCESS)
+			return false;
+		transferredBytes += bytes;
+		return true;
 	}
 
 	template<class BufferClass>
-	void PxgParticleBufferBase<BufferClass>::copyToHost(CUstream stream)
+	bool PxgParticleBufferBase<BufferClass>::enqueueOmniPvdData(PxU32 flags, PxU64& transferredBytes)
 	{
-		if(mPositionInvMassesH)
-		{
-			mContextManager.copyDToHAsync<PxVec4>(mPositionInvMassesH, mPositionInvMassesD, mNumActiveParticles, stream);
-		}
+		transferredBytes = 0;
+		if ((flags & ~(PxsParticleBuffer::ePOSITION | PxsParticleBuffer::eVELOCITY | PxsParticleBuffer::ePHASE))
+			|| mNumActiveParticles > mMaxNumParticles) return false;
+		if (!flags) return true;
+		if ((flags & PxsParticleBuffer::ePOSITION) && !readOmniPvdParticleArray(mContextManager,
+			mPositionInvMassesH, mOmniPvdPositionCapacity, mPositionInvMassesD, mNumActiveParticles, mMaxNumParticles, transferredBytes)) return false;
+		if ((flags & PxsParticleBuffer::eVELOCITY) && !readOmniPvdParticleArray(mContextManager,
+			mVelocitiesH, mOmniPvdVelocityCapacity, mVelocitiesD, mNumActiveParticles, mMaxNumParticles, transferredBytes)) return false;
+		if ((flags & PxsParticleBuffer::ePHASE) && !readOmniPvdParticleArray(mContextManager,
+			mPhasesH, mOmniPvdPhaseCapacity, mPhasesD, mNumActiveParticles, mMaxNumParticles, transferredBytes)) return false;
+		return true;
 	}
+
+	// Finish queued copies even after a failure before any mirror can be read or freed.
+	static bool finishOmniPvdRead(PxCudaContextManager& manager, bool ok, PxU64 transferredBytes)
+	{
+		const bool synced = !transferredBytes || manager.getCudaContext()->streamSynchronize(0) == CUDA_SUCCESS;
+		return ok && synced;
+	}
+
+	template<class BufferClass>
+	bool PxgParticleBufferBase<BufferClass>::readOmniPvdData(PxU32 flags, PxU64& transferredBytes)
+	{
+		PxScopedCudaLock lock(mContextManager);
+		const bool ok = enqueueOmniPvdData(flags, transferredBytes);
+		return finishOmniPvdRead(mContextManager, ok, transferredBytes);
+	}
+
+	template<class BufferClass>
+	void PxgParticleBufferBase<BufferClass>::trimOmniPvdData(PxU32 flags)
+	{
+		if (!(flags & PxsParticleBuffer::ePOSITION))
+		{ PX_PINNED_MEMORY_FREE(mContextManager, mPositionInvMassesH); mPositionInvMassesH = NULL; mOmniPvdPositionCapacity = 0; }
+		if (!(flags & PxsParticleBuffer::eVELOCITY))
+		{ PX_PINNED_MEMORY_FREE(mContextManager, mVelocitiesH); mVelocitiesH = NULL; mOmniPvdVelocityCapacity = 0; }
+		if (!(flags & PxsParticleBuffer::ePHASE))
+		{ PX_PINNED_MEMORY_FREE(mContextManager, mPhasesH); mPhasesH = NULL; mOmniPvdPhaseCapacity = 0; }
+	}
+#endif
 
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////
 	
 	PxgParticleBuffer::PxgParticleBuffer(PxU32 maxNumParticles, PxCudaContextManager& contextManager) :
 		PxgParticleBufferBase<PxsParticleBuffer>(maxNumParticles, contextManager)
 	{}
-
-	void PxgParticleBuffer::copyToHost(CUstream stream)
-	{
-		PxgParticleBufferBase<PxsParticleBuffer>::copyToHost(stream);
-	}
 
 	/////////////////////////////////////////////////////////////////////////////////////////////////////////
 	
@@ -277,6 +297,10 @@ namespace physx
 		mMaxNumDiffuseParticles(0),
 		mMaxActiveDiffuseParticles(0),
 		mNumActiveDiffuseParticlesH(NULL)
+#if PX_SUPPORT_OMNI_PVD
+		, mOmniPvdDiffusePositions(NULL), mOmniPvdDiffuseVelocities(NULL),
+		mOmniPvdDiffusePositionCapacity(0), mOmniPvdDiffuseVelocityCapacity(0), mOmniPvdDiffuseCount(0)
+#endif
 	{
 		mContextManager.acquireContext();
 		PxCudaContext* cudaContext = mContextManager.getCudaContext();
@@ -311,7 +335,51 @@ namespace physx
 		PX_DEVICE_MEMORY_FREE(mContextManager, mDiffuseVelocitiesD);
 		PX_DEVICE_MEMORY_FREE(mContextManager, mNumDiffuseParticlesD);
 		PX_PINNED_MEMORY_FREE(mContextManager, mNumActiveDiffuseParticlesH);
+#if PX_SUPPORT_OMNI_PVD
+		PX_PINNED_MEMORY_FREE(mContextManager, mOmniPvdDiffusePositions);
+		PX_PINNED_MEMORY_FREE(mContextManager, mOmniPvdDiffuseVelocities);
+#endif
 	}
+
+#if PX_SUPPORT_OMNI_PVD
+	bool PxgParticleAndDiffuseBuffer::readOmniPvdData(PxU32 flags, PxU64& transferredBytes)
+	{
+		PxScopedCudaLock lock(mContextManager);
+		mOmniPvdDiffuseCount = 0;
+		const PxU32 diffuseFlags = PxsParticleBuffer::eDIFFUSE_POSITION | PxsParticleBuffer::eDIFFUSE_VELOCITY;
+		bool ok = enqueueOmniPvdData(flags & ~diffuseFlags, transferredBytes);
+		PxU32 count = 0;
+		if (ok && (flags & diffuseFlags))
+		{
+			// ps_diffuseParticleCopy writes this mapped count: read it once.
+			const volatile PxI32* mapped = mNumActiveDiffuseParticlesH;
+			const PxI32 active = mapped ? *mapped : 0;
+			ok = active >= 0 && PxU32(active) <= mMaxNumDiffuseParticles && PxU32(active) <= PX_MAX_U32 / sizeof(PxVec4);
+			if (ok)
+			{
+				count = PxU32(active);
+				ok = (!(flags & PxsParticleBuffer::eDIFFUSE_POSITION) || readOmniPvdParticleArray(mContextManager,
+					mOmniPvdDiffusePositions, mOmniPvdDiffusePositionCapacity, mDiffusePositionsLifeTimeD, count, mMaxNumDiffuseParticles, transferredBytes)) &&
+					(!(flags & PxsParticleBuffer::eDIFFUSE_VELOCITY) || readOmniPvdParticleArray(mContextManager,
+					mOmniPvdDiffuseVelocities, mOmniPvdDiffuseVelocityCapacity, mDiffuseVelocitiesD, count, mMaxNumDiffuseParticles, transferredBytes));
+			}
+		}
+		ok = finishOmniPvdRead(mContextManager, ok, transferredBytes);
+		if (ok) mOmniPvdDiffuseCount = count;
+		return ok;
+	}
+
+	void PxgParticleAndDiffuseBuffer::trimOmniPvdData(PxU32 flags)
+	{
+		PxgParticleBufferBase<PxsParticleAndDiffuseBuffer>::trimOmniPvdData(flags);
+		if (!(flags & PxsParticleBuffer::eDIFFUSE_POSITION))
+		{ PX_PINNED_MEMORY_FREE(mContextManager, mOmniPvdDiffusePositions); mOmniPvdDiffusePositions = NULL; mOmniPvdDiffusePositionCapacity = 0; }
+		if (!(flags & PxsParticleBuffer::eDIFFUSE_VELOCITY))
+		{ PX_PINNED_MEMORY_FREE(mContextManager, mOmniPvdDiffuseVelocities); mOmniPvdDiffuseVelocities = NULL; mOmniPvdDiffuseVelocityCapacity = 0; }
+		if (!(flags & (PxsParticleBuffer::eDIFFUSE_POSITION | PxsParticleBuffer::eDIFFUSE_VELOCITY)))
+			mOmniPvdDiffuseCount = 0;
+	}
+#endif
 
 	void PxgParticleAndDiffuseBuffer::setMaxActiveDiffuseParticles(PxU32 maxActiveDiffuseParticles)
 	{
@@ -324,11 +392,6 @@ namespace physx
 	{
 		mParams = params;
 		mBufferFlags |= PxParticleBufferFlag::eUPDATE_DIFFUSE_PARAM;
-	}
-
-	void PxgParticleAndDiffuseBuffer::copyToHost(CUstream stream)
-	{
-		PxgParticleBufferBase<PxsParticleAndDiffuseBuffer>::copyToHost(stream);
 	}
 
 	////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -349,19 +412,23 @@ namespace physx
 		mTempBlockCellsHistogramBuf(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
 		mTempHistogramCountBuf(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
 		mTempBoundsBuf(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
-		mPrimitiveContactsBuf(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
-		mPrimitiveContactCountBuf(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
-		mPrimitiveContactSortedByParticleBuf(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
-		mPrimitiveContactSortedByRigidBuf(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
-		mRigidContactBlocksSortedByParticle(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
-		mRigidContactBlocksSortedByRigid(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
-		mPrimitiveConstraintAppliedParticleForces(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
-		mPrimitiveConstraintAppliedRigidForces(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mContactSortedByRigidBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleContactInfoBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleContactNormalPenBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleContactCountBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleContactInfoSortedByParticleBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleContactNormalPenSortedByParticleBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleContactInfoSortedByRigidBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleContactNormalPenSortedByRigidBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleContactBlocksSortedByParticle(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleContactBlocksSortedByRigid(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleAppliedParticleForcesBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleAppliedRigidForcesBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
 		mDeltaVelParticleBuf(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
 		mDeltaVelRigidBuf(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
 		mTempBlockDeltaVelBuf(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
 		mTempBlockRigidIdBuf(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
-		mParticleRigidRefCount(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
+		mRigidParticleRefCountBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSHARED_PARTICLES),
 		mFinalizeStartEvent(NULL),
 		mBoundUpdateEvent(NULL),
 		mSolveParticleEvent(NULL),
@@ -402,21 +469,26 @@ namespace physx
 		mTempBlockCellsHistogramBuf.allocate(PxgParticleSystemKernelGridDim::BOUNDCELLUPDATE * sizeof(PxU32), PX_FL);
 		mTempHistogramCountBuf.allocate(sizeof(PxU32), PX_FL);
 
-		const PxU32 contactBufSize = mMaxContacts * sizeof(PxgParticlePrimitiveContact);
-		const PxU32 constraintBufSize = ((mMaxContacts+31)/32) * sizeof(PxgParticleRigidContactBlock);
+		const PxU32 contactInfoBufSize = mMaxContacts * sizeof(PxgDeformablePairInfo);
+		const PxU32 contactNormalPenBufSize = mMaxContacts * sizeof(float4);
+		const PxU32 constraintBufSize = ((mMaxContacts+31)/32) * sizeof(PxgRigidParticleContactBlock);
 		const PxU32 appliedForceSize = mMaxContacts * sizeof(float2);
 
-		mPrimitiveContactsBuf.allocate(contactBufSize, PX_FL);
-		mPrimitiveContactCountBuf.allocate(sizeof(PxU32), PX_FL);
+		mContactSortedByRigidBuffer.allocateElements(mMaxContacts, PX_FL);
+		mRigidParticleContactInfoBuffer.allocate(contactInfoBufSize, PX_FL);
+		mRigidParticleContactNormalPenBuffer.allocate(contactNormalPenBufSize, PX_FL);
+		mRigidParticleContactCountBuffer.allocate(sizeof(PxU32), PX_FL);
 
-		mPrimitiveContactSortedByParticleBuf.allocate(contactBufSize, PX_FL);
-		mPrimitiveContactSortedByRigidBuf.allocate(contactBufSize, PX_FL);
+		mRigidParticleContactInfoSortedByParticleBuffer.allocate(contactInfoBufSize, PX_FL);
+		mRigidParticleContactNormalPenSortedByParticleBuffer.allocate(contactNormalPenBufSize, PX_FL);
+		mRigidParticleContactInfoSortedByRigidBuffer.allocate(contactInfoBufSize, PX_FL);
+		mRigidParticleContactNormalPenSortedByRigidBuffer.allocate(contactNormalPenBufSize, PX_FL);
 
-		mRigidContactBlocksSortedByParticle.allocate(constraintBufSize, PX_FL);
-		mRigidContactBlocksSortedByRigid.allocate(constraintBufSize, PX_FL);
+		mRigidParticleContactBlocksSortedByParticle.allocate(constraintBufSize, PX_FL);
+		mRigidParticleContactBlocksSortedByRigid.allocate(constraintBufSize, PX_FL);
 
-		mPrimitiveConstraintAppliedParticleForces.allocate(appliedForceSize, PX_FL);
-		mPrimitiveConstraintAppliedRigidForces.allocate(appliedForceSize, PX_FL);
+		mRigidParticleAppliedParticleForcesBuffer.allocate(appliedForceSize, PX_FL);
+		mRigidParticleAppliedRigidForcesBuffer.allocate(appliedForceSize, PX_FL);
 
 		mDeltaVelParticleBuf.allocate(mMaxContacts *sizeof(float4), PX_FL);
 		mDeltaVelRigidBuf.allocate(mMaxContacts *sizeof(float4)*2, PX_FL);
@@ -903,7 +975,7 @@ namespace physx
 
 	void PxgParticleSystemCore::resetContactCounts()
 	{
-		CUdeviceptr totalContactCountsd = getParticleContactCount().getDevicePtr();
+		CUdeviceptr totalContactCountsd = getRigidParticleContactCount().getDevicePtr();
 		mCudaContext->memsetD32Async(totalContactCountsd, 0, 1, mStream);
 
 		mHostContactCount.get() = 0;
@@ -913,7 +985,7 @@ namespace physx
 	void PxgParticleSystemCore::sortContacts(const PxU32 nbActiveParticleSystems)
 	{
 	
-		CUdeviceptr  totalContactCountsd = mPrimitiveContactCountBuf.getDevicePtr();
+		CUdeviceptr  totalContactCountsd = mRigidParticleContactCountBuffer.getDevicePtr();
 
 		// copy contacts to host for overflow checking.
 		mCudaContext->memcpyDtoHAsync(mHostContactCount.data(), totalContactCountsd, sizeof(PxU32), mStream);
@@ -940,21 +1012,21 @@ namespace physx
 
 		{
 			//sort particle-primitives contact based on rigid body index(lower 32 bit of the node index, which get fill in contact gen)
-			CUdeviceptr inputKeyd = mTempContactByRigidBitBuf.getDevicePtr();
-			CUdeviceptr inputRankd = mContactRemapSortedByRigidBuf.getDevicePtr();
+			CUdeviceptr inputKeyd = mTempContactByRigidBitBuffer.getDevicePtr();
+			CUdeviceptr inputRankd = mContactRemapSortedByRigidBuffer.getDevicePtr();
 
-			CUdeviceptr outputKeyd = mTempContactBuf.getDevicePtr();
-			CUdeviceptr outputRankd = mTempContactRemapBuf.getDevicePtr();
+			CUdeviceptr outputKeyd = mTempContactBuffer.getDevicePtr();
+			CUdeviceptr outputRankd = mTempContactRemapBuffer.getDevicePtr();
 
 			updateGPURadixSortBlockDesc(mStream, inputKeyd, inputRankd, outputKeyd, outputRankd, mRadixCountTotalBuf.getDevicePtr(), 
 				totalContactCountsd, &mRSDesc[2 * nbActiveParticleSystems], mRadixSortDescBuf[0].getDevicePtr(), mRadixSortDescBuf[1].getDevicePtr());
 
 			//sort particle-primitives contact based on particle index(lower 32 bit is the particle index, which get fill in contact gen)
-			CUdeviceptr inputKeyd2 = mTempContactByParticleBitBuf.getDevicePtr();
-			CUdeviceptr inputRankd2 = mContactRemapSortedByParticleBuf.getDevicePtr();
+			CUdeviceptr inputKeyd2 = mTempContactByParticleBitBuffer.getDevicePtr();
+			CUdeviceptr inputRankd2 = mContactRemapSortedByParticleBuffer.getDevicePtr();
 			//reuse the temp buffer
-			CUdeviceptr outputKeyd2 = mTempContactBuf2.getDevicePtr();
-			CUdeviceptr outputRankd2 = mTempContactRemapBuf2.getDevicePtr();
+			CUdeviceptr outputKeyd2 = mTempContactBuffer2.getDevicePtr();
+			CUdeviceptr outputRankd2 = mTempContactRemapBuffer2.getDevicePtr();
 
 			updateGPURadixSortBlockDesc(mStream, inputKeyd2, inputRankd2, outputKeyd2, outputRankd2, mRadixCountTotalBuf.getDevicePtr() + mRadixCountSize,
 				totalContactCountsd, &mRSDesc[2 * nbActiveParticleSystems + 2], mRadixSortDescBuf[0].getDevicePtr() + sizeof(PxgRadixSortBlockDesc),
@@ -1003,16 +1075,16 @@ namespace physx
 #endif
 			}
 
-			CUdeviceptr contactByRigidd = mContactByRigidBuf.getDevicePtr();
-			CUdeviceptr contactByParticled = mContactSortedByParticleBuf.getDevicePtr();
+			CUdeviceptr contactByRigidd = mContactByRigidBuffer.getDevicePtr();
+			CUdeviceptr contactByParticled = mContactByParticleBuffer.getDevicePtr();
 			{
 				//copy the higher 32 bit to the temp contact rigid index buffer
-				CUdeviceptr tempContactByRigidd = mTempContactByRigidBitBuf.getDevicePtr();
-				CUdeviceptr rankd = mContactRemapSortedByRigidBuf.getDevicePtr();
+				CUdeviceptr tempContactByRigidd = mTempContactByRigidBitBuffer.getDevicePtr();
+				CUdeviceptr rankd = mContactRemapSortedByRigidBuffer.getDevicePtr();
 
 				//copy the higher 32 bit to the temp contact particle buffer
-				CUdeviceptr tempContactByParticled = mTempContactByParticleBitBuf.getDevicePtr();
-				CUdeviceptr rankParticled = mContactRemapSortedByParticleBuf.getDevicePtr();
+				CUdeviceptr tempContactByParticled = mTempContactByParticleBitBuffer.getDevicePtr();
+				CUdeviceptr rankParticled = mContactRemapSortedByParticleBuffer.getDevicePtr();
 
 				CUfunction copyFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::RS_DOUBLE_COPY_HIGH_32BITS2);
 
@@ -1069,12 +1141,12 @@ namespace physx
 			}
 
 			{
-				//copy the original rigidId to the sorted buffer based on mContactRemapSortedByRigidBuf
-				CUdeviceptr outContactByRigidd = mContactSortedByRigidBuf.getDevicePtr();
-				CUdeviceptr rankd = mContactRemapSortedByRigidBuf.getDevicePtr();
+				//copy the original rigidId to the sorted buffer based on mContactRemapSortedByRigidBuffer
+				CUdeviceptr outContactByRigidd = mContactSortedByRigidBuffer.getDevicePtr();
+				CUdeviceptr rankd = mContactRemapSortedByRigidBuffer.getDevicePtr();
 
-				CUdeviceptr outContactByParticled = mContactSortedByParticleBuf.getDevicePtr();
-				CUdeviceptr rankParticled = mContactRemapSortedByParticleBuf.getDevicePtr();
+				CUdeviceptr outContactByParticled = mContactByParticleBuffer.getDevicePtr();
+				CUdeviceptr rankParticled = mContactRemapSortedByParticleBuffer.getDevicePtr();
 
 				CUfunction copyFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::RS_DOUBLE_COPY_VALUE);
 
@@ -1102,25 +1174,31 @@ namespace physx
 		}
 
 		{
-			//create sorted contacts based on mContactRemapSortedByRigidBuf and mContactRemapSortedByParticleBuf
-			CUdeviceptr remapByRigidd = mContactRemapSortedByRigidBuf.getDevicePtr();
-			CUdeviceptr remapByParticled = mContactRemapSortedByParticleBuf.getDevicePtr();
+			//create sorted contacts based on mContactRemapSortedByRigidBuffer and mContactRemapSortedByParticleBuffer
+			CUdeviceptr remapByRigidd = mContactRemapSortedByRigidBuffer.getDevicePtr();
+			CUdeviceptr remapByParticled = mContactRemapSortedByParticleBuffer.getDevicePtr();
 
-			CUdeviceptr sortedContactsByRigidd = mPrimitiveContactSortedByRigidBuf.getDevicePtr();
-			CUdeviceptr sortedContactsByParticled = mPrimitiveContactSortedByParticleBuf.getDevicePtr();
-			
-			CUdeviceptr contactsd = mPrimitiveContactsBuf.getDevicePtr();
+			CUdeviceptr sortedInfosByRigidd = mRigidParticleContactInfoSortedByRigidBuffer.getDevicePtr();
+			CUdeviceptr sortedNormalPensByRigidd = mRigidParticleContactNormalPenSortedByRigidBuffer.getDevicePtr();
+			CUdeviceptr sortedInfosByParticled = mRigidParticleContactInfoSortedByParticleBuffer.getDevicePtr();
+			CUdeviceptr sortedNormalPensByParticled = mRigidParticleContactNormalPenSortedByParticleBuffer.getDevicePtr();
+
+			CUdeviceptr contactInfosd = mRigidParticleContactInfoBuffer.getDevicePtr();
+			CUdeviceptr contactNormalPensd = mRigidParticleContactNormalPenBuffer.getDevicePtr();
 
 			CUfunction reorderContactsFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::PS_REORDER_PRIMITIVE_CONTACTS);
 
 			PxCudaKernelParam kernelParams[] =
 			{
-				PX_CUDA_KERNEL_PARAM(contactsd),
+				PX_CUDA_KERNEL_PARAM(contactInfosd),
+				PX_CUDA_KERNEL_PARAM(contactNormalPensd),
 				PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 				PX_CUDA_KERNEL_PARAM(remapByRigidd),
 				PX_CUDA_KERNEL_PARAM(remapByParticled),
-				PX_CUDA_KERNEL_PARAM(sortedContactsByRigidd),
-				PX_CUDA_KERNEL_PARAM(sortedContactsByParticled)
+				PX_CUDA_KERNEL_PARAM(sortedInfosByRigidd),
+				PX_CUDA_KERNEL_PARAM(sortedNormalPensByRigidd),
+				PX_CUDA_KERNEL_PARAM(sortedInfosByParticled),
+				PX_CUDA_KERNEL_PARAM(sortedNormalPensByParticled)
 			};
 
 			CUresult  resultR = mCudaContext->launchKernel(reorderContactsFunction, PxgParticleSystemKernelGridDim::BOUNDCELLUPDATE, 1, 1, PxgParticleSystemKernelBlockDim::BOUNDCELLUPDATE, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
@@ -1132,27 +1210,6 @@ namespace physx
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU sortParticles fail!!\n");
 
-			//PxU32 numContacts;
-			//mCudaContext->memcpyDtoH(&numContacts, totalContactCountsd, sizeof(PxU32));
-			//
-
-			/*PxArray<PxgParticlePrimitiveContact> originalContacts;
-			originalContacts.reserve(numContacts);
-			originalContacts.forceSize_Unsafe(numContacts);
-			mCudaContext->memcpyDtoH(originalContacts.begin(), contactsd, sizeof(PxgParticlePrimitiveContact) * numContacts);
-
-			PxArray<PxgParticlePrimitiveContact> rigidContacts;
-			rigidContacts.reserve(numContacts);
-			rigidContacts.forceSize_Unsafe(numContacts);
-			mCudaContext->memcpyDtoH(rigidContacts.begin(), sortedContactsByRigidd, sizeof(PxgParticlePrimitiveContact) * numContacts);
-
-			PxArray<PxgParticlePrimitiveContact> particleContacts;
-			particleContacts.reserve(numContacts);
-			particleContacts.forceSize_Unsafe(numContacts);
-			mCudaContext->memcpyDtoH(particleContacts.begin(), sortedContactsByParticled, sizeof(PxgParticlePrimitiveContact) * numContacts);
-
-			int bob = 0;
-			PX_UNUSED(bob);*/
 #endif
 		}
 
@@ -1242,7 +1299,7 @@ namespace physx
 	}
 
 	void PxgParticleSystemCore::updateSortedVelocity(CUdeviceptr particleSystemsd, CUdeviceptr activeParticleSystemsd,
-		const PxU32 nbActiveParticleSystems, const PxReal dt, const bool skipNewPositionAdjustment)
+		const PxU32 nbActiveParticleSystems, const PxReal dt, const bool isVelocityIteration)
 	{
 
 		if (nbActiveParticleSystems == 0)
@@ -1267,7 +1324,7 @@ namespace physx
 				PX_CUDA_KERNEL_PARAM(particleSystemsd),
 				PX_CUDA_KERNEL_PARAM(activeParticleSystemsd),
 				PX_CUDA_KERNEL_PARAM(invDt),
-				PX_CUDA_KERNEL_PARAM(skipNewPositionAdjustment)
+				PX_CUDA_KERNEL_PARAM(isVelocityIteration)
 			};
 
 			{
@@ -1293,13 +1350,14 @@ namespace physx
 		
 		CUdeviceptr particleSystemd = getParticleSystemBuffer().getDevicePtr();
 
-		CUdeviceptr totalContactCountsd = getParticleContactCount().getDevicePtr();
+		CUdeviceptr totalContactCountsd = getRigidParticleContactCount().getDevicePtr();
 
 		//prepare primitive constraints sorted by rigid id
 		{
-			CUdeviceptr contactsd = mPrimitiveContactSortedByRigidBuf.getDevicePtr();
-			CUdeviceptr contactBlocksd = mRigidContactBlocksSortedByRigid.getDevicePtr();
-			CUdeviceptr appliedForced = mPrimitiveConstraintAppliedRigidForces.getDevicePtr();
+			CUdeviceptr contactInfosd = mRigidParticleContactInfoSortedByRigidBuffer.getDevicePtr();
+			CUdeviceptr contactNormalPensd = mRigidParticleContactNormalPenSortedByRigidBuffer.getDevicePtr();
+			CUdeviceptr contactBlocksd = mRigidParticleContactBlocksSortedByRigid.getDevicePtr();
+			CUdeviceptr appliedForced = mRigidParticleAppliedRigidForcesBuffer.getDevicePtr();
 
 			CUdeviceptr deltaVBuff = mDeltaVelRigidBuf.getDevicePtr();
 
@@ -1308,7 +1366,8 @@ namespace physx
 			PxCudaKernelParam kernelParams[] =
 			{
 				PX_CUDA_KERNEL_PARAM(particleSystemd),
-				PX_CUDA_KERNEL_PARAM(contactsd),
+				PX_CUDA_KERNEL_PARAM(contactInfosd),
+				PX_CUDA_KERNEL_PARAM(contactNormalPensd),
 				PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 				PX_CUDA_KERNEL_PARAM(contactBlocksd),
 				PX_CUDA_KERNEL_PARAM(prePrepDescd),
@@ -1333,12 +1392,12 @@ namespace physx
 		}
 
 		{
-			CUdeviceptr contactsd = mPrimitiveContactSortedByParticleBuf.getDevicePtr();
+			CUdeviceptr contactInfosd = mRigidParticleContactInfoSortedByParticleBuffer.getDevicePtr();
 			CUdeviceptr blockOffsetd = mTempBlockCellsHistogramBuf.getDevicePtr();
 			CUdeviceptr offsetd = mTempCellsHistogramBuf.getDevicePtr();
 			CUdeviceptr pairCountd = mTempHistogramCountBuf.getDevicePtr();
-			CUdeviceptr startd = mTempContactBuf.getDevicePtr();
-			CUdeviceptr	endd = mTempContactRemapBuf.getDevicePtr();
+			CUdeviceptr startd = mTempContactBuffer.getDevicePtr();
+			CUdeviceptr	endd = mTempContactRemapBuffer.getDevicePtr();
 
 			//compute blockOffset and offset array for particle
 			{
@@ -1347,7 +1406,7 @@ namespace physx
 				PxCudaKernelParam kernelParams[] =
 				{
 					PX_CUDA_KERNEL_PARAM(particleSystemd),
-					PX_CUDA_KERNEL_PARAM(contactsd),
+					PX_CUDA_KERNEL_PARAM(contactInfosd),
 					PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 					PX_CUDA_KERNEL_PARAM(blockOffsetd),
 					PX_CUDA_KERNEL_PARAM(offsetd),
@@ -1388,7 +1447,7 @@ namespace physx
 
 				PxCudaKernelParam kernelParams[] =
 				{
-					PX_CUDA_KERNEL_PARAM(contactsd),
+					PX_CUDA_KERNEL_PARAM(contactInfosd),
 					PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 					PX_CUDA_KERNEL_PARAM(blockOffsetd),
 					PX_CUDA_KERNEL_PARAM(offsetd),
@@ -1623,13 +1682,13 @@ namespace physx
 
 	void PxgParticleSystemCore::solvePrimitiveCollisionForParticles(CUdeviceptr prePrepDescd, CUdeviceptr solverCoreDescd,
 		CUdeviceptr artiCoreDescd, const PxReal dt, bool isTGS,
-		bool isVelIteration)
+		bool isVelocityIteration)
 	{
 		//solve particle-primitive collision
 		
 		CUdeviceptr particleSystemd = getParticleSystemBuffer().getDevicePtr();
 
-		CUdeviceptr totalContactCountsd = getParticleContactCount().getDevicePtr();
+		CUdeviceptr totalContactCountsd = getRigidParticleContactCount().getDevicePtr();
 
 		//const PxU32 nbActiveParticleSystems = mSimController->getBodySimManager().mActiveParticleSystems.size();
 
@@ -1639,24 +1698,24 @@ namespace physx
 		// down-weight) in one pass before either PC solve. Runs on mStream; the rigid solve on
 		// solverStream waits for mPreCountParticleRigidEvent (recorded right after) so the refcount is
 		// visible cross-stream. Both streams are fully synchronized just before this function (see
-		// PxgPBDParticleSystemCore::solve / solveTGS).
+		// PxgPBDParticleSystemCore::solve).
 		{
-			// Size like the soft-body/cloth mFemRigidRefCount: per-link articulation bucketing must
+			// Size like the soft-body/cloth mRigidDeformableRefCountBuffer: per-link articulation bucketing must
 			// match getGlobalRigidBodyId or articulation indices overflow.
 			const PxU32 numSolverBodies = mGpuContext->mSolverBodyPool.size();
 			const PxU32 numArticulations = mGpuContext->mArticulationCount;
 			const PxU32 maxLinksPerArti = mSimController->getSimulationCore()->getMaxArticulationLinks();
 			const PxU32 refCountElems = numSolverBodies + numArticulations * maxLinksPerArti;
-			if (mParticleRigidRefCount.getNbElements() != refCountElems)
+			if (mRigidParticleRefCountBuffer.getNbElements() != refCountElems)
 			{
-				mParticleRigidRefCount.allocateElements(refCountElems, PX_FL);
+				mRigidParticleRefCountBuffer.allocateElements(refCountElems, PX_FL);
 			}
 
-			PxgDevicePointer<PxU32> rigidRefCountd = mParticleRigidRefCount.getTypedDevicePtr();
-			mCudaContext->memsetD32Async(rigidRefCountd.mPtr, 0, mParticleRigidRefCount.getNbElements(), mStream);
+			PxgDevicePointer<PxU32> rigidRefCountd = mRigidParticleRefCountBuffer.getTypedDevicePtr();
+			mCudaContext->memsetD32Async(rigidRefCountd.mPtr, 0, mRigidParticleRefCountBuffer.getNbElements(), mStream);
 
-			CUdeviceptr contactsd = mPrimitiveContactSortedByParticleBuf.getDevicePtr();
-			CUdeviceptr contactBlocksd = mRigidContactBlocksSortedByParticle.getDevicePtr();
+			CUdeviceptr contactInfosd = mRigidParticleContactInfoSortedByParticleBuffer.getDevicePtr();
+			CUdeviceptr contactBlocksd = mRigidParticleContactBlocksSortedByParticle.getDevicePtr();
 
 			const CUfunction queryPCRefCountKernelFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::PS_QUERY_PC_REFERENCE_COUNT);
 
@@ -1665,7 +1724,7 @@ namespace physx
 			PxCudaKernelParam kernelParams[] =
 			{
 				PX_CUDA_KERNEL_PARAM(particleSystemd),
-				PX_CUDA_KERNEL_PARAM(contactsd),
+				PX_CUDA_KERNEL_PARAM(contactInfosd),
 				PX_CUDA_KERNEL_PARAM(contactBlocksd),
 				PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 				PX_CUDA_KERNEL_PARAM(prePrepDescd),
@@ -1694,21 +1753,20 @@ namespace physx
 		//Particle-rigid collisions affecting particles, solved on particle stream!
 		{
 
-			CUdeviceptr contactsd = mPrimitiveContactSortedByParticleBuf.getDevicePtr();
-			CUdeviceptr contactBlocksd = mRigidContactBlocksSortedByParticle.getDevicePtr();
-			CUdeviceptr appliedForced = mPrimitiveConstraintAppliedParticleForces.getDevicePtr();
+			CUdeviceptr contactInfosd = mRigidParticleContactInfoSortedByParticleBuffer.getDevicePtr();
+			CUdeviceptr contactBlocksd = mRigidParticleContactBlocksSortedByParticle.getDevicePtr();
+			CUdeviceptr appliedForced = mRigidParticleAppliedParticleForcesBuffer.getDevicePtr();
 			CUdeviceptr deltaVd = mDeltaVelParticleBuf.getDevicePtr();
-			CUdeviceptr rigidRefCountd = mParticleRigidRefCount.getDevicePtr();
+			CUdeviceptr rigidRefCountd = mRigidParticleRefCountBuffer.getDevicePtr();
 			{
-				const CUfunction solvePCParticleKernelFunction = isTGS ? mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::PS_SOLVE_PC_PARTICLE_TGS) :
-					mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::PS_SOLVE_PC_PARTICLE);
+				const CUfunction solvePCParticleKernelFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::PS_SOLVE_PC_PARTICLE);
 
 				float4* solverBodyVelPoold = mGpuContext->getGpuSolverCore()->getSolverBodyVelPoolDevPtr();
 
 				PxCudaKernelParam kernelParams[] =
 				{
 					PX_CUDA_KERNEL_PARAM(particleSystemd),
-					PX_CUDA_KERNEL_PARAM(contactsd),
+					PX_CUDA_KERNEL_PARAM(contactInfosd),
 					PX_CUDA_KERNEL_PARAM(contactBlocksd),
 					PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 					PX_CUDA_KERNEL_PARAM(prePrepDescd),
@@ -1718,7 +1776,8 @@ namespace physx
 					PX_CUDA_KERNEL_PARAM(appliedForced),
 					PX_CUDA_KERNEL_PARAM(rigidRefCountd),
 					PX_CUDA_KERNEL_PARAM(dt),
-					PX_CUDA_KERNEL_PARAM(isVelIteration),
+					PX_CUDA_KERNEL_PARAM(isVelocityIteration),
+					PX_CUDA_KERNEL_PARAM(isTGS),
 					PX_CUDA_KERNEL_PARAM(artiCoreDescd)
 				};
 
@@ -1755,8 +1814,8 @@ namespace physx
 				//CUdeviceptr blockOffsetd = mTempBlockCellsHistogramBuf.getDevicePtr();
 				//CUdeviceptr offsetd = mTempCellsHistogramBuf.getDevicePtr();
 				CUdeviceptr pairCountd = mTempHistogramCountBuf.getDevicePtr();
-				CUdeviceptr startd = mTempContactBuf.getDevicePtr();
-				CUdeviceptr	endd = mTempContactRemapBuf.getDevicePtr();
+				CUdeviceptr startd = mTempContactBuffer.getDevicePtr();
+				CUdeviceptr	endd = mTempContactRemapBuffer.getDevicePtr();
 
 				//accumulate deltaV changes for particle
 				{
@@ -1765,7 +1824,7 @@ namespace physx
 					PxCudaKernelParam kernelParams[] =
 					{
 						PX_CUDA_KERNEL_PARAM(particleSystemd),
-						PX_CUDA_KERNEL_PARAM(contactsd),
+						PX_CUDA_KERNEL_PARAM(contactInfosd),
 						PX_CUDA_KERNEL_PARAM(pairCountd),
 						PX_CUDA_KERNEL_PARAM(startd),
 						PX_CUDA_KERNEL_PARAM(endd),
@@ -1810,25 +1869,24 @@ namespace physx
 	//this will be just called by PBD
 	void PxgParticleSystemCore::solvePrimitiveCollisionForRigids(CUdeviceptr prePrepDescd, CUdeviceptr solverCoreDescd,
 		CUdeviceptr artiCoreDescd, CUstream solverStream, const PxReal dt, bool isTGS,
-		bool isVelIteration)
+		bool isVelocityIteration)
 	{
 		//solve particle-primitive collision
 
 		CUdeviceptr particleSystemd = getParticleSystemBuffer().getDevicePtr();
 
-		CUdeviceptr totalContactCountsd = getParticleContactCount().getDevicePtr();
+		CUdeviceptr totalContactCountsd = getRigidParticleContactCount().getDevicePtr();
 
 		//Particle-rigid particle collisions, affecting rigids, solved on solverStream
 		if (1)
 		{
-			CUdeviceptr contactsd = mPrimitiveContactSortedByRigidBuf.getDevicePtr();
-			CUdeviceptr contactBlocksd = mRigidContactBlocksSortedByRigid.getDevicePtr();
-			CUdeviceptr appliedForced = mPrimitiveConstraintAppliedRigidForces.getDevicePtr();
+			CUdeviceptr contactInfosd = mRigidParticleContactInfoSortedByRigidBuffer.getDevicePtr();
+			CUdeviceptr contactBlocksd = mRigidParticleContactBlocksSortedByRigid.getDevicePtr();
+			CUdeviceptr appliedForced = mRigidParticleAppliedRigidForcesBuffer.getDevicePtr();
 			CUdeviceptr deltaVd = mDeltaVelRigidBuf.getDevicePtr();
-			CUdeviceptr rigidRefCountd = mParticleRigidRefCount.getDevicePtr();
+			CUdeviceptr rigidRefCountd = mRigidParticleRefCountBuffer.getDevicePtr();
 
-			const CUfunction solvePCRigidKernelFunction = isTGS ? mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::PS_SOLVE_PC_RIGID_TGS)
-				: mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::PS_SOLVE_PC_RIGID);
+			const CUfunction solvePCRigidKernelFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::PS_SOLVE_PC_RIGID);
 
 			float4* solverBodyVelPoold = mGpuContext->getGpuSolverCore()->getSolverBodyVelPoolDevPtr();
 
@@ -1840,7 +1898,7 @@ namespace physx
 			PxCudaKernelParam kernelParams[] =
 			{
 				PX_CUDA_KERNEL_PARAM(particleSystemd),
-				PX_CUDA_KERNEL_PARAM(contactsd),
+				PX_CUDA_KERNEL_PARAM(contactInfosd),
 				PX_CUDA_KERNEL_PARAM(contactBlocksd),
 				PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 				PX_CUDA_KERNEL_PARAM(prePrepDescd),
@@ -1850,7 +1908,8 @@ namespace physx
 				PX_CUDA_KERNEL_PARAM(appliedForced),
 				PX_CUDA_KERNEL_PARAM(rigidRefCountd),
 				PX_CUDA_KERNEL_PARAM(dt),
-				PX_CUDA_KERNEL_PARAM(isVelIteration),
+				PX_CUDA_KERNEL_PARAM(isVelocityIteration),
+				PX_CUDA_KERNEL_PARAM(isTGS),
 				PX_CUDA_KERNEL_PARAM(artiCoreDescd)
 			};
 
@@ -1887,7 +1946,7 @@ namespace physx
 
 			
 			accumulateRigidDeltas(prePrepDescd, solverCoreDescd, artiCoreDescd,
-				mContactSortedByRigidBuf.getDevicePtr(), totalContactCountsd, solverStream,
+				mContactSortedByRigidBuffer.getDevicePtr(), totalContactCountsd, solverStream,
 				isTGS);
 		}
 
@@ -1901,10 +1960,11 @@ namespace physx
 	{
 		CUdeviceptr particleSystemd = getParticleSystemBuffer().getDevicePtr();
 
-		CUdeviceptr totalContactCountsd = getParticleContactCount().getDevicePtr();
-		CUdeviceptr contactsd = mPrimitiveContactSortedByParticleBuf.getDevicePtr();
-		CUdeviceptr contactBlocksd = mRigidContactBlocksSortedByParticle.getDevicePtr();
-		CUdeviceptr appliedForced = mPrimitiveConstraintAppliedParticleForces.getDevicePtr();
+		CUdeviceptr totalContactCountsd = getRigidParticleContactCount().getDevicePtr();
+		CUdeviceptr contactInfosd = mRigidParticleContactInfoSortedByParticleBuffer.getDevicePtr();
+		CUdeviceptr contactNormalPensd = mRigidParticleContactNormalPenSortedByParticleBuffer.getDevicePtr();
+		CUdeviceptr contactBlocksd = mRigidParticleContactBlocksSortedByParticle.getDevicePtr();
+		CUdeviceptr appliedForced = mRigidParticleAppliedParticleForcesBuffer.getDevicePtr();
 		void* nullContactDeltaV = NULL;
 
 		//prepare primitive constraints sorted by particle id
@@ -1914,7 +1974,8 @@ namespace physx
 			PxCudaKernelParam kernelParams[] =
 			{
 				PX_CUDA_KERNEL_PARAM(particleSystemd),
-				PX_CUDA_KERNEL_PARAM(contactsd),
+				PX_CUDA_KERNEL_PARAM(contactInfosd),
+				PX_CUDA_KERNEL_PARAM(contactNormalPensd),
 				PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 				PX_CUDA_KERNEL_PARAM(contactBlocksd),
 				PX_CUDA_KERNEL_PARAM(prePrepDescd),
@@ -2043,34 +2104,6 @@ namespace physx
 			if (result != CUDA_SUCCESS)
 				PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "GPU ps_updateBufferLaunch kernel fail!\n");
 #endif
-		}
-	}
-
-	void PxgParticleSystemCore::copyUserBufferDataToHost(PxgParticleSystem* particleSystems, PxU32* activeParticleSystems, PxU32 nbActiveParticleSystems)
-	{
-		const PxU32* particleSystemNodeIndex = mParticleSystemNodeIndexPool.begin();
-		void** bodySimsLL = mSimController->getBodySimManager().mBodies.begin();
-
-		for (PxU32 i = 0; i < nbActiveParticleSystems; ++i)
-		{
-			const PxU32 index = activeParticleSystems[i];
-			PxgParticleSystem& particleSystem = particleSystems[index];
-			Dy::ParticleSystem* dyParticleSystem = reinterpret_cast<Dy::ParticleSystem*>(bodySimsLL[particleSystemNodeIndex[index]]);
-			Dy::ParticleSystemCore& dyParticleSystemCore = dyParticleSystem->getCore();
-
-			if ((dyParticleSystem->mFlag & Dy::ParticleSystemFlag::eENABLE_GPU_DATA_SYNC) && (particleSystem.mCommonData.mNumParticles > 0))
-			{
-				for (PxU32 b = 0; b < dyParticleSystemCore.mParticleBuffers.size(); ++b)
-				{
-					PxgParticleBuffer* particleBuffer = static_cast<PxgParticleBuffer*>(dyParticleSystemCore.mParticleBuffers[b]);
-					particleBuffer->copyToHost(mFinalizeStream);
-				}
-				for (PxU32 b = 0; b < dyParticleSystemCore.mParticleDiffuseBuffers.size(); ++b)
-				{
-					PxgParticleAndDiffuseBuffer* particleDiffuseBuffer = static_cast<PxgParticleAndDiffuseBuffer*>(dyParticleSystemCore.mParticleDiffuseBuffers[b]);
-					particleDiffuseBuffer->copyToHost(mFinalizeStream);
-				}
-			}
 		}
 	}
 

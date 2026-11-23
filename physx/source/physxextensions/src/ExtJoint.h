@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef EXT_JOINT_H
 #define EXT_JOINT_H
@@ -48,7 +25,9 @@
 	#include "PxPvdClient.h"
 #endif
 
-#include "omnipvd/ExtOmniPvdSetData.h"
+#if PX_SUPPORT_OMNI_PVD
+	#include "omnipvd/ExtOmniPvdSetData.h"
+#endif
 
 namespace physx
 {
@@ -66,6 +45,71 @@ namespace Ext
 		return 4.0f * PxAtan2(swingYZ, 1.0f + swingW);	// tan (t/2) = sin(t)/(1+cos t), so this is the quarter angle
 	}
 
+#if PX_SUPPORT_OMNI_PVD
+	PX_FORCE_INLINE PxConstraintOmniPvdState omniPvdCpuJointState(const PxJoint& joint)
+	{
+		PxConstraintOmniPvdState state;
+		PxRigidActor* actors[2]; joint.getActors(actors[0], actors[1]);
+		for (PxU32 i = 0; i < 2; ++i)
+		{
+			const PxRigidActor* actor = actors[i];
+			const PxRigidBody* body = actor ? actor->is<PxRigidBody>() : NULL;
+			const PxScene* scene = actor ? actor->getScene() : NULL;
+			if (body && scene && (scene->getFlags() & PxSceneFlag::eENABLE_DIRECT_GPU_API)) continue;
+			if (actor) state.actorGlobalPose[i] = actor->getGlobalPose();
+			if (body)
+			{
+				state.actorLinearVelocity[i] = body->getLinearVelocity();
+				state.actorAngularVelocity[i] = body->getAngularVelocity();
+			}
+			state.actorPoseValid[i] = state.actorVelocityValid[i] = true;
+		}
+		return state;
+	}
+
+	PX_FORCE_INLINE bool omniPvdJointPoseValid(const PxConstraintOmniPvdState& state)
+	{
+		return state.actorPoseValid[0] && state.actorPoseValid[1];
+	}
+
+	PX_FORCE_INLINE bool omniPvdJointVelocityValid(const PxConstraintOmniPvdState& state)
+	{
+		return omniPvdJointPoseValid(state) && state.actorVelocityValid[0] && state.actorVelocityValid[1];
+	}
+
+	PX_FORCE_INLINE PxTransform omniPvdRelativeTransform(const PxJoint& joint, const PxConstraintOmniPvdState& state)
+	{
+		const PxTransform firstFrame = state.actorGlobalPose[0] * joint.getLocalPose(PxJointActorIndex::eACTOR0);
+		const PxTransform actor1Frame = state.actorGlobalPose[1] * joint.getLocalPose(PxJointActorIndex::eACTOR1);
+		return firstFrame.transformInv(actor1Frame);
+	}
+
+	PX_FORCE_INLINE PxVec3 omniPvdRelativeVelocity(const PxJoint& joint, const PxConstraintOmniPvdState& state, bool angular)
+	{
+		PxRigidActor* actors[2]; joint.getActors(actors[0], actors[1]);
+		PxVec3 linear[2] = { state.actorLinearVelocity[0], state.actorLinearVelocity[1] };
+		if (!angular)
+			for (PxU32 i = 0; i < 2; ++i)
+			{
+				const PxRigidBody* body = actors[i] ? actors[i]->is<PxRigidBody>() : NULL;
+				const PxVec3 com = body ? body->getCMassLocalPose().p : PxVec3(0.0f);
+				const PxVec3 offset = joint.getLocalPose(static_cast<PxJointActorIndex::Enum>(i)).p - com;
+				linear[i] += state.actorAngularVelocity[i].cross(state.actorGlobalPose[i].rotate(offset));
+			}
+		const PxQuat frame = state.actorGlobalPose[0].q * joint.getLocalPose(PxJointActorIndex::eACTOR0).q;
+		return frame.rotateInv(angular ? state.actorAngularVelocity[1] - state.actorAngularVelocity[0] : linear[1] - linear[0]);
+	}
+
+	PX_FORCE_INLINE PxReal omniPvdJointAngle(const PxJoint& joint, const PxConstraintOmniPvdState& state, PxU32 axis)
+	{
+		PxQuat swing, twist;
+		PxSeparateSwingTwist(omniPvdRelativeTransform(joint, state).q, swing, twist);
+		if (axis == 0) return twist.x < 0.0f ? -twist.getAngle() : twist.getAngle();
+		if (swing.w < 0.0f) swing = -swing;
+		return computeSwingAngle(axis == 1 ? swing.y : swing.z, swing.w);
+	}
+#endif
+
 	template<class JointType, class DataType>
 	PX_FORCE_INLINE	JointType* createJointT(PxPhysics& physics, PxRigidActor* actor0, const PxTransform& localFrame0, PxRigidActor* actor1, const PxTransform& localFrame1, const PxConstraintShaderTable& shaders)
 	{
@@ -79,6 +123,9 @@ namespace Ext
 		if (j)
 		{
 			omniPvdInitJoint(*j);
+			// Snapshots and re-entry update measured values after emitting the joint.
+			if (OmniPvdCaptureJoint(*j))
+				j->updateOmniPvdProperties();
 		}
 #endif
 
@@ -211,10 +258,12 @@ namespace Ext
 			mData->c2b[1] = getCom(actor1).transformInv(mLocalPose[1]);
 			mPxConstraint->markDirty();
 
+#if PX_SUPPORT_OMNI_PVD
 			OMNI_PVD_WRITE_SCOPE_BEGIN(pvdWriter, pvdRegData)
 			OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxJoint, actor0, static_cast<PxJoint&>(*this), actor0)
 			OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxJoint, actor1, static_cast<PxJoint&>(*this), actor1)
 			OMNI_PVD_WRITE_SCOPE_END
+#endif
 		}
 
 		// PxJoint
@@ -241,10 +290,12 @@ namespace Ext
 			mData->c2b[actor] = getCom(actor).transformInv(p);
 			mPxConstraint->markDirty();
 
+#if PX_SUPPORT_OMNI_PVD
 			OMNI_PVD_WRITE_SCOPE_BEGIN(pvdWriter, pvdRegData)
 			OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxJoint, actor0LocalPose, static_cast<PxJoint&>(*this), mLocalPose[0])
 			OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxJoint, actor1LocalPose, static_cast<PxJoint&>(*this), mLocalPose[1])
 			OMNI_PVD_WRITE_SCOPE_END
+#endif
 		}
 
 		// PxJoint
@@ -341,10 +392,12 @@ namespace Ext
 			PX_CHECK_AND_RETURN(PxIsFinite(force) && PxIsFinite(torque), "PxJoint::setBreakForce: invalid float");
 			mPxConstraint->setBreakForce(force,torque);
 
+#if PX_SUPPORT_OMNI_PVD
 			OMNI_PVD_WRITE_SCOPE_BEGIN(pvdWriter, pvdRegData)
 			OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxJoint, breakForce, static_cast<PxJoint&>(*this), force)
 			OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxJoint, breakTorque, static_cast<PxJoint&>(*this), torque)
 			OMNI_PVD_WRITE_SCOPE_END
+#endif
 		}
 
 		// PxJoint
@@ -358,7 +411,9 @@ namespace Ext
 		{
 			mPxConstraint->setFlags(flags);
 
+#if PX_SUPPORT_OMNI_PVD
 			OMNI_PVD_SET(OMNI_PVD_CONTEXT_HANDLE, PxJoint, constraintFlags, static_cast<PxJoint&>(*this), flags)
+#endif
 		}
 
 		// PxJoint
@@ -366,7 +421,9 @@ namespace Ext
 		{
 			mPxConstraint->setFlag(flag, value);
 
+#if PX_SUPPORT_OMNI_PVD
 			OMNI_PVD_SET(OMNI_PVD_CONTEXT_HANDLE, PxJoint, constraintFlags, static_cast<PxJoint&>(*this), getConstraintFlags())
+#endif
 		}
 
 		// PxJoint
@@ -382,7 +439,9 @@ namespace Ext
 			mData->invMassScale.linear0 = invMassScale;
 			mPxConstraint->markDirty();
 
+#if PX_SUPPORT_OMNI_PVD
 			OMNI_PVD_SET(OMNI_PVD_CONTEXT_HANDLE, PxJoint, invMassScale0, static_cast<PxJoint&>(*this), invMassScale)
+#endif
 		}
 
 		// PxJoint
@@ -398,7 +457,9 @@ namespace Ext
 			mData->invMassScale.angular0 = invInertiaScale;
 			mPxConstraint->markDirty();
 
+#if PX_SUPPORT_OMNI_PVD
 			OMNI_PVD_SET(OMNI_PVD_CONTEXT_HANDLE, PxJoint, invInertiaScale0, static_cast<PxJoint&>(*this), invInertiaScale)
+#endif
 		}
 
 		// PxJoint
@@ -414,7 +475,9 @@ namespace Ext
 			mData->invMassScale.linear1 = invMassScale;
 			mPxConstraint->markDirty();
 
+#if PX_SUPPORT_OMNI_PVD
 			OMNI_PVD_SET(OMNI_PVD_CONTEXT_HANDLE, PxJoint, invMassScale1, static_cast<PxJoint&>(*this), invMassScale)
+#endif
 		}
 
 		// PxJoint
@@ -430,7 +493,9 @@ namespace Ext
 			mData->invMassScale.angular1 = invInertiaScale;
 			mPxConstraint->markDirty();
 
+#if PX_SUPPORT_OMNI_PVD
 			OMNI_PVD_SET(OMNI_PVD_CONTEXT_HANDLE, PxJoint, invInertiaScale1, static_cast<PxJoint&>(*this), invInertiaScale)
+#endif
 		}
 
 		// PxJoint
@@ -523,7 +588,6 @@ namespace Ext
 		// PxConstraintConnector
 		virtual	void onConstraintRelease()	PX_OVERRIDE
 		{
-			PX_FREE(mData);
 			PX_DELETE_THIS;
 		}
 
@@ -590,7 +654,9 @@ namespace Ext
 			if(Base::getBaseFlags() & PxBaseFlag::eOWNS_MEMORY)
 				PX_FREE(mData);
 
+#if PX_SUPPORT_OMNI_PVD
 			OMNI_PVD_DESTROY(OMNI_PVD_CONTEXT_HANDLE, PxJoint, static_cast<Base&>(*this))
+#endif
 		}
 
 		PX_FORCE_INLINE DataClass& data() const

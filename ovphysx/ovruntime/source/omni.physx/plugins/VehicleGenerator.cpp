@@ -1,7 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+// @implements REQ-OMNIPVD-CAPTURE-001
+// @covers AC-3
+
+// @implements REQ-ATTACH-RESOLVE-001
+// @covers AC-6
+// @implements REQ-PARSE-VEH-DRIVETRAIN-001
+// @covers AC-4
+
+/**
+ * @implements REQ-OMNIPVD-LATE-001
+ * @covers AC-10
+ */
+
 #include "PhysXTools.h"
 #include "VehicleGenerator.h"
 
@@ -13,6 +25,14 @@ namespace omni
 {
 namespace physx
 {
+
+static bool isVehicleCaptured(const ::physx::PxActor& actor)
+{
+    ::physx::PxOmniPvd* omniPvd = OmniPhysX::getInstance().getPhysXSetup().getOmniPvd();
+    return omniPvd && omniPvd->isSampling() &&
+           OmniPhysX::getInstance().getPhysXSetup().isOmniPvdSecondaryDataEnabled() &&
+           omniPvd->isObjectRecorded(actor);
+}
 
 static_assert(::physx::PxVehicleLimits::eMAX_NB_AXLES == ::physx::PxVehicleLimits::eMAX_NB_WHEELS, "");
 // It should be possible to support cases where each wheel is controlled individually and thus
@@ -50,9 +70,11 @@ PxQueryHitType::Enum VehicleQueryFilterCallback::preFilter(
     if (filterData0.word2 && filterData1.word2)
     {
         const PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
-        const CollisionGroupsPairsSet& colGroupsPairsSet = physxSetup.getCollisionGroupFilteredPairs();
 
-        const PhysXScene* scene = physxSetup.getPhysXScene((size_t)actor->getScene()->userData);        
+        const PhysXScene* scene = physxSetup.findPhysXScene(actor->getScene());
+        if (!scene)
+            return PxQueryHitType::eNONE;
+        const CollisionGroupsPairsSet& colGroupsPairsSet = scene->getAttachedStage().getCollisionGroupFilteredPairs();
 
         const Pair<uint32_t> groupPair(filterData0.word2, filterData1.word2);
         CollisionGroupsPairsSet::const_iterator it = colGroupsPairsSet.find(groupPair);
@@ -713,21 +735,22 @@ void PhysXVehicleBase::simulate(const float dt, const ::physx::PxVehicleSimulati
     mComponentSequence.update(dt, context);
 }
 
-void PhysXVehicleBase::createPvdObjectHandles(::physx::PxAllocatorCallback& allocator,
-    const uint32_t maxNbMaterialFrictionEntries)
+void PhysXVehicleBase::createPvdObjectHandles(::physx::PxAllocatorCallback& allocator)
 {
     const uint32_t nbAntiRolls = 0;
     const OmniPvdContextHandle contextHandle = 1;  // hardcoded at the moment like in PhysX. Needs to be fetched from the PhysX scene
                                                    // as soon as PhysX makes proper use of contexts (see OM-83903)
     mPvdObjectHandles = ::physx::PxVehiclePvdObjectCreate(
-        mWheelCapacity, nbAntiRolls, maxNbMaterialFrictionEntries, contextHandle, 
+        mWheelCapacity, nbAntiRolls, mPvdMaxNbMaterialFrictionEntries, contextHandle,
         allocator);
+    resetPvdRegistration();
 }
 
 void PhysXVehicleBase::releasePvdObjectHandles(OmniPvdWriter& pvdWriter, ::physx::PxAllocatorCallback& allocator)
 {
     ::physx::PxVehiclePvdObjectRelease(pvdWriter, allocator,
         *mPvdObjectHandles);
+    mPvdObjectHandles = nullptr;
 }
 
 void PhysXVehicleBase::updateSprungMassProperties(const uint32_t wheelIndex,
@@ -990,10 +1013,9 @@ static TVehicle* createInternal(::physx::PxRigidDynamic& vehicleActor,
             wheelIndexToDataMap, frame, gravityMagnitude);
         vehicle->setComponentSequence();
 
-        if (allocatorForPvd)
+        if (allocatorForPvd && isVehicleCaptured(vehicleActor))
         {
-            vehicle->createPvdObjectHandles(*allocatorForPvd,
-                static_cast<uint32_t>(tireMaterialFrictionTables.size()));
+            vehicle->createPvdObjectHandles(*allocatorForPvd);
         }
 
         return vehicle;
@@ -1114,6 +1136,17 @@ void PhysXActorVehicleBase::setDataValues(const usdparser::VehicleDesc& vehicleD
         vehicleMass, vehicleMassSpaceInertiaTensor, bodyToActor,
         frame, pxPhysics.getTolerancesScale().length, gravityMagnitude);
 
+    mPvdMaxNbMaterialFrictionEntries = 0;
+    for (const ::physx::PxVehiclePhysXMaterialFrictionParams* frictionTable : tireMaterialFrictionTables)
+    {
+        CARB_ASSERT(frictionTable);
+        if (frictionTable)
+        {
+            mPvdMaxNbMaterialFrictionEntries =
+                ::physx::PxMax(mPvdMaxNbMaterialFrictionEntries, frictionTable->nbMaterialFrictions);
+        }
+    }
+
     //---
 
     if (vehicleDesc.queryType == VehicleDesc::eRAYCAST)
@@ -1193,13 +1226,25 @@ void PhysXActorVehicleBase::simulateEnd(const float dt, const ::physx::PxVehicle
     ::physx::PxVehiclePhysXActorEndComponent* actorEndComp = static_cast<::physx::PxVehiclePhysXActorEndComponent*>(this);
     actorEndComp->update(dt, context);
 
-    if (mPvdObjectHandles)
+    if (mPvdObjectHandles && isVehicleCaptured(*mPhysxActor.rigidBody))
     {
-        CARB_ASSERT(static_cast<const ::physx::PxVehiclePhysXSimulationContext&>(context).pvdContext.attributeHandles);
-        CARB_ASSERT(static_cast<const ::physx::PxVehiclePhysXSimulationContext&>(context).pvdContext.writer);
+        const ::physx::PxVehiclePhysXSimulationContext& sourceContext =
+            static_cast<const ::physx::PxVehiclePhysXSimulationContext&>(context);
+        CARB_ASSERT(sourceContext.pvdContext.attributeHandles);
+        CARB_ASSERT(sourceContext.pvdContext.writer);
+
+        PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
+        ::physx::PxOmniPvd::ScopedExclusiveWriter writerScope(physxSetup.getOmniPvd());
+        OmniPvdWriter* writer = writerScope.getWriter();
+        CARB_ASSERT(writer);
+        if (!writer)
+            return;
+
+        ::physx::PxVehiclePhysXSimulationContext guardedContext = sourceContext;
+        guardedContext.pvdContext.writer = writer;
 
         ::physx::PxVehiclePVDComponent* pvdComp = static_cast<::physx::PxVehiclePVDComponent*>(this);
-        pvdComp->update(dt, context);
+        pvdComp->update(dt, guardedContext);
     }
 }
 
@@ -2107,12 +2152,14 @@ void PhysXVehicleEngineDrive::setDataValues(const usdparser::VehicleDesc& vehicl
         mAutobox->mParams.upRatios[neutralGear] = 0.0f;
         mAutobox->mParams.upRatios[gearRatioCountWithoutNeutral] = 0.0f;
 
-        const uint32_t upRatioCount = static_cast<uint32_t>(autoGearboxDesc.upRatios.size());
-        CARB_ASSERT(upRatioCount < (::physx::PxVehicleGearboxParams::eMAX_NB_GEARS - 2));  // reverse, neutral and highest gear is not represented
-                                                                                                     // in USD as the values would not be used
-        for (uint32_t i = 0; i < upRatioCount; i++)
+        // Normalize per vehicle, without changing a shared autobox descriptor. The loader rejects
+        // nonempty arrays that are too short; absent arrays use the schema defaults and extras are ignored.
+        const uint32_t ratioCount = gearRatioCountWithoutNeutral > 1 ? gearRatioCountWithoutNeutral - 2 : 0;
+        CARB_ASSERT(autoGearboxDesc.upRatios.empty() || autoGearboxDesc.upRatios.size() >= ratioCount);
+        for (uint32_t i = 0; i < ratioCount; i++)
         {
-            mAutobox->mParams.upRatios[neutralGear + 1 + i] = autoGearboxDesc.upRatios[i];
+            mAutobox->mParams.upRatios[neutralGear + 1 + i] =
+                i < autoGearboxDesc.upRatios.size() ? autoGearboxDesc.upRatios[i] : 0.65f;
         }
 
         // these should never be used but rather have some well defined value in there
@@ -2120,12 +2167,11 @@ void PhysXVehicleEngineDrive::setDataValues(const usdparser::VehicleDesc& vehicl
         mAutobox->mParams.downRatios[neutralGear] = 0.0f;
         mAutobox->mParams.downRatios[neutralGear + 1] = 0.0f;
 
-        const uint32_t downRatioCount = static_cast<uint32_t>(autoGearboxDesc.downRatios.size());
-        CARB_ASSERT(downRatioCount < (::physx::PxVehicleGearboxParams::eMAX_NB_GEARS - 2));  // reverse, neutral and first is not represented
-                                                                                                       // in USD as the values would not be used
-        for (uint32_t i = 0; i < downRatioCount; i++)
+        CARB_ASSERT(autoGearboxDesc.downRatios.empty() || autoGearboxDesc.downRatios.size() >= ratioCount);
+        for (uint32_t i = 0; i < ratioCount; i++)
         {
-            mAutobox->mParams.downRatios[neutralGear + 2 + i] = autoGearboxDesc.downRatios[i];
+            mAutobox->mParams.downRatios[neutralGear + 2 + i] =
+                i < autoGearboxDesc.downRatios.size() ? autoGearboxDesc.downRatios[i] : 0.5f;
         }
 
         mAutobox->mParams.latency = autoGearboxDesc.latency;

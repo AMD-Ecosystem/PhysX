@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
@@ -11,7 +11,9 @@
 
 #include <vector>
 
-// Scoped profiling, for internal OmniPhysX profiling
+// Scoped profiling, for internal OmniPhysX profiling.
+//
+// Shared sample storage is protected for independent attachment clients.
 class ScopedProfile
 {
 public:
@@ -30,6 +32,7 @@ public:
         {
             const uint64_t endTime = Time::getCurrentCounterValue();
             const float timeInMs = Time::getCounterFrequency().toTensOfNanos(endTime - mStartTime) / (100.0f * 1000.0f);
+            std::lock_guard<carb::tasking::MutexWrapper> lock(omni::physx::OmniPhysX::getInstance().profileMutex);
             omni::physx::OmniPhysX::getInstance().getOmniPhysXProfileStats().push_back({ mProfileZone, timeInMs });
         }
     }
@@ -43,6 +46,7 @@ public:
 #define PHYSICS_CROSS_THREAD_PROFILE_START(zoneName)                                                                   \
     if (omni::physx::OmniPhysX::getInstance().isOmniPhysXProfilingEnabled())                                           \
     {                                                                                                                  \
+        std::lock_guard<carb::tasking::MutexWrapper> lock(omni::physx::OmniPhysX::getInstance().profileMutex); \
         omni::physx::OmniPhysX::getInstance().getOmniPhysXCrossThreadProfileMap()[zoneName] =                          \
             Time::getCurrentCounterValue();                                                                            \
     }
@@ -50,6 +54,7 @@ public:
 #define PHYSICS_CROSS_THREAD_PROFILE_END(zoneName)                                                                     \
     if (omni::physx::OmniPhysX::getInstance().isOmniPhysXProfilingEnabled())                                           \
     {                                                                                                                  \
+        std::lock_guard<carb::tasking::MutexWrapper> lock(omni::physx::OmniPhysX::getInstance().profileMutex); \
         CrossThreadProfileMap::const_iterator fit =                                                                    \
             omni::physx::OmniPhysX::getInstance().getOmniPhysXCrossThreadProfileMap().find(zoneName);                  \
         if (fit != omni::physx::OmniPhysX::getInstance().getOmniPhysXCrossThreadProfileMap().end())                    \

@@ -1,7 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+
+// @implements REQ-ATTACH-VIEWS-001
+// @covers AC-4
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-3 AC-4
+
+/**
+ * @implements REQ-TENSOR-PATH-001
+ * @covers AC-1
+ */
 
 #include "IArticulationMetatype.h"
 #include "TensorDesc.h"
@@ -42,7 +52,6 @@ public:
     virtual bool getDofDampings(const TensorDesc* dstTensor) const = 0;
     virtual bool getDofMaxForces(const TensorDesc* dstTensor) const = 0;
     virtual bool getDofDriveModelProperties(const TensorDesc* dstTensor) const = 0;
-    virtual bool getDofFrictionCoefficients(const TensorDesc* dstTensor) const = 0; // deprecated
     virtual bool getDofFrictionProperties(const TensorDesc* dstTensor) const = 0;
     virtual bool getDofMaxVelocities(const TensorDesc* dstTensor) const = 0;
     virtual bool getDofArmatures(const TensorDesc* dstTensor) const = 0;
@@ -52,7 +61,6 @@ public:
     virtual bool setDofDampings(const TensorDesc* srcTensor, const TensorDesc* indexTensor) = 0;
     virtual bool setDofMaxForces(const TensorDesc* srcTensor, const TensorDesc* indexTensor) = 0;
     virtual bool setDofDriveModelProperties(const TensorDesc* srcTensor, const TensorDesc* indexTensor) = 0;
-    virtual bool setDofFrictionCoefficients(const TensorDesc* srcTensor, const TensorDesc* indexTensor) = 0; // deprecated
     virtual bool setDofFrictionProperties(const TensorDesc* srcTensor, const TensorDesc* indexTensor) = 0;
     virtual bool setDofMaxVelocities(const TensorDesc* srcTensor, const TensorDesc* indexTensor) = 0;
     virtual bool setDofArmatures(const TensorDesc* srcTensor, const TensorDesc* indexTensor) = 0;
@@ -66,7 +74,6 @@ public:
     virtual bool setDofDampingsMasked(const TensorDesc* srcTensor, const TensorDesc* maskTensor) = 0;
     virtual bool setDofMaxForcesMasked(const TensorDesc* srcTensor, const TensorDesc* maskTensor) = 0;
     virtual bool setDofDriveModelPropertiesMasked(const TensorDesc* srcTensor, const TensorDesc* maskTensor) = 0;
-    virtual bool setDofFrictionCoefficientsMasked(const TensorDesc* srcTensor, const TensorDesc* maskTensor) = 0; // deprecated
     virtual bool setDofFrictionPropertiesMasked(const TensorDesc* srcTensor, const TensorDesc* maskTensor) = 0;
     virtual bool setDofMaxVelocitiesMasked(const TensorDesc* srcTensor, const TensorDesc* maskTensor) = 0;
     virtual bool setDofArmaturesMasked(const TensorDesc* srcTensor, const TensorDesc* maskTensor) = 0;
@@ -109,6 +116,13 @@ public:
     virtual bool getDofPositionTargets(const TensorDesc* dstTensor) const = 0;
     virtual bool getDofVelocityTargets(const TensorDesc* dstTensor) const = 0;
 
+    // Generalized joint coordinates in the inverse dynamics queries below follow the authored USD body
+    // relationship: +1 when body0 is the articulation parent and -1 when body1 is the parent. If
+    // S_dof contains those signs and T is S_dof for a fixed base or diag(I6,S_dof) for a floating
+    // base, the returned quantities satisfy J=J_physx*T, M=T*M_physx*T, c=T*c_physx, and
+    // g=T*g_physx. getArticulationCentroidalMomentum() similarly returns [A_physx*T|b_physx]. The
+    // six floating-root coordinates and centroidal bias are unchanged. Angular generalized-coordinate
+    // dimensions use radians and receive no degree conversion; linear dimensions retain their units.
     virtual bool getJacobianShape(uint32_t* numRows, uint32_t* numCols) const = 0;
     virtual bool getJacobians(const TensorDesc* dstTensor) const = 0;
 
@@ -215,7 +229,8 @@ public:
 
     virtual bool check() const = 0;
 
-    virtual void release() = 0;
+    // Returns false while runtime execution is busy; the view remains owned by the caller.
+    virtual bool release() = 0;
 
 protected:
     virtual ~IArticulationView() = default;

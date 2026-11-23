@@ -1,28 +1,5 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 // Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 #include "foundation/PxAssert.h"
@@ -115,11 +92,6 @@ namespace physx
 //PX_STOMP_ALLOCATED_MEMORY is defined in common/PxPhysXCommonConfig.h
 
 
-#if PX_DEBUG
-#include "PxgMemoryTracker.h"
-static MemTracker mMemTracker;
-#endif
-
 PxCudaContext* createCudaContext(CUdevice device, PxDeviceAllocatorCallback* deviceCallback, PxPinnedHostAllocatorCallback* pinnedHostCallback, bool launchSynchronous);
 
 class CudaCtxMgr : public PxCudaContextManager, public PxUserAllocated
@@ -165,6 +137,7 @@ public:
 	virtual void            getDeviceMemoryInfo(size_t& free, size_t& total) const PX_OVERRIDE;
 
 	virtual void            release() PX_OVERRIDE;
+	virtual void            acquireReference() PX_OVERRIDE;
 
 	virtual CUcontext		getContext() PX_OVERRIDE { return mCtx; }
 
@@ -174,28 +147,7 @@ public:
 
 	virtual CUdeviceptr     getMappedDevicePtr(void* pinnedHostBuffer) PX_OVERRIDE;
 
-protected:
-	virtual void* allocDeviceBufferInternal(PxU64 numBytes, const char* filename, PxI32 line) PX_OVERRIDE;
-	virtual void* allocPinnedHostBufferInternal(PxU64 numBytes, const char* filename, PxI32 line) PX_OVERRIDE;
-
-	virtual void freeDeviceBufferInternal(void* deviceBuffer) PX_OVERRIDE;
-	virtual void freePinnedHostBufferInternal(void* pinnedHostBuffer) PX_OVERRIDE;
-
-	virtual void clearDeviceBufferAsyncInternal(void* deviceBuffer, PxU32 numBytes, CUstream stream, PxI32 value) PX_OVERRIDE;
-
-	virtual void copyDToHAsyncInternal(void* hostBuffer, const void* deviceBuffer, PxU32 numBytes, CUstream stream) PX_OVERRIDE;
-	virtual void copyHToDAsyncInternal(void* deviceBuffer, const void* hostBuffer, PxU32 numBytes, CUstream stream) PX_OVERRIDE;
-	virtual void copyDToDAsyncInternal(void* dstDeviceBuffer, const void* srcDeviceBuffer, PxU32 numBytes, CUstream stream) PX_OVERRIDE;
-
-	virtual void copyDToHInternal(void* hostBuffer, const void* deviceBuffer, PxU32 numBytes) PX_OVERRIDE;
-	virtual void copyHToDInternal(void* deviceBuffer, const void* hostBuffer, PxU32 numBytes) PX_OVERRIDE;
-
-	virtual void memsetD8AsyncInternal(void* dstDeviceBuffer, const PxU8& value, PxU32 numBytes, CUstream stream) PX_OVERRIDE;
-	virtual void memsetD32AsyncInternal(void* dstDeviceBuffer, const PxU32& value, PxU32 numIntegers, CUstream stream) PX_OVERRIDE;
-
 private:
-
-	friend void		addRef(PxCudaContextManager* cudaContextManager);
 
 	PxArray<CUmodule>	mCuModules;
 
@@ -233,149 +185,6 @@ CUdeviceptr CudaCtxMgr::getMappedDevicePtr(void* pinnedHostBuffer)
 	if (result != CUDA_SUCCESS)
 		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "Getting mapped device pointer failed with error code %i!\n", PxI32(result));
 	return dPtr;
-}
-
-
-void* CudaCtxMgr::allocDeviceBufferInternal(PxU64 numBytes, const char* filename, PxI32 lineNumber)
-{
-	numBytes = PxMax(PxU64(1u), numBytes);
-	PxScopedCudaLock lock(*this);
-	CUdeviceptr ptr;
-	PxCUresult result = getCudaContext()->memAlloc(&ptr, numBytes);
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "Mem allocation failed with error code %i!\n", PxI32(result));
-	void* deviceBuffer = reinterpret_cast<void*>(ptr);
-#if PX_DEBUG
-	if (deviceBuffer)
-		mMemTracker.registerMemory(deviceBuffer, true, numBytes, filename, lineNumber);
-#else
-	PX_UNUSED(filename);
-	PX_UNUSED(lineNumber);
-#endif
-	return deviceBuffer;
-}
-void* CudaCtxMgr::allocPinnedHostBufferInternal(PxU64 numBytes, const char* filename, PxI32 lineNumber)
-{
-	numBytes = PxMax(PxU64(1u), numBytes);
-	PxScopedCudaLock lock(*this);
-	void* pinnedHostBuffer;
-	const unsigned int cuMemhostallocDevicemap = 0x02;
-	const unsigned int cuMemhostallocPortable = 0x01;
-	PxCUresult result = getCudaContext()->memHostAlloc(&pinnedHostBuffer, numBytes, cuMemhostallocDevicemap | cuMemhostallocPortable);
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "Mem allocation failed with error code %i!\n", PxI32(result));
-
-#if PX_DEBUG
-	mMemTracker.registerMemory(pinnedHostBuffer, false, numBytes, filename, lineNumber);
-#else
-	PX_UNUSED(filename);
-	PX_UNUSED(lineNumber);
-#endif
-	return pinnedHostBuffer;
-}
-
-void CudaCtxMgr::freeDeviceBufferInternal(void* deviceBuffer)
-{
-	if (!deviceBuffer)
-		return;
-	PxScopedCudaLock lock(*this);
-	PxCUresult result = getCudaContext()->memFree(CUdeviceptr(deviceBuffer));
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "Mem free failed with error code %i!\n", PxI32(result));
-#if PX_DEBUG
-	mMemTracker.unregisterMemory(deviceBuffer, true);
-#endif
-}
-void CudaCtxMgr::freePinnedHostBufferInternal(void* pinnedHostBuffer)
-{
-	if (!pinnedHostBuffer)
-		return;
-	PxScopedCudaLock lock(*this);
-	PxCUresult result = getCudaContext()->memFreeHost(pinnedHostBuffer);
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "Mem free failed with error code %i!\n", PxI32(result));
-#if PX_DEBUG
-	mMemTracker.unregisterMemory(pinnedHostBuffer, false);
-#endif
-}
-
-void CudaCtxMgr::clearDeviceBufferAsyncInternal(void* deviceBuffer, PxU32 numBytes, CUstream stream, PxI32 value)
-{
-	if (!deviceBuffer)
-		return;
-	PxScopedCudaLock lock(*this);
-	PX_ASSERT(numBytes % 4 == 0);
-	PxCUresult result = getCudaContext()->memsetD32Async(CUdeviceptr(deviceBuffer), value, numBytes >> 2, stream);
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "Mem set failed with error code %i!\n", PxI32(result));
-}
-
-void CudaCtxMgr::copyDToHAsyncInternal(void* hostBuffer, const void* deviceBuffer, PxU32 numBytes, CUstream stream)
-{
-	if (!deviceBuffer || !hostBuffer)
-		return;
-	PxScopedCudaLock lock(*this);
-	PxCUresult result = getCudaContext()->memcpyDtoHAsync(hostBuffer, CUdeviceptr(deviceBuffer), numBytes, stream);
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "copyDtoHAsync set failed with error code %i!\n", PxI32(result));
-}
-void CudaCtxMgr::copyHToDAsyncInternal(void* deviceBuffer, const void* hostBuffer, PxU32 numBytes, CUstream stream)
-{
-	if (!deviceBuffer || !hostBuffer)
-		return;
-	PxScopedCudaLock lock(*this);
-	PxCUresult result = getCudaContext()->memcpyHtoDAsync(CUdeviceptr(deviceBuffer), hostBuffer, numBytes, stream);
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "copyHtoDAsync set failed with error code %i!\n", PxI32(result));
-}
-void CudaCtxMgr::copyDToDAsyncInternal(void* dstDeviceBuffer, const void* srcDeviceBuffer, PxU32 numBytes, CUstream stream)
-{
-	if (!srcDeviceBuffer || !dstDeviceBuffer)
-		return;
-	PxScopedCudaLock lock(*this);
-	PxCUresult result = getCudaContext()->memcpyDtoDAsync(CUdeviceptr(dstDeviceBuffer), CUdeviceptr(srcDeviceBuffer), numBytes, stream);
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "copyDtoDAsync set failed with error code %i!\n", PxI32(result));
-}
-
-void CudaCtxMgr::copyDToHInternal(void* hostBuffer, const void* deviceBuffer, PxU32 numBytes)
-{
-	if (!deviceBuffer || !hostBuffer)
-		return;
-	PxScopedCudaLock lock(*this);
-	PxCUresult result = getCudaContext()->memcpyDtoH(hostBuffer, CUdeviceptr(deviceBuffer), numBytes);
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "copyDtoH set failed with error code %i!\n", PxI32(result));
-}
-void CudaCtxMgr::copyHToDInternal(void* deviceBuffer, const void* hostBuffer, PxU32 numBytes)
-{
-	if (!deviceBuffer || !hostBuffer)
-		return;
-	PxScopedCudaLock lock(*this);
-	PxCUresult result = getCudaContext()->memcpyHtoD(CUdeviceptr(deviceBuffer), hostBuffer, numBytes);
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "copyHtoD set failed with error code %i!\n", PxI32(result));
-}
-
-void CudaCtxMgr::memsetD8AsyncInternal(void* dstDeviceBuffer, const PxU8& value, PxU32 numBytes, CUstream stream)
-{
-	if (!dstDeviceBuffer)
-		return;
-	PxScopedCudaLock lock(*this);
-	PxCUresult result = getCudaContext()->memsetD8Async(CUdeviceptr(dstDeviceBuffer), value, numBytes, stream);
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "Memset failed with error code %i!\n", PxI32(result));
-
-}
-
-void CudaCtxMgr::memsetD32AsyncInternal(void* dstDeviceBuffer, const PxU32& value, PxU32 numIntegers, CUstream stream)
-{
-	if (!dstDeviceBuffer)
-		return;
-	PxScopedCudaLock lock(*this);
-	PxCUresult result = getCudaContext()->memsetD32Async(CUdeviceptr(dstDeviceBuffer), value, numIntegers, stream);
-	if (result != CUDA_SUCCESS)
-		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "Memset failed with error code %i!\n", PxI32(result));
 }
 
 
@@ -503,12 +312,17 @@ void CudaCtxMgr::getDeviceMemoryInfo(size_t& free, size_t& total) const
 #define CUT_SAFE_CALL(call)  { CUresult ret = call;	\
 		if( CUDA_SUCCESS != ret ) { PX_ASSERT(0); } }
 
+// Marks mContextRefCountTls as never allocated, so the destructor can tell a real key from one the
+// constructor bailed out before creating; the value matches Windows TLS_OUT_OF_INDEXES.
+static const uint32_t sInvalidTlsIndex = 0xFFFFFFFF;
+
 /* If a context is not provided, an ordinal must be given */
 CudaCtxMgr::CudaCtxMgr(const PxCudaContextManagerDesc& desc, PxErrorCallback& errorCallback, bool launchSynchronous)
 	: mOwnContext(false)
 	, mCudaCtx(NULL)
 	, mUsingConcurrentStreams(true)
 	, mRefCount(1)
+	, mContextRefCountTls(sInvalidTlsIndex)
 #if PX_DEBUG
 	, mPushPopCount(0)
 #endif
@@ -810,16 +624,15 @@ bool CudaCtxMgr::safeDelayImport(PxErrorCallback& errorCallback)
 #endif // __HIP_PLATFORM_AMD__
 }
 
-void addRef(PxCudaContextManager* cudaContextManager)
-{
-	if (cudaContextManager)
-		PxAtomicIncrement(&static_cast<CudaCtxMgr*>(cudaContextManager)->mRefCount);
-}
-
 void CudaCtxMgr::release()
 {
 	if (PxAtomicDecrement(&mRefCount) == 0)
 		PX_DELETE_THIS;
+}
+
+void CudaCtxMgr::acquireReference()
+{
+	PxAtomicIncrement(&mRefCount);
 }
 
 CudaCtxMgr::~CudaCtxMgr()
@@ -827,7 +640,9 @@ CudaCtxMgr::~CudaCtxMgr()
 	PX_ASSERT(mRefCount == 0);
 	if (mCudaCtx)
 	{
-		// unload CUDA modules
+		// unload CUDA modules. The module table is only populated after the TLS key is allocated,
+		// so on a failed construction there is nothing to unload and no key to lock with.
+		if (mContextRefCountTls != sInvalidTlsIndex)
 		{
 			PxScopedCudaLock lock(*this);
 			for(PxU32 i = 0; i < mCuModules.size(); i++)
@@ -851,7 +666,13 @@ CudaCtxMgr::~CudaCtxMgr()
 		CUT_SAFE_CALL(cuCtxDestroy(mCtx));
 	}
 
-	PxTlsFree(mContextRefCountTls);
+	// Only free the key if the constructor got far enough to allocate one. Freeing an
+	// uninitialized index would delete an unrelated subsystem's TLS slot.
+	if (mContextRefCountTls != sInvalidTlsIndex)
+	{
+		PxTlsFree(mContextRefCountTls);
+		mContextRefCountTls = sInvalidTlsIndex;
+	}
 
 #if PX_DEBUG
 	PX_ASSERT(mPushPopCount == 0);
@@ -867,6 +688,17 @@ void CudaCtxMgr::acquireContext()
 
 bool CudaCtxMgr::tryAcquireContext()
 {
+	// The TLS key is only allocated once construction has fully succeeded, so reaching this with
+	// the sentinel means the caller is using a manager whose contextIsValid() returned false.
+	// Indexing TLS with an unallocated key is undefined, so refuse - and report it rather than
+	// failing silently, since the caller is about to run GPU work that will not be serialized.
+	if (mContextRefCountTls == sInvalidTlsIndex)
+	{
+		PxGetErrorCallback()->reportError(PxErrorCode::eINVALID_OPERATION,
+			"PxCudaContextManager: context acquired on a manager that failed to initialize.", PX_FL);
+		return false;
+	}
+
 	// AD: we directly store the counter in the per-thread value (instead of using a pointer-to-value.)
 	// Using size_t because we have a pointer's width to play with, so the type will potentially depend on the platform.
 	// All the values are initialized to NULL at PxTlsAlloc() and for any newly created thread it will be NULL as well.
@@ -892,6 +724,12 @@ bool CudaCtxMgr::tryAcquireContext()
 
 void CudaCtxMgr::releaseContext()
 {
+	// Paired with the guard in tryAcquireContext(): PxScopedCudaLock releases even when the acquire
+	// failed, so the same check is required here. The acquire already reported the error - reporting
+	// again would just double up on the same misuse.
+	if (mContextRefCountTls == sInvalidTlsIndex)
+		return;
+
 	size_t refCount = PxTlsGetValue(mContextRefCountTls);
 
 #if PX_DEBUG

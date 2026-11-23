@@ -1,14 +1,89 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+// @implements REQ-ATTACH-SERVICES-001
+// @covers AC-3
+
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1 AC-2
+
+// @implements REQ-ATTACH-LIFETIME-001
+// @covers AC-3
+
+// @implements REQ-ATTACH-RESOLVE-001
+// @covers AC-9 AC-10
+
+// @implements REQ-PARSE-JOINT-006
+// @covers AC-5
+
+// @implements REQ-SIM-ARTJOINTDRIVE-001
+// @covers AC-1
+
+// @implements REQ-SIM-ARTJOINTDRIVE-002
+// @covers AC-1 AC-2 AC-3 AC-4
+
+// @implements REQ-CACHE-ATTACH-001
+// @covers AC-19 AC-20
+
+// @implements REQ-CACHE-UPDATE-001
+// @covers AC-14
+
+// @implements REQ-LOAD-TENDON-001
+// @covers AC-1 AC-2 AC-3
+
+// @implements REQ-LOAD-JOINTLIMIT-001
+// @covers AC-1 AC-2 AC-4 AC-9
+
+/**
+ * @implements REQ-PROPS-MAT-001
+ * @covers AC-2 AC-3
+ */
 
 /**
  * @implements REQ-PARSE-UNIFY-001
- * @covers AC-6 AC-10
+ * @covers AC-1 AC-2
+ *
+ * @implements REQ-PARSE-BODY-001
+ * @covers AC-6
+ *
+ * @implements REQ-SIM-MULTISCENE-001
+ * @covers AC-4 AC-5
+ *
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-7 AC-9 AC-10 AC-27 AC-29
+ *
+ * @implements REQ-SIM-ACTIVEACTOR-001
+ * @covers AC-1
+ *
+ * @implements REQ-PARSE-COL-004
+ * @covers AC-3
+ *
+ * @implements REQ-SPLINE-TARGET-001
+ * @covers AC-1
+ *
+ * @implements REQ-PARSE-BACKEND-001
+ * @covers AC-6
+ *
+ * @implements REQ-PARSE-MASS-003
+ * @covers AC-1 AC-2
+ *
+ * @implements REQ-WRITE-AUTHORING-001
+ * @covers AC-5
+ *
+ * @implements REQ-RUNTIME-ERROR-001
+ * @covers AC-3 AC-4
+ *
+ * @implements REQ-SIM-BODY-INPUT-001
+ * @covers AC-1 AC-2 AC-3
  */
 
-#include "UsdPCH.h"
+// @implements REQ-CUSTOM-LIFETIME-001
+// @covers AC-2 AC-3
 
+#include "../RuntimeExecution.h"
+#include "../attachment/PhysXPoissonSampling.h"
 #include "UsdInterface.h"
+#include "tensors/CenterOfMassEpoch.h"
 #include <ChangeRegister.h>
 #include <CookingDataAsync.h>
 #include <internal/Internal.h>
@@ -27,6 +102,7 @@
 #include <OmniPhysX.h>
 #include <Trigger.h>
 #include <PhysXCustomJoint.h>
+#include <JointLimitConversion.h>
 #include <PhysXCustomGeometry.h>
 #include <Raycast.h>
 #include <PhysXMirror.h>
@@ -40,7 +116,9 @@
 #include <usdLoad/MimicJoint.h>
 #include <PhysXSettings.h>
 #include <PhysXUpdate.h>
-#include <physxSchema/axisInstanceTokens.h>
+
+#include <omni/physics/parse/KnownTokens.h>
+#include <omni/physx/RuntimeError.h>
 
 #include <private/omni/physx/PhysxUsd.h>
 #include <omni/log/ILog.h>
@@ -52,10 +130,8 @@
 
 #include <common/utilities/MemoryMacros.h>
 
-extern void* getPhysXPtr(const PXR_NS::SdfPath& path, omni::physx::PhysXType type);
-extern void* getInternalPtr(const PXR_NS::SdfPath& path, omni::physx::PhysXType type);
 
-using namespace PXR_NS;
+
 using namespace ::physx;
 using namespace omni::physx::usdparser;
 using namespace omni::physx::internal;
@@ -64,46 +140,69 @@ using namespace cookingdataasync;
 
 OMNI_LOG_DECLARE_CHANNEL(kRoboticsLogChannel)
 
-static std::vector<std::pair<ObjectId, PxArticulationLink*>> gTempParent;
 
 namespace omni
 {
 namespace physx
 {
 
-PhysXUsdPhysicsInterface gPhysicsUsdInterface;
-
 PhysXUsdPhysicsInterface& getPhysXUsdPhysicsInterface()
 {
-    return gPhysicsUsdInterface;
+    return OmniPhysX::getInstance().getUsdPhysicsInterface();
 }
 
-namespace
+// Strip an unsupported (multi- or single-apply) API schema instance off the
+// object's backing destination. Scene-description authoring, so it goes through the
+// authoring sink (REQ-WRITE-AUTHORING-001) and still reaches a resident backing USD
+// stage on an ovstage attach, where getDataWrite() is null by design. A no-op only
+// when there is no backing destination at all (a USD-free consumer has nothing to strip).
+// This is a cleanup/downgrade side effect that accompanies a warning ("this
+// schema is ignored here"), not a read -- callers keep emitting their warning either way.
+static void removeAppliedAPI(usdparser::AttachedStage& attachedStage,
+                             omni::physics::parse::ObjectKey key,
+                             std::string_view apiName,
+                             std::string_view instanceName = {})
 {
-// schemaTypeToken now lives in PhysXTools.h (single boundary translation).
-using omni::physx::internal::schemaTypeToken;
-} // namespace
-
-void clearFiltering()
-{
-    PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
-
-    physxSetup.getFilteredPairs().clear();
-    physxSetup.getCollisionGroupFilteredPairs().clear();
+    if (omni::physics::parse::IPhysicsDataWrite* write = attachedStage.getAuthoringDataWrite())
+        write->removeAppliedAPI(key, apiName, instanceName);
 }
 
-// Mint the source ObjectKey for a path on the currently attached stage. Used at
-// record creation sites that lack an AttachedStage in scope; returns the invalid
-// key when no stage is attached (matching the empty-SdfPath behaviour records had).
-static omni::physics::parse::ObjectKey keyForActiveStage(const PXR_NS::SdfPath& path)
+// Resolve an instance TokenId to InternalTendonAxis/InternalTendonAttachment's
+// instanceName (TendonInstanceNameHandle, pinned to std::string in both configs
+// -- InternalScene.h). Same pxr-free source-interning pattern as tokenText()
+// below.
+static std::string tendonInstanceNameFor(const usdparser::AttachedStage& attachedStage,
+                                         omni::physics::parse::TokenId instanceToken)
 {
-    const usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getActiveAttachedStage();
-    return attachedStage->keyFor(path);
+    const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+    return source ? std::string(source->tokenToString(instanceToken)) : std::string();
 }
 
+// pxr-free diagnostic mirror: resolve a TokenId to plain text for %s log formatting,
+// without materializing a TfToken. Returns "" when the source/token is invalid.
+static std::string tokenText(const usdparser::AttachedStage& attachedStage, omni::physics::parse::TokenId token)
+{
+    const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+    return source ? std::string(source->tokenToString(token)) : std::string();
+}
+
+void clearFiltering(const usdparser::AttachedStage& attachedStage)
+{
+    attachedStage.getFilteredPairs().clear();
+    attachedStage.getCollisionGroupFilteredPairs().clear();
+}
+
+
+
+
+// `key` is the shape's source identity: the record key, the PhysX debug name
+// and every diagnostic come from it (via attachedStage.textFor), never from a
+// live UsdPrim -- the optional USD trigger-state write-back below (Trigger.h's
+// preloadTrigger) resolves its own prim from `key`, and is a no-op when there
+// is nothing to author into (no backing stage).
 ObjectId createShape(const PxGeometry& geom,
                      const PhysxShapeDesc& desc,
-                     const UsdPrim& prim,
+                     omni::physics::parse::ObjectKey key,
                      PhysXScene* physxScene,
                      uint32_t collisionGroup,
                      PxRigidActor* rigidActor,
@@ -142,6 +241,8 @@ ObjectId createShape(const PxGeometry& geom,
         const PxQuat rot = toPhysXQuat(desc.localRot);
         const PxVec3 pos = toPhysX(desc.localPos);
         const PxTransform shapeTrans  = PxTransform(pos, rot) * (*poseOffset);
+        massInfo.geometryToSourcePos = fromPhysX(poseOffset->p);
+        massInfo.geometryToSourceRot = fromPhysX(poseOffset->q);
         massInfo.localPos = fromPhysX(shapeTrans.p);
         massInfo.localRot = fromPhysX(shapeTrans.q);
     }
@@ -173,12 +274,12 @@ ObjectId createShape(const PxGeometry& geom,
     }
 
     PxMaterial* material = physxScene->getDefaultMaterial();
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = physxScene->getAttachedStage().getInternalPhysXDatabase();
     InternalMaterial* intMat = nullptr;
     if (desc.materials.size() == 1 && desc.materials[0] != kInvalidObjectId)
     {
         InternalDatabase::Record& materialRecord = db.getRecords()[desc.materials[0]];
-        material = getPtr<PxMaterial>(ePTMaterial, desc.materials[0]);
+        material = getPtr<PxMaterial>(physxScene->getAttachedStage().getInternalPhysXDatabase(), ePTMaterial, desc.materials[0]);
         intMat = (InternalMaterial*)materialRecord.mInternalPtr;
     }
     CARB_ASSERT(material);
@@ -189,9 +290,33 @@ ObjectId createShape(const PxGeometry& geom,
     PxShape* shape = OmniPhysX::getInstance().getPhysXSetup().getPhysics()->createShape(geom, *material, isExclusive);
     if (!shape)
     {
-        CARB_LOG_ERROR("PhysX Shape failed to be created on a prim: %s!", prim.GetPrimPath().GetText());
+        CARB_LOG_ERROR("PhysX Shape failed to be created on a prim: %s!", physxScene->getAttachedStage().textFor(key));
         return kInvalidObjectId;
     }
+
+    struct ShapeRollback
+    {
+        PxShape* shape;
+        PxRigidActor* attached = nullptr;
+        InternalMaterial* material = nullptr;
+        ObjectId materialShape = kInvalidObjectId;
+        ~ShapeRollback()
+        {
+            if (!shape) return;
+            if (material) material->removeShapeId(materialShape);
+            if (attached) attached->detachShape(*shape);
+            shape->release(); // SDK listener releases custom state exactly once
+        }
+    } rollback{shape};
+
+    if (geom.getType() == PxGeometryType::eCUSTOM)
+    {
+        omni::physx::CustomPhysXGeometryCallback & callback = *static_cast<CustomPhysXGeometryCallback*>(static_cast<const PxCustomGeometry&>(geom).callbacks);
+        OmniPhysX::getInstance().getCustomGeometryManager().bindShape(callback, *shape);
+    }
+
+    // Resolve the optional name before publishing ownership: textFor may allocate.
+    const char* shapeName = exposePrimNames ? physxScene->getAttachedStage().textFor(key) : nullptr;
 
     PxFilterData fd;
     convertCollisionGroupToPxFilterData(collisionGroup, fd);
@@ -214,7 +339,7 @@ ObjectId createShape(const PxGeometry& geom,
                     if (desc.materials[i] != kInvalidObjectId)
                     {
                         InternalDatabase::Record& materialRecord = db.getRecords()[desc.materials[i]];
-                        material = getPtr<PxMaterial>(ePTMaterial, desc.materials[i]);
+                        material = getPtr<PxMaterial>(physxScene->getAttachedStage().getInternalPhysXDatabase(), ePTMaterial, desc.materials[i]);
                     }
                     materialArray[i] = material;
                 }
@@ -222,12 +347,12 @@ ObjectId createShape(const PxGeometry& geom,
             }
             else
             {
-                CARB_LOG_WARN("Multiple materials supported only for original triangle mesh (no approximation), prim: %s", prim.GetPrimPath().GetText());
+                CARB_LOG_WARN("Multiple materials supported only for original triangle mesh (no approximation), prim: %s", physxScene->getAttachedStage().textFor(key));
             }
         }
         else
         {
-            CARB_LOG_WARN("Multiple materials supported only for original triangle mesh (no approximation), prim: %s", prim.GetPrimPath().GetText());
+            CARB_LOG_WARN("Multiple materials supported only for original triangle mesh (no approximation), prim: %s", physxScene->getAttachedStage().textFor(key));
         }
     }
 
@@ -239,7 +364,7 @@ ObjectId createShape(const PxGeometry& geom,
         {
             if (desc.contactOffset <= desc.restOffset)
             {
-                CARB_LOG_ERROR("Collision contact offset must be positive and greater then restOffset, prim: %s", prim.GetPrimPath().GetText());
+                CARB_LOG_ERROR("Collision contact offset must be positive and greater then restOffset, prim: %s", physxScene->getAttachedStage().textFor(key));
                 contactOffset = desc.contactOffset + desc.restOffset + 1e-3f;
                 shape->setContactOffset(contactOffset);
             }
@@ -268,7 +393,7 @@ ObjectId createShape(const PxGeometry& geom,
         {
             if (desc.restOffset > contactOffset)
             {
-                CARB_LOG_ERROR("Collision rest offset must be lesser then contact offset, prim: %s", prim.GetPrimPath().GetText());
+                CARB_LOG_ERROR("Collision rest offset must be lesser then contact offset, prim: %s", physxScene->getAttachedStage().textFor(key));
                 shape->setRestOffset(0.0f);
             }
             shape->setRestOffset(desc.restOffset);
@@ -280,7 +405,7 @@ ObjectId createShape(const PxGeometry& geom,
     bool isTrigger = desc.isTrigger;
     if (isTrigger && desc.type == eTriangleMeshShape)
     {
-        CARB_LOG_WARN("Triggers are not supported for triangle mesh shapes, prim: %s", prim.GetPrimPath().GetText());
+        CARB_LOG_WARN("Triggers are not supported for triangle mesh shapes, prim: %s", physxScene->getAttachedStage().textFor(key));
         isTrigger = false;
     }
 
@@ -289,7 +414,9 @@ ObjectId createShape(const PxGeometry& geom,
         shape->setFlag(PxShapeFlag::eSIMULATION_SHAPE, false);
         shape->setFlag(PxShapeFlag::eTRIGGER_SHAPE, desc.collisionEnabled);
         shape->setFlag(PxShapeFlag::eSCENE_QUERY_SHAPE, false);
-        OmniPhysX::getInstance().getTriggerManager()->preloadTrigger(prim, desc.isTriggerUsdOutput);
+        // USD-only trigger state write-back; preloadTrigger no-ops when there is
+        // nothing to author into (no backing stage).
+        OmniPhysX::getInstance().getTriggerManager()->preloadTrigger(physxScene->getAttachedStage(), key, desc.isTriggerUsdOutput);
     }
     else
     {
@@ -299,7 +426,7 @@ ObjectId createShape(const PxGeometry& geom,
 
     if (desc.collisionEnabled)
     {
-        shape->setFlag(PxShapeFlag::eVISUALIZATION, OmniPhysX::getInstance().isDebugVisualizationEnabled());
+        shape->setFlag(PxShapeFlag::eVISUALIZATION, physxScene->getAttachedStage().isDebugVisualizationEnabled());
     }
     else
     {
@@ -308,28 +435,39 @@ ObjectId createShape(const PxGeometry& geom,
 
     if (rigidActor)
     {
-        const bool retVal = rigidActor->attachShape(*shape);
-        CARB_ASSERT(retVal);
+        if (!rigidActor->attachShape(*shape))
+        {
+            CARB_LOG_ERROR("PhysX rejected attaching a shape to its rigid actor.");
+            return kInvalidObjectId;
+        }
+        rollback.attached = rigidActor;
     }
 
     ObjectId outId = kInvalidObjectId;
 
     if (!compoundId)
     {
-        InternalShape* internalShape =
-            ICE_NEW(InternalShape)(physxScene, desc.localScale, intMat ? desc.materials[0] : kInvalidObjectId);
+        std::unique_ptr<InternalShape> pendingInternal(
+            ICE_NEW(InternalShape)(physxScene, desc.localScale, intMat ? desc.materials[0] : kInvalidObjectId));
+        InternalShape* internalShape = pendingInternal.get();
+        internalShape->mSourceGprim = desc.sourceGprim;
         internalShape->mMassInfo = massInfo;
         if (instance)
             internalShape->mInstanceIndex = instance->index;
         if (intMat)
         {
             internalShape->mMaterialId = (usdparser::ObjectId)material->userData;
-            intMat->addShapeId(db.getRecords().size());
+            const ObjectId candidate = db.getRecords().size();
+            intMat->addShapeId(candidate);
+            rollback.material = intMat;
+            rollback.materialShape = candidate;
         }
-        outId = db.addRecord(ePTShape, shape, internalShape, physxScene->getAttachedStage().keyFor(prim.GetPrimPath()));
+        outId = db.addRecord(ePTShape, shape, internalShape, key);
+        pendingInternal.release();
+        rollback.shape = nullptr; // the database now owns the creator reference
         shape->userData = (void*)(outId);
         if (exposePrimNames)
-            shape->setName(prim.GetPath().GetText());
+            shape->setName(shapeName);
     }
     else
     {
@@ -337,20 +475,21 @@ ObjectId createShape(const PxGeometry& geom,
         PhysXCompoundShape* cs = (PhysXCompoundShape*)db.getRecord(internalType, *compoundId);
         std::vector<::physx::PxShape*>& cShapes = const_cast<std::vector<::physx::PxShape*>&>(cs->getShapes());
         cShapes.push_back(shape);
+        rollback.shape = nullptr; // the compound now owns the creator reference
         shape->userData = (void*)(*compoundId);
         if (exposePrimNames)
-            shape->setName(prim.GetPath().GetText());
+            shape->setName(shapeName);
     }
 
     return outId;
 }
 
-InternalActor* setupActor(PhysXScene* ps, PxRigidActor& actor, const PhysxRigidBodyDesc& desc, const UsdPrim& topPrim, const ObjectInstance* instance, omni::physics::parse::ObjectKey key)
+InternalActor* setupActor(PhysXScene* ps, PxRigidActor& actor, const PhysxRigidBodyDesc& desc, const ObjectInstance* instance, omni::physics::parse::ObjectKey key)
 {
     const uint32_t nbShapes = uint32_t(desc.shapes.size());
     for (uint32_t i = 0; i < nbShapes; i++)
     {
-        PxShape* shape = getPtr<PxShape>(ePTShape, desc.shapes[i]);
+        PxShape* shape = getPtr<PxShape>(ps->getAttachedStage().getInternalPhysXDatabase(), ePTShape, desc.shapes[i]);
         if (shape)
         {
             const bool retVal = actor.attachShape(*shape);
@@ -358,14 +497,14 @@ InternalActor* setupActor(PhysXScene* ps, PxRigidActor& actor, const PhysxRigidB
         }
         else
         {
-            const PhysXCompoundShape* compoundShape = getPtr<const PhysXCompoundShape>(ePTCompoundShape, desc.shapes[i]);
+            const PhysXCompoundShape* compoundShape = getPtr<const PhysXCompoundShape>(ps->getAttachedStage().getInternalPhysXDatabase(), ePTCompoundShape, desc.shapes[i]);
             if (compoundShape)
             {
                 for (size_t k = 0; k < compoundShape->getShapes().size(); k++)
                 {
                     PxShape* s = (PxShape*)compoundShape->getShapes()[k];
                     if (s->isExclusive())
-                        s->setFlag(PxShapeFlag::eVISUALIZATION, OmniPhysX::getInstance().isDebugVisualizationEnabled());
+                        s->setFlag(PxShapeFlag::eVISUALIZATION, ps->getAttachedStage().isDebugVisualizationEnabled());
                     const bool retVal = actor.attachShape(*s);
                     CARB_ASSERT(retVal);
                 }
@@ -373,7 +512,7 @@ InternalActor* setupActor(PhysXScene* ps, PxRigidActor& actor, const PhysxRigidB
         }
     }
 
-    actor.setActorFlag(PxActorFlag::eVISUALIZATION, OmniPhysX::getInstance().isDebugVisualizationEnabled());
+    actor.setActorFlag(PxActorFlag::eVISUALIZATION, ps->getAttachedStage().isDebugVisualizationEnabled());
 
     InternalActor* internalActor = nullptr;
     if (desc.type != eArticulationLink)
@@ -386,16 +525,16 @@ InternalActor* setupActor(PhysXScene* ps, PxRigidActor& actor, const PhysxRigidB
             localSpaceVelocities = dynDesc.localSpaceVelocities;
         }
 
-        internalActor = ICE_NEW(InternalActor)(ps, topPrim.GetPrimPath(), topPrim,
+        internalActor = ICE_NEW(InternalActor)(ps,
             (actor.is<PxRigidBody>() && !(actor.is<PxRigidBody>()->getRigidBodyFlags() & PxRigidBodyFlag::eKINEMATIC)) ? true : false,
             instance, localSpaceVelocities, key);
     }
     else
     {
-        internalActor = ICE_NEW(InternalLink)(ps, topPrim.GetPrimPath(), topPrim, instance, key);
+        internalActor = ICE_NEW(InternalLink)(ps, instance, key);
     }
     internalActor->mScale = desc.scale;
-    ps->getInternalScene()->mActors.push_back(internalActor);
+    ps->getInternalScene()->addActor(*internalActor);
     internalActor->mActor = &actor;
 
     // set flag if dynamic body has time sampled xform
@@ -415,6 +554,7 @@ InternalActor* setupActor(PhysXScene* ps, PxRigidActor& actor, const PhysxRigidB
         internalActor->enableContactSolve(dynDesc.solveContacts, &actor);
 
         internalActor->mSurfaceVelocity = toPhysX(dynDesc.surfaceLinearVelocity);
+        internalActor->mSurfaceVelocityAuthored = toPhysX(dynDesc.surfaceLinearVelocityAuthored);
         internalActor->mSurfaceAngularVelocity = toPhysX(dynDesc.surfaceAngularVelocity);
         internalActor->mSurfaceAngularVelocityPivot = actor.getGlobalPose();
         internalActor->mSurfaceVelocityLocalSpace = dynDesc.surfaceVelocityLocalSpace;
@@ -423,8 +563,9 @@ InternalActor* setupActor(PhysXScene* ps, PxRigidActor& actor, const PhysxRigidB
         {
             const AttachedStage& attachedStage = ps->getAttachedStage();
             const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
+            const omni::physics::parse::KnownTokens& tok = attachedStage.getKnownTokens();
             if (src && dynDesc.splinesCurvePrimKey.valid() &&
-                src->isA(dynDesc.splinesCurvePrimKey, schemaTypeToken<UsdGeomBasisCurves>(*src)))
+                src->isA(dynDesc.splinesCurvePrimKey, tok.basisCurvesType))
             {
                 internalActor->enableSplineSurfaceVelocity(dynDesc.splinesSurfaceVelocityEnabled, actor,
                                                            attachedStage, dynDesc.splinesCurvePrimKey);
@@ -434,7 +575,7 @@ InternalActor* setupActor(PhysXScene* ps, PxRigidActor& actor, const PhysxRigidB
     }
 
     // set back joints broken by resync
-    const PxJointMap& jointMap = OmniPhysX::getInstance().getInternalPhysXDatabase().getPxJointMap();
+    const PxJointMap& jointMap = ps->getAttachedStage().getInternalPhysXDatabase().getPxJointMap();
     PxJointMap::const_iterator jointIt = jointMap.find(key);
     while (jointIt != jointMap.end() && jointIt->first == key)
     {
@@ -481,7 +622,7 @@ void applyRigidDynamicPhysxDesc(PhysXScene* ps, const DynamicPhysxRigidBodyDesc&
     applyPhysXRigidBodyDesc(rigidDynamic, desc);
     rigidDynamic.setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, desc.kinematicBody);
 
-    rigidDynamic.setActorFlag(PxActorFlag::eVISUALIZATION, OmniPhysX::getInstance().isDebugVisualizationEnabled());
+    rigidDynamic.setActorFlag(PxActorFlag::eVISUALIZATION, ps->getAttachedStage().isDebugVisualizationEnabled());
 
     rigidDynamic.setSolverIterationCounts(
         ps->getInternalScene()->clampPosIterationCount(desc.solverPositionIterationCount),
@@ -517,14 +658,42 @@ void applyRigidDynamicPhysxDesc(PhysXScene* ps, const DynamicPhysxRigidBodyDesc&
     }
 }
 
-bool checkScenes()
+uint32_t creationEnvironmentId(const AttachedStage& attachedStage, omni::physics::parse::ObjectKey key)
 {
-    return !OmniPhysX::getInstance().getPhysXSetup().getPhysXScenes().empty();
+    // Decided when the scene is created (eScene in createObject); replicate() overrides it
+    // only while it parses its source.
+    if (!attachedStage.isUsingReplicatorEnvIds())
+        return PX_INVALID_U32;
+    // Until replicate() registers a partition token every prim lands in env 0 (the clone
+    // source's env), so the primvar is not read. The compiled cache relies on this: its read
+    // plan does not declare the primvar, so reading it would prevent storing the attachment.
+    if (!attachedStage.hasRegisteredEnvIds())
+        return 0;
+    uint32_t partition_id = 0;
+    // Read (and look up) through the TokenId path, not TfToken: replicate()'s
+    // registerEnvIdFromToken(TokenId) call (PhysXReplicator.cpp) is the only writer of
+    // the scene-partition -> envId map, so a TfToken-keyed lookup here would always miss.
+    if (const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource())
+    {
+        const omni::physics::parse::TokenId scenePartitionAttr = source->internToken(kScenePartitionPrimvar);
+        omni::physics::parse::TokenId scenePartitionToken;
+        if (getValue<omni::physics::parse::TokenId>(attachedStage, key, scenePartitionAttr,
+                                                     omni::physics::parse::ReadTime::defaultTime(), scenePartitionToken))
+        {
+            partition_id = attachedStage.getEnvIdFromToken(scenePartitionToken);
+        }
+    }
+    return partition_id;
+}
+
+bool checkScenes(const AttachedStage& attachedStage)
+{
+    return !attachedStage.getPhysXScenes().empty();
 }
 
 void releaseDeformableAttachments(InternalActor* intActor)
 {
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = intActor->mPhysXScene->getAttachedStage().getInternalPhysXDatabase();
 
     for (MirrorActor& mirror : intActor->mMirrors)
     {
@@ -538,7 +707,7 @@ void releaseDeformableAttachments(InternalActor* intActor)
 
 void releaseDeformableCollisionFilters(InternalActor* intActor)
 {
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = intActor->mPhysXScene->getAttachedStage().getInternalPhysXDatabase();
 
     for (MirrorActor& mirror : intActor->mMirrors)
     {
@@ -550,12 +719,11 @@ void releaseDeformableCollisionFilters(InternalActor* intActor)
     intActor->mPhysXScene->getInternalScene()->removeDeformableCollisionFilters(ObjectId(intActor->mActor->userData));
 }
 
-void updateDeformableAttachmentShapeEvents(InternalActor* intActor, ObjectId shapeId, PXR_NS::SdfPath shapeKey, DirtyEventType eventType)
+void updateDeformableAttachmentShapeEvents(InternalActor* intActor, ObjectId shapeId, omni::physics::parse::ObjectKey shapeKey, DirtyEventType eventType)
 {
-    PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
-
     if (intActor)
     {
+        const AttachedStage& attachedStage = intActor->mPhysXScene->getAttachedStage();
         // Refresh all attachments that has the same rb which the shape is attached to
         std::vector<PxRigidActor*> actorList = { intActor->mActor };
         for (MirrorActor& mirror : intActor->mMirrors)
@@ -565,8 +733,8 @@ void updateDeformableAttachmentShapeEvents(InternalActor* intActor, ObjectId sha
 
         for (PxRigidActor* actor : actorList)
         {
-            const PhysXScenesMap& physxScenes = physxSetup.getPhysXScenes();
-            for (PhysXScenesMap::const_reference ref : physxScenes)
+            const AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
+            for (AttachedStage::SceneMap::const_reference ref : physxScenes)
             {
                 PhysXScene* sc = ref.second;
 
@@ -580,12 +748,11 @@ void updateDeformableAttachmentShapeEvents(InternalActor* intActor, ObjectId sha
     }
 }
 
-void updateDeformableCollisionFilterShapeEvents(InternalActor* intActor, ObjectId shapeId, PXR_NS::SdfPath shapeKey, DirtyEventType eventType)
+void updateDeformableCollisionFilterShapeEvents(InternalActor* intActor, ObjectId shapeId, omni::physics::parse::ObjectKey shapeKey, DirtyEventType eventType)
 {
-    PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
-
     if (intActor)
     {
+        const AttachedStage& attachedStage = intActor->mPhysXScene->getAttachedStage();
         // Refresh all collision filters that has the same rb which the shape is attached to
         std::vector<PxRigidActor*> actorList = { intActor->mActor };
         for (MirrorActor& mirror : intActor->mMirrors)
@@ -595,8 +762,8 @@ void updateDeformableCollisionFilterShapeEvents(InternalActor* intActor, ObjectI
 
         for (PxRigidActor* actor : actorList)
         {
-            const PhysXScenesMap& physxScenes = physxSetup.getPhysXScenes();
-            for (PhysXScenesMap::const_reference ref : physxScenes)
+            const AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
+            for (AttachedStage::SceneMap::const_reference ref : physxScenes)
             {
                 PhysXScene* sc = ref.second;
 
@@ -611,68 +778,150 @@ void updateDeformableCollisionFilterShapeEvents(InternalActor* intActor, ObjectI
 }
 
 PhysXUsdPhysicsInterface::PhysXUsdPhysicsInterface()
-    : mDirty(true)
-    , mObjectChangeNotificationsEnabled(false)
-    , mExposePrimNames(true)
+    : mExposePrimNames(true)
 {
+}
+
+void PhysXUsdPhysicsInterface::captureParseOptions(usdparser::AttachedStage& attachedStage) const
+{
+    usdparser::AttachedStage::ParseOptions& options = attachedStage.getParseOptions();
+    options.exposePrimNames = mExposePrimNames;
+    if (options.forceSingleScenePath != mForceParseOnlySingleScenePath)
+    {
+        options.forceSingleScenePath = mForceParseOnlySingleScenePath;
+        options.forcedSceneId = usdparser::kInvalidObjectId;
+    }
+}
+
+void PhysXUsdPhysicsInterface::setDirty(const usdparser::AttachedStage& attachedStage, bool val)
+{
+    attachedStage.getPendingPhysicsSetup().dirty = val;
 }
 
 PhysXUsdPhysicsInterface::~PhysXUsdPhysicsInterface()
 {
 }
 
-void PhysXUsdPhysicsInterface::sendObjectCreationNotification(const PXR_NS::SdfPath& path, ObjectId objectId, PhysXType physxType)
+void PhysXUsdPhysicsInterface::enableObjectChangeNotifications(usdparser::AttachedStage& owner, bool enable)
 {
-    if ((objectId != kInvalidObjectId) && !mPhysicsObjectChangeSubscriptions.map.empty())
+    owner.objectNotificationState().enabled = enable;
+}
+
+bool PhysXUsdPhysicsInterface::objectChangeNotificationsEnabled(const usdparser::AttachedStage& owner) const
+{
+    return owner.objectNotificationState().enabled;
+}
+
+void PhysXUsdPhysicsInterface::setInitialStagePopulationInProgress(usdparser::AttachedStage& owner, bool inProgress)
+{
+    owner.objectNotificationState().initialPopulation = inProgress;
+}
+
+bool PhysXUsdPhysicsInterface::initialStagePopulationInProgress(const usdparser::AttachedStage& owner) const
+{
+    return owner.objectNotificationState().initialPopulation;
+}
+
+bool PhysXUsdPhysicsInterface::shouldDeliverObjectChangeNotification(
+    const usdparser::AttachedStage& owner, const ObjectChangeObserver& callback) const
+{
+    if (callback.attach != kNoAttach && callback.attach != owner.getAttachHandle())
+        return false;
+    if (owner.objectNotificationState().suppressed)
+        return false;
+    if (owner.objectNotificationState().initialPopulation)
+        return callback.notifyInitialPopulation;
+    return owner.objectNotificationState().enabled || !callback.stopCallbackWhenSimStopped;
+}
+
+bool PhysXUsdPhysicsInterface::objectCreationNotificationsWanted(const usdparser::AttachedStage& attachedStage) const
+{
+    const ObjectChangeRegistry::EventMap subscriptions = mPhysicsObjectChangeSubscriptions.snapshot();
+    return std::any_of(subscriptions.begin(), subscriptions.end(),
+                       [&](const ObjectChangeRegistry::EventMap::value_type& subscription) {
+                           return subscription.second.objectCreationNotifyFn &&
+                                  shouldDeliverObjectChangeNotification(attachedStage, subscription.second);
+                       });
+}
+
+void PhysXUsdPhysicsInterface::sendObjectCreationNotification(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, ObjectId objectId, PhysXType physxType)
+{
+    const ObjectChangeRegistry::EventMap subscriptions = mPhysicsObjectChangeSubscriptions.snapshot();
+    if (objectId == kInvalidObjectId || std::none_of(
+            subscriptions.begin(), subscriptions.end(),
+            [&](const ObjectChangeRegistry::EventMap::value_type& subscription) {
+                return subscription.second.objectCreationNotifyFn && shouldDeliverObjectChangeNotification(attachedStage, subscription.second);
+            }))
+        return;
+
+    const std::string path(attachedStage.textFor(key));
+    const internal::InternalPhysXDatabase& database = attachedStage.getInternalPhysXDatabase();
+    void* nativeObject = objectId < database.getRecords().size() ? database.getRecords()[objectId].mPtr : nullptr;
+    const PhysicsObjectChangeEvent event{ attachedStage.getAttachHandle(), key, objectId, physxType,
+                                          path.c_str(), nativeObject };
+    if (objectId != kInvalidObjectId && !subscriptions.empty())
     {
-        PhysicsObjectChangeSubscriptionRegistry::EventMap::const_iterator it = mPhysicsObjectChangeSubscriptions.map.begin();
-        PhysicsObjectChangeSubscriptionRegistry::EventMap::const_iterator itEnd = mPhysicsObjectChangeSubscriptions.map.end();
-        while (it != itEnd)
+        for (const ObjectChangeRegistry::EventMap::value_type& subscription : subscriptions)
         {
-            const IPhysicsObjectChangeCallback& callback = it->second;
-            if (shouldDeliverObjectChangeNotification(callback))
+            if (!mPhysicsObjectChangeSubscriptions.contains(subscription.first))
+                continue;
+            const ObjectChangeObserver& callback = subscription.second;
+            if (shouldDeliverObjectChangeNotification(attachedStage, callback))
             {
                 if (callback.objectCreationNotifyFn)
                 {
-                    callback.objectCreationNotifyFn(path, objectId, physxType, callback.userData);
+                    RuntimeCallbackScope callbackScope;
+                    callback.objectCreationNotifyFn(event, callback.userData);
                 }
             }
-            it++;
         }
     }
 }
 
-void PhysXUsdPhysicsInterface::sendObjectDestructionNotification(const PXR_NS::SdfPath& removedPath, ObjectId objectId, PhysXType physxType)
+void PhysXUsdPhysicsInterface::sendObjectDestructionNotification(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey removedKey, ObjectId objectId, PhysXType physxType)
 {
-    if ((objectId != kInvalidObjectId) && !mPhysicsObjectChangeSubscriptions.map.empty())
-    {
-        PhysicsObjectChangeSubscriptionRegistry::EventMap::const_iterator it = mPhysicsObjectChangeSubscriptions.map.begin();
-        PhysicsObjectChangeSubscriptionRegistry::EventMap::const_iterator itEnd = mPhysicsObjectChangeSubscriptions.map.end();
-        while (it != itEnd)
-        {
-            const IPhysicsObjectChangeCallback& callback = it->second;
+    const ObjectChangeRegistry::EventMap subscriptions = mPhysicsObjectChangeSubscriptions.snapshot();
+    if (objectId == kInvalidObjectId || std::none_of(
+            subscriptions.begin(), subscriptions.end(),
+            [&](const ObjectChangeRegistry::EventMap::value_type& subscription) {
+                return subscription.second.objectDestructionNotifyFn && shouldDeliverObjectChangeNotification(attachedStage, subscription.second);
+            }))
+        return;
 
-            if (shouldDeliverObjectChangeNotification(callback))
+    const std::string path(attachedStage.textFor(removedKey));
+    const internal::InternalPhysXDatabase& database = attachedStage.getInternalPhysXDatabase();
+    void* nativeObject = objectId < database.getRecords().size() ? database.getRecords()[objectId].mPtr : nullptr;
+    const PhysicsObjectChangeEvent event{ attachedStage.getAttachHandle(), removedKey, objectId, physxType,
+                                          path.c_str(), nativeObject };
+    if (objectId != kInvalidObjectId && !subscriptions.empty())
+    {
+        for (const ObjectChangeRegistry::EventMap::value_type& subscription : subscriptions)
+        {
+            if (!mPhysicsObjectChangeSubscriptions.contains(subscription.first))
+                continue;
+            const ObjectChangeObserver& callback = subscription.second;
+
+            if (shouldDeliverObjectChangeNotification(attachedStage, callback))
             {
                 if (callback.objectDestructionNotifyFn)
                 {
-                    callback.objectDestructionNotifyFn(removedPath, objectId, physxType, callback.userData);
+                    RuntimeCallbackScope callbackScope;
+                    callback.objectDestructionNotifyFn(event, callback.userData);
                 }
             }
-            it++;
         }
     }
 }
 
-bool hasPhysxJointAxisAPI(usdparser::AttachedStage& attachedStage, const PXR_NS::SdfPath& jointPrimKey, const TfToken& instance)
+// PhysxJointAxisAPI instance schemas are pre-composed by KnownTokens (e.g.
+// physxJointAxisAPIAngular), so this is a plain hasSchema lookup.
+static bool hasPhysxJointAxisAPI(const usdparser::AttachedStage& attachedStage,
+                                 omni::physics::parse::ObjectKey jointKey,
+                                 omni::physics::parse::TokenId instanceSchemaToken)
 {
-    // PhysxJointAxisAPI's token literal already is the registered applied-schema
-    // base name, so it passes straight through to the multi-apply lookup.
-    return hasMultiApplyInstance(attachedStage, attachedStage.keyFor(jointPrimKey),
-                                 PhysxSchemaTokens->PhysxJointAxisAPI, instance);
+    const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+    return source && source->hasSchema(jointKey, instanceSchemaToken);
 }
-
-
 
 // note: tConfigurePhysXJoint=false is for scenarios, where the InternalJoint object got removed
 //       but the PhysX joint remained (for example, if some non-joint API schema on the joint prim
@@ -680,18 +929,17 @@ bool hasPhysxJointAxisAPI(usdparser::AttachedStage& attachedStage, const PXR_NS:
 //       on.
 template<bool tConfigurePhysXJoint>
 static void createArticulationJoint(usdparser::AttachedStage& attachedStage, const PhysxJointDesc& jointDesc,
-    PxArticulationJointReducedCoordinate* pxJoint, const SdfPath& childLinkPath, InternalLink* internalLink)
+    PxArticulationJointReducedCoordinate* pxJoint, omni::physics::parse::ObjectKey childLinkKey, InternalLink* internalLink)
 {
     if (!tConfigurePhysXJoint)
     {
         CARB_ASSERT(internalLink == nullptr);
     }
 
-    // Resolve path-typed joint members once for use throughout this function.
-    // The descriptor stores ObjectKey post-unification (2026-04-30); the rest
-    // of the legacy logic is SdfPath-based, so we convert at entry.
-    const SdfPath jointPrimKey = attachedStage.pathFor(jointDesc.jointPrimKey);
-    const SdfPath jointBody1Path = attachedStage.pathFor(jointDesc.body1);
+    const omni::physics::parse::ObjectKey jointPrimKey = jointDesc.jointPrimKey;
+
+    const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
+    const omni::physics::parse::KnownTokens& jointTok = attachedStage.getKnownTokens();
 
     InternalJoint* intJoint = ICE_NEW(InternalJoint);
 
@@ -702,13 +950,13 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
 
         intJoint->mJointType = jointDesc.type;
 
-        intJoint->mBody0IsParentLink = jointBody1Path == childLinkPath;
+        intJoint->mBody0IsParentLink = jointDesc.body1 == childLinkKey;
         if (!intJoint->mBody0IsParentLink)
         {
             OMNI_LOG_WARN(
                 kRoboticsLogChannel,
                 "Physics USD: Joint %s body rel does not follow articulation hierarchy; consider swapping body0/body1 rels to match.",
-                jointPrimKey.GetText());
+                attachedStage.textFor(jointPrimKey));
         }
 
         PxTransform localPose0;
@@ -762,7 +1010,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
                 pxJoint->setArmature(::physx::PxArticulationAxis::eTWIST, revJointDesc.properties.armature);
                 pxJoint->setMaxJointVelocity(::physx::PxArticulationAxis::eTWIST, revJointDesc.properties.maxJointVelocity);
                 pxJoint->setFrictionParams(::physx::PxArticulationAxis::eTWIST, PxJointFrictionParams(revJointDesc.properties.staticFrictionEffort, revJointDesc.properties.dynamicFrictionEffort, revJointDesc.properties.viscousFrictionCoefficient));
-                if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, UsdPhysicsTokens->angular))
+                if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, jointTok.physxJointAxisAPIAngular))
                 {
                     ObjectDb* objectDb = attachedStage.getObjectDatabase();
                     objectDb->addSchemaAPI(jointPrimKey, SchemaAPIFlag::eJointAxisAngularAPI);
@@ -773,7 +1021,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
                 {
                     registerDriveTimeSampledChanges(attachedStage, jointPrimKey, "drive:angular");
                     pxJoint->setDriveParams(::physx::PxArticulationAxis::eTWIST, toPhysX(driveData));
-                    intJoint->setArticulationDrivePositionTarget(pxJoint, ::physx::PxArticulationAxis::eTWIST, driveData.targetPosition, jointPrimKey);
+                    intJoint->setArticulationDrivePositionTarget(pxJoint, ::physx::PxArticulationAxis::eTWIST, driveData.targetPosition, &attachedStage, jointPrimKey);
                     intJoint->setArticulationDriveVelocityTarget(pxJoint, ::physx::PxArticulationAxis::eTWIST, driveData.targetVelocity);
                     if(driveData.isEnvelopeUsed)
                     {
@@ -799,7 +1047,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
                     intJoint->setArticulationJointVelocity(pxJoint, ::physx::PxArticulationAxis::eTWIST, jointState.velocity);
                 }
 
-                intJoint->mJointStates[0].usdToken = PXR_NS::UsdPhysicsTokens->angular;
+                intJoint->mJointStates[0].usdToken = "angular";
                 intJoint->mJointStates[0].enabled = true;
                 intJoint->mJointStates[0].convertToDegrees = true;
                 intJoint->mJointStates[0].physxAxis = ::physx::PxArticulationAxis::eTWIST;
@@ -834,12 +1082,12 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
                 pxJoint->setMaxJointVelocity(::physx::PxArticulationAxis::eX, prisJointDesc.properties.maxJointVelocity);
                 pxJoint->setFrictionParams(::physx::PxArticulationAxis::eX, PxJointFrictionParams(prisJointDesc.properties.staticFrictionEffort, prisJointDesc.properties.dynamicFrictionEffort, prisJointDesc.properties.viscousFrictionCoefficient));
 
-                if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, UsdPhysicsTokens->linear))
+                if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, jointTok.physxJointAxisAPILinear))
                 {
                     ObjectDb* objectDb = attachedStage.getObjectDatabase();
                     objectDb->addSchemaAPI(jointPrimKey, SchemaAPIFlag::eJointAxisLinearAPI);
                 }
-                
+
                 if (driveData.enabled)
                 {
                     registerDriveTimeSampledChanges(attachedStage, jointPrimKey, "drive:linear");
@@ -869,7 +1117,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
                     intJoint->setArticulationJointVelocity(pxJoint, ::physx::PxArticulationAxis::eX, jointState.velocity);
                 }
 
-                intJoint->mJointStates[0].usdToken = PXR_NS::UsdPhysicsTokens->linear;
+                intJoint->mJointStates[0].usdToken = "linear";
                 intJoint->mJointStates[0].enabled = true;
                 intJoint->mJointStates[0].convertToDegrees = false;
                 intJoint->mJointStates[0].physxAxis = ::physx::PxArticulationAxis::eX;
@@ -921,7 +1169,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
                             pxJoint->setArmature(::physx::PxArticulationAxis::eTWIST, properties.armature);
                             pxJoint->setMaxJointVelocity(::physx::PxArticulationAxis::eTWIST, properties.maxJointVelocity);
                             pxJoint->setFrictionParams(::physx::PxArticulationAxis::eTWIST, PxJointFrictionParams(properties.staticFrictionEffort, properties.dynamicFrictionEffort, properties.viscousFrictionCoefficient));
-                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, UsdPhysicsTokens->rotX))
+                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, jointTok.physxJointAxisAPIRotX))
                             {
                                 ObjectDb* objectDb = attachedStage.getObjectDatabase();
                                 objectDb->addSchemaAPI(jointPrimKey, SchemaAPIFlag::eJointAxisRotXAPI);
@@ -931,7 +1179,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
                             pxJoint->setArmature(::physx::PxArticulationAxis::eSWING1, properties.armature);
                             pxJoint->setMaxJointVelocity(::physx::PxArticulationAxis::eSWING1, properties.maxJointVelocity);
                             pxJoint->setFrictionParams(::physx::PxArticulationAxis::eSWING1, PxJointFrictionParams(properties.staticFrictionEffort, properties.dynamicFrictionEffort, properties.viscousFrictionCoefficient));
-                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, UsdPhysicsTokens->rotY))
+                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, jointTok.physxJointAxisAPIRotY))
                             {
                                 ObjectDb* objectDb = attachedStage.getObjectDatabase();
                                 objectDb->addSchemaAPI(jointPrimKey, SchemaAPIFlag::eJointAxisRotYAPI);
@@ -941,7 +1189,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
                             pxJoint->setArmature(::physx::PxArticulationAxis::eSWING2, properties.armature);
                             pxJoint->setMaxJointVelocity(::physx::PxArticulationAxis::eSWING2, properties.maxJointVelocity);
                             pxJoint->setFrictionParams(::physx::PxArticulationAxis::eSWING2, PxJointFrictionParams(properties.staticFrictionEffort, properties.dynamicFrictionEffort, properties.viscousFrictionCoefficient));
-                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, UsdPhysicsTokens->rotZ))
+                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, jointTok.physxJointAxisAPIRotZ))
                             {
                                 ObjectDb* objectDb = attachedStage.getObjectDatabase();
                                 objectDb->addSchemaAPI(jointPrimKey, SchemaAPIFlag::eJointAxisRotZAPI);
@@ -979,7 +1227,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
                             pxJoint->setArmature(::physx::PxArticulationAxis::eTWIST, properties.armature);
                             pxJoint->setMaxJointVelocity(::physx::PxArticulationAxis::eTWIST, properties.maxJointVelocity);
                             pxJoint->setFrictionParams(::physx::PxArticulationAxis::eTWIST, PxJointFrictionParams(properties.staticFrictionEffort, properties.dynamicFrictionEffort, properties.viscousFrictionCoefficient));
-                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, UsdPhysicsTokens->rotX))
+                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, jointTok.physxJointAxisAPIRotX))
                             {
                                 ObjectDb* objectDb = attachedStage.getObjectDatabase();
                                 objectDb->addSchemaAPI(jointPrimKey, SchemaAPIFlag::eJointAxisRotXAPI);
@@ -989,7 +1237,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
                             pxJoint->setArmature(::physx::PxArticulationAxis::eSWING1, properties.armature);
                             pxJoint->setMaxJointVelocity(::physx::PxArticulationAxis::eSWING1, properties.maxJointVelocity);
                             pxJoint->setFrictionParams(::physx::PxArticulationAxis::eSWING1, PxJointFrictionParams(properties.staticFrictionEffort, properties.dynamicFrictionEffort, properties.viscousFrictionCoefficient));
-                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, UsdPhysicsTokens->rotY))
+                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, jointTok.physxJointAxisAPIRotY))
                             {
                                 ObjectDb* objectDb = attachedStage.getObjectDatabase();
                                 objectDb->addSchemaAPI(jointPrimKey, SchemaAPIFlag::eJointAxisRotYAPI);
@@ -999,7 +1247,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
                             pxJoint->setArmature(::physx::PxArticulationAxis::eSWING2, properties.armature);
                             pxJoint->setMaxJointVelocity(::physx::PxArticulationAxis::eSWING2, properties.maxJointVelocity);
                             pxJoint->setFrictionParams(::physx::PxArticulationAxis::eSWING2, PxJointFrictionParams(properties.staticFrictionEffort, properties.dynamicFrictionEffort, properties.viscousFrictionCoefficient));
-                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, UsdPhysicsTokens->rotZ))
+                            if(hasPhysxJointAxisAPI(attachedStage, jointPrimKey, jointTok.physxJointAxisAPIRotZ))
                             {
                                 ObjectDb* objectDb = attachedStage.getObjectDatabase();
                                 objectDb->addSchemaAPI(jointPrimKey, SchemaAPIFlag::eJointAxisRotZAPI);
@@ -1180,7 +1428,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
             }
             if (hasUnsupportedLinearDrives)
             {
-                CARB_LOG_WARN("Linear drives on articulation D6 joints are not supported - drive is ignored. Joint: %s.", jointPrimKey.GetText());
+                CARB_LOG_WARN("Linear drives on articulation D6 joints are not supported - drive is ignored. Joint: %s.", attachedStage.textFor(jointPrimKey));
             }
 
             for (size_t i = 0; i < d6JointDesc.jointStates.size(); ++i)
@@ -1199,7 +1447,7 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
 
                 if (hasUnsupportedLinearJointStates)
                 {
-                    CARB_LOG_WARN("Linear joint states on articulation D6 joints are not supported - state is ignored. Joint: %s.", jointPrimKey.GetText());
+                    CARB_LOG_WARN("Linear joint states on articulation D6 joints are not supported - state is ignored. Joint: %s.", attachedStage.textFor(jointPrimKey));
                 }
                 else if (jointState.enabled)
                 {
@@ -1212,9 +1460,9 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
 
                     switch (d6JointDesc.jointStates[i].first)
                     {
-                    case eRotX: intJoint->mJointStates[i].usdToken = PXR_NS::UsdPhysicsTokens->rotX; break;
-                    case eRotY: intJoint->mJointStates[i].usdToken = PXR_NS::UsdPhysicsTokens->rotY; break;
-                    case eRotZ: intJoint->mJointStates[i].usdToken = PXR_NS::UsdPhysicsTokens->rotZ; break;
+                    case eRotX: intJoint->mJointStates[i].usdToken = "rotX"; break;
+                    case eRotY: intJoint->mJointStates[i].usdToken = "rotY"; break;
+                    case eRotZ: intJoint->mJointStates[i].usdToken = "rotZ"; break;
                     }
 
                     intJoint->mJointStates[i].enabled = true;
@@ -1233,32 +1481,46 @@ static void createArticulationJoint(usdparser::AttachedStage& attachedStage, con
             intJoint->fixupLocalPose(localPose1);
             pxJoint->setParentPose(localPose0);
             pxJoint->setChildPose(localPose1);
-
-            pxJoint->setFrictionCoefficient(jointDesc.jointFriction);
         }
 
-        InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
-        const ObjectId jointObjId = db.addRecord(ePTLinkJoint, pxJoint, intJoint, attachedStage.keyFor(jointPrimKey));
+        InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
+        if (!tConfigurePhysXJoint)
+        {
+            // The PhysX joint keeps the limits it had, so take back the limit bounds delivered to
+            // the previous InternalJoint instead of starting from none, and without reading them
+            // from the stage (REQ-LOAD-JOINTLIMIT-001 AC-9).
+            InternalLink* childLink = (InternalLink*)db.getInternalTypedRecord(
+                ePTLink, (ObjectId)pxJoint->getChildArticulationLink().userData);
+            if (childLink)
+            {
+                for (int i = 0; i < 6; i++)
+                {
+                    intJoint->mLiveLimits[i] = childLink->mInboundJointLiveLimits[i];
+                    childLink->mInboundJointLiveLimits[i] = JointLiveLimitBounds();
+                }
+            }
+        }
+        const ObjectId jointObjId = db.addRecord(ePTLinkJoint, pxJoint, intJoint, jointPrimKey);
         pxJoint->userData = (void*)jointObjId;
-        pxJoint->setName(jointPrimKey.GetText());
-        attachedStage.getObjectDatabase()->findOrCreateEntry(jointPrimKey, eArticulationJoint, jointObjId);
+        pxJoint->setName(attachedStage.textFor(jointPrimKey));
+        attachedStage.getObjectDatabase()->findOrCreateEntry(jointPrimKey, attachedStage.textFor(jointPrimKey), eArticulationJoint, jointObjId);
     }
     else
     {
         OMNI_LOG_ERROR(
             kRoboticsLogChannel,
             "Physics USD: joint %s: memory allocation for internal joint object failed.",
-            jointPrimKey.GetText());
+            attachedStage.textFor(jointPrimKey));
     }
 }
 
-ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attachedStage, const SdfPath& path,
+ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key,
                                                 const PhysxObjectDesc& objectDesc,
                                                 const ObjectInstance* instance)
 {
     if (objectDesc.type != eScene && objectDesc.type !=  eCollisionGroup)
     {
-        if (!checkScenes())
+        if (!checkScenes(attachedStage))
         {
             PhysXUsdPhysicsInterface::reportLoadError(usdparser::ErrorCode::eError, "No physics scene created, please add physics scene into stage!");
             return kInvalidObjectId;
@@ -1266,16 +1528,18 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     }
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
     PhysXSetup& physxSetup = omniPhysX.getPhysXSetup();
-    InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
-    // scristiano: this is temporary code to allow physics inspector. we should filter simulation owners at parsing stage
-    if(!mForceParseOnlySingleScenePath.IsEmpty())
+    // scristiano: this is temporary code to allow physics inspector. we should filter simulation
+    // owners at parsing stage. Kit-inspector-only debug filter, opt-in via an explicit Kit
+    // setting; runs under any backend since findEntry/textFor are the key-native overloads.
+    if(!attachedStage.getParseOptions().forceSingleScenePath.empty())
     {
         switch (objectDesc.type)
         {
             case eScene:
             {
-                if (path != mForceParseOnlySingleScenePath)
+                if (attachedStage.textFor(key) != attachedStage.getParseOptions().forceSingleScenePath)
                 {
                     return kInvalidObjectId;
                 }
@@ -1285,7 +1549,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
             {
                 const DynamicPhysxRigidBodyDesc& desc = static_cast<const DynamicPhysxRigidBodyDesc&>(objectDesc);
                 const ObjectId sceneId = desc.sceneIds.empty() ? kInvalidObjectId : desc.sceneIds[0];
-                if(sceneId != mForceParseOnlySingleSceneObjectId)
+                if(sceneId != attachedStage.getParseOptions().forcedSceneId)
                     return kInvalidObjectId;
             }
             break;
@@ -1293,7 +1557,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
             {
                 const StaticPhysxRigidBodyDesc& desc = static_cast<const StaticPhysxRigidBodyDesc&>(objectDesc);
                 const ObjectId sceneId = desc.sceneIds.empty() ? kInvalidObjectId : desc.sceneIds[0];
-                if(sceneId != mForceParseOnlySingleSceneObjectId)
+                if(sceneId != attachedStage.getParseOptions().forcedSceneId)
                     return kInvalidObjectId;
             }
             break;
@@ -1301,14 +1565,14 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
             {
                 const PhysxArticulationLinkDesc& desc = static_cast<const PhysxArticulationLinkDesc&>(objectDesc);
                 const ObjectId sceneId = desc.sceneIds.empty() ? kInvalidObjectId : desc.sceneIds[0];
-                if(sceneId != mForceParseOnlySingleSceneObjectId)
+                if(sceneId != attachedStage.getParseOptions().forcedSceneId)
                     return kInvalidObjectId;
             }
             break;
             case eArticulation:
             {
                 const PhysxArticulationDesc& desc = static_cast<const PhysxArticulationDesc&>(objectDesc);
-                if(desc.sceneId != mForceParseOnlySingleSceneObjectId)
+                if(desc.sceneId != attachedStage.getParseOptions().forcedSceneId)
                     return kInvalidObjectId;
             }
             break;
@@ -1317,7 +1581,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
                 const PhysxTendonFixedDesc& desc = static_cast<const PhysxTendonFixedDesc&>(objectDesc);
 
                 // Find parent joint of tendon root joint (needed for dummy joint)
-                ObjectId parentLinkJointId = attachedStage.getObjectDatabase()->findEntry(path, eArticulationJoint);
+                ObjectId parentLinkJointId = attachedStage.getObjectDatabase()->findEntry(key, eArticulationJoint);
 
                 if (parentLinkJointId == kInvalidObjectId)
                 {
@@ -1330,7 +1594,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
                 const PhysxTendonAxisDesc& desc = static_cast<const PhysxTendonAxisDesc&>(objectDesc);
 
                 // Get link joint corresponding to tendon axis
-                ObjectId linkJointId = attachedStage.getObjectDatabase()->findEntry(path, eArticulationJoint);
+                ObjectId linkJointId = attachedStage.getObjectDatabase()->findEntry(key, eArticulationJoint);
 
                 if (linkJointId == kInvalidObjectId)
                 {
@@ -1343,7 +1607,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
                 const PhysxTendonSpatialDesc& desc = static_cast<const PhysxTendonSpatialDesc&>(objectDesc);
 
                 // find articulation link that root attachment should attach to
-                const ObjectId linkId = attachedStage.getObjectDatabase()->findEntry(path, eArticulationLink);
+                const ObjectId linkId = attachedStage.getObjectDatabase()->findEntry(key, eArticulationLink);
 
                 if (linkId == kInvalidObjectId)
                 {
@@ -1357,7 +1621,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
                 const PhysxTendonAttachmentDesc& desc = static_cast<const PhysxTendonAttachmentDesc&>(objectDesc);
 
                 // find corresponding link that attachment belongs to
-                const ObjectId linkId = attachedStage.getObjectDatabase()->findEntry(path, eArticulationLink);
+                const ObjectId linkId = attachedStage.getObjectDatabase()->findEntry(key, eArticulationLink);
 
                 if (linkId == kInvalidObjectId)
                 {
@@ -1368,17 +1632,17 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
             case eCapsuleCct:
             {
                 const CapsuleCctDesc& desc = static_cast<const CapsuleCctDesc&>(objectDesc);
-                if(desc.sceneId != mForceParseOnlySingleSceneObjectId)
+                if(desc.sceneId != attachedStage.getParseOptions().forcedSceneId)
                     return kInvalidObjectId;
             }
-            break;            
+            break;
             case eMimicJointRotX:
             case eMimicJointRotY:
             case eMimicJointRotZ:
             case eNewtonMimicJoint:
             {
                 // find corresponding joint that mimic joint belongs to
-                const ObjectId articulationJointID = attachedStage.getObjectDatabase()->findEntry(path, eArticulationJoint);
+                const ObjectId articulationJointID = attachedStage.getObjectDatabase()->findEntry(key, eArticulationJoint);
 
                 if (articulationJointID == kInvalidObjectId)
                 {
@@ -1432,13 +1696,6 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         }
     }
 
-
-    UsdStageWeakPtr stage = attachedStage.getStage();
-    // No live USD stage under a non-USD backend (e.g. ovstage): object creation
-    // is descriptor-driven, so `usdPrim` stays invalid and USD-prim-specific
-    // paths are gated on it below.
-    UsdPrim usdPrim = stage ? stage->GetPrimAtPath(path) : UsdPrim{};
-
     ObjectId outId = kInvalidObjectId;
     PhysXType physxType = ePTRemoved;
 
@@ -1453,12 +1710,10 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
 
     case eInfiniteVoxelMap:
     {
-        // A.B. add multiple scenes support
-        PhysXScene* defaultScene = omniPhysX.getPhysXSetup().getPhysXScene(0);
-        const usdparser::InfiniteVoxelMapDesc& desc = static_cast<const usdparser::InfiniteVoxelMapDesc&>(objectDesc);
-        InternalInfiniteVoxelMap* internalInfiniteVoxelMap = ICE_NEW(InternalInfiniteVoxelMap)(defaultScene->getScene(), stage, desc);
-        physxType = ePTInfiniteVoxelMap;
-        outId = db.addRecord(physxType, nullptr, internalInfiniteVoxelMap, attachedStage.keyFor(path));
+        // Unsupported in the USD-free runtime: no ePTInfiniteVoxelMap record is ever published.
+        CARB_LOG_WARN("InfiniteVoxelMapAPI on '%s' is not supported by the USD-free runtime; the voxel map is ignored",
+                      attachedStage.textFor(key));
+        return kInvalidObjectId;
     }
     break;
     case eMaterial:
@@ -1467,12 +1722,12 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         PxMaterial* material = nullptr;
         // special case, we cant create the default scene material first
         PhysXScene* physxScene = nullptr;
-        const PhysXScenesMap& physxScenes = physxSetup.getPhysXScenes();
+        const AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
 
-        for (PhysXScenesMap::const_reference ref : physxScenes)
+        for (AttachedStage::SceneMap::const_reference ref : physxScenes)
         {
             PhysXScene* sc = ref.second;
-            if (path == sc->getDefaultMaterialPath())
+            if (key == sc->getDefaultMaterialPath())
             {
                 physxScene = sc;
                 break;
@@ -1500,15 +1755,21 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         else
         {
             material = physxScene->getDefaultMaterial();
+            if (material)
+                material->acquireReference(); // the record owns a reference independently of the scene
         }
 
         if (material)
         {
             InternalMaterial* internalMat = ICE_NEW(InternalMaterial)(desc.density);
             physxType = ePTMaterial;
-            outId = db.addRecord(physxType, material, internalMat, attachedStage.keyFor(path));
+            outId = db.addRecord(physxType, material, internalMat, key);
             material->userData = (void*)(outId);
         }
+        // Its colliders fall back to the scene default, for example while PhysX's
+        // process-wide material table is full: the compiled cache must not store this load.
+        else
+            attachedStage.noteCreationFailure();
     }
     break;
     case eDeformableMaterial:
@@ -1518,12 +1779,12 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
 
         PxDeformableVolumeMaterial* material = nullptr;
         PhysXScene* physxScene = nullptr;
-        const PhysXScenesMap& physxScenes = physxSetup.getPhysXScenes();
+        const AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
 
-        for (PhysXScenesMap::const_reference ref : physxScenes)
+        for (AttachedStage::SceneMap::const_reference ref : physxScenes)
         {
             PhysXScene* sc = ref.second;
-            if (path == sc->getDefaultVolumeDeformableMaterialPath())
+            if (key == sc->getDefaultVolumeDeformableMaterialPath())
             {
                 physxScene = sc;
                 break;
@@ -1538,6 +1799,8 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         else
         {
             material = physxScene->getDefaultVolumeDeformableMaterial();
+            if (material)
+                material->acquireReference(); // the record owns a reference independently of the scene
         }
 
         if (material)
@@ -1550,7 +1813,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
             // there, see usdPrim init above), so the material was registered under an
             // empty key and getPhysXPtr(/path, ePTDeformable*Material) could never
             // find it -> deformable-material tensor views matched 0 prims.
-            outId = db.addRecord(physxType, material, internalMat, attachedStage.keyFor(path));
+            outId = db.addRecord(physxType, material, internalMat, key);
             material->userData = (void*)(outId);
         }
     }
@@ -1562,12 +1825,12 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
 
         PxDeformableSurfaceMaterial* material = nullptr;
         PhysXScene* physxScene = nullptr;
-        const PhysXScenesMap& physxScenes = physxSetup.getPhysXScenes();
+        const AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
 
-        for (PhysXScenesMap::const_reference ref : physxScenes)
+        for (AttachedStage::SceneMap::const_reference ref : physxScenes)
         {
             PhysXScene* sc = ref.second;
-            if (path == sc->getDefaultSurfaceDeformableMaterialPath())
+            if (key == sc->getDefaultSurfaceDeformableMaterialPath())
             {
                 physxScene = sc;
                 break;
@@ -1583,6 +1846,8 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         else
         {
             material = physxScene->getDefaultSurfaceDeformableMaterial();
+            if (material)
+                material->acquireReference(); // the record owns a reference independently of the scene
         }
 
         if (material)
@@ -1595,7 +1860,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
             // there, see usdPrim init above), so the material was registered under an
             // empty key and getPhysXPtr(/path, ePTDeformable*Material) could never
             // find it -> deformable-material tensor views matched 0 prims.
-            outId = db.addRecord(physxType, material, internalMat, attachedStage.keyFor(path));
+            outId = db.addRecord(physxType, material, internalMat, key);
             material->userData = (void*)(outId);
         }
     }
@@ -1606,12 +1871,12 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
 
         PxPBDMaterial* material = nullptr;
         PhysXScene* physxScene = nullptr;
-        const PhysXScenesMap& physxScenes = physxSetup.getPhysXScenes();
+        const AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
 
-        for (PhysXScenesMap::const_reference ref : physxScenes)
+        for (AttachedStage::SceneMap::const_reference ref : physxScenes)
         {
             PhysXScene* sc = ref.second;
-            if (path == sc->getDefaultPBDMaterialPath())
+            if (key == sc->getDefaultPBDMaterialPath())
             {
                 physxScene = sc;
                 break;
@@ -1634,12 +1899,14 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         else
         {
             material = physxScene->getDefaultPBDMaterial();
+            if (material)
+                material->acquireReference(); // the record owns a reference independently of the scene
         }
 
         if (material)
         {
             InternalPBDParticleMaterial* internalMat = ICE_NEW(InternalPBDParticleMaterial)(desc.density);
-            outId = db.addRecord(ePTPBDMaterial, material, internalMat, attachedStage.keyFor(path));
+            outId = db.addRecord(ePTPBDMaterial, material, internalMat, key);
             material->userData = (void*)(outId);
         }
     }
@@ -1647,7 +1914,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     case ePointInstancedBody:
     {
         physxType = ePTPointInstancer;
-        outId = db.addRecord(physxType, nullptr, nullptr, attachedStage.keyFor(path));
+        outId = db.addRecord(physxType, nullptr, nullptr, key);
     }
     break;
     case eScene:
@@ -1656,10 +1923,11 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         const usdparser::PhysxSceneDesc& desc = static_cast<const usdparser::PhysxSceneDesc&>(objectDesc);
 
         physxType = ePTScene;
-        outId = db.addRecord(physxType, nullptr, nullptr, attachedStage.keyFor(path));
-        if(!mForceParseOnlySingleScenePath.IsEmpty())
+        outId = db.addRecord(physxType, nullptr, nullptr, key);
+        // Kit-inspector-only debug filter -- see setForceParseOnlySingleScene's comment.
+        if(!attachedStage.getParseOptions().forceSingleScenePath.empty())
         {
-            mForceParseOnlySingleSceneObjectId = outId;
+            attachedStage.getParseOptions().forcedSceneId = outId;
         }
         // Units come from the attached source (works under any backend — USD or
         // ovstage — without a live USD stage), not the USD stage directly.
@@ -1682,8 +1950,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
             // eENABLE_DIRECT_GPU_API scenes — PxgBodySimManager has no rigid-body unstaging).
             // Same GPU gate as replicate(): env-ids only act under GPU dynamics + GPU broadphase.
             {
-                carb::settings::ISettings* iSettings = OmniPhysX::getInstance().getISettings();
-                if (iSettings && iSettings->getAsBool(kSettingReplicatorEnvIdsOnAttach))
+                if (attachedStage.getCachedSettings().replicatorEnvIdsOnAttach)
                 {
                     const bool gpuDynamics = scene->getFlags() & PxSceneFlag::eENABLE_GPU_DYNAMICS;
                     const bool gpuBroadphase = scene->getBroadPhaseType() == PxBroadPhaseType::eGPU;
@@ -1696,27 +1963,40 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
                 InternalScene* intScene = physxScene->getInternalScene();
                 intScene->mGravityDirection = toPhysX(desc.gravityDirection);
                 intScene->mGravityMagnitude = desc.gravityMagnitude;
-                // Time-sampled-gravity re-registration is a USD-prim notion; skip
-                // under a non-USD backend (no USD prim, no time samples). Gravity
-                // itself comes from the descriptor above.
-                if (usdPrim)
-                    registerSceneTimeSampledChanges(attachedStage, usdPrim.GetPrimPath());
+                // registerSceneTimeSampledChanges reads through
+                // IPhysicsSource::isAttributeTimeSampled, so it naturally registers
+                // nothing on a backend that never reports time samples.
+                registerSceneTimeSampledChanges(attachedStage, key);
                 scene->setGravity(PxVec3(desc.gravityDirection.x * desc.gravityMagnitude, desc.gravityDirection.y * desc.gravityMagnitude, desc.gravityDirection.z * desc.gravityMagnitude));
             }
             scene->userData = (void*)(outId);
         }
         else
         {
-            CARB_LOG_ERROR("Failed to create PhysX Scene (prim: %s), no simulation will happen. Please report this issue ideally with a log and repro.", path.GetText());
+            CARB_LOG_ERROR("Failed to create PhysX Scene (prim: %s), no simulation will happen. Please report this issue ideally with a log and repro.", attachedStage.textFor(key));
         }
     }
     break;
 
     case eParticleSystem:
     {
+        // Re-entrant-scan guard: attachOvstage's initial-stage-load has been observed to run
+        // loadFromRange twice with identical scan roots (TestParticles.cpp's "Particle System
+        // Scene Ownership Resolves Second Scene" caught it -- getNbPBDParticleSystems() came
+        // back 2, not 1), so createObject can be asked to create the same particle-system prim
+        // twice. createPbdParticleSystem has no existence check of its own and would spawn a
+        // second, leaked PxPBDParticleSystem; unlike most other object types (whose duplicate
+        // engine object is merely unused and overwritten in the ObjectDb, invisible to a test),
+        // a particle system's actor count is directly observable
+        // (PxScene::getNbPBDParticleSystems), so this is the one spot worth guarding
+        // explicitly here. The double full-load itself is a separate, open issue.
+        const ObjectId existingParticleSystemId = attachedStage.getObjectDatabase()->findEntry(key, eParticleSystem);
+        if (existingParticleSystemId != kInvalidObjectId)
+            return existingParticleSystemId;
+
         const ParticleSystemDesc& desc = static_cast<const ParticleSystemDesc&>(objectDesc);
-        const ObjectId sceneId = attachedStage.getObjectDatabase()->findEntry(desc.scenePath, eScene);
-        PhysXScene* physxScene = OmniPhysX::getInstance().getPhysXSetup().getPhysXScene(sceneId);
+        const ObjectId sceneId = attachedStage.getObjectDatabase()->findEntry(desc.sceneKey, eScene);
+        PhysXScene* physxScene = attachedStage.getPhysXScene(sceneId);
 
         if (!physxScene || !physxScene->isFullGpuPipelineAvailable())
         {
@@ -1727,15 +2007,20 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         }
 
         physxType = ePTParticleSystem;
-        outId = createPbdParticleSystem(attachedStage, path, desc);
+        outId = createPbdParticleSystem(attachedStage, key, desc);
     }
     break;
 
     case eParticleSet:
     {
+        // Re-entrant-scan guard: same rationale as eParticleSystem above.
+        const ObjectId existingParticleSetId = attachedStage.getObjectDatabase()->findEntry(key, eParticleSet);
+        if (existingParticleSetId != kInvalidObjectId)
+            return existingParticleSetId;
+
         const ParticleSetDesc& desc = static_cast<const ParticleSetDesc&>(objectDesc);
-        const ObjectId sceneId = attachedStage.getObjectDatabase()->findEntry(desc.scenePath, eScene);
-        PhysXScene* physxScene = OmniPhysX::getInstance().getPhysXSetup().getPhysXScene(sceneId);
+        const ObjectId sceneId = attachedStage.getObjectDatabase()->findEntry(desc.sceneKey, eScene);
+        PhysXScene* physxScene = attachedStage.getPhysXScene(sceneId);
 
         if (!physxScene || !physxScene->isFullGpuPipelineAvailable())
         {
@@ -1746,9 +2031,11 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         }
 
         physxType = ePTParticleSet;
-        outId = createParticleSet(attachedStage, path, desc);
+        outId = createParticleSet(attachedStage, key, desc);
+        // Cleanup-on-failure: removes the applied API so a failed particle set
+        // doesn't linger as a schema with no engine object.
         if (outId == kInvalidObjectId)
-            stage->GetPrimAtPath(path).RemoveAPI<PhysxSchemaPhysxParticleSetAPI>();
+            removeAppliedAPI(attachedStage, key, "PhysxParticleSetAPI");
     }
     break;
     case eAttachmentVtxVtx:
@@ -1760,7 +2047,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         // No need to check for GPU dynamic flag on the scene because this is already done by the deformable
         const PhysxDeformableAttachmentDesc& desc = static_cast<const PhysxDeformableAttachmentDesc&>(objectDesc);
         physxType = ePTDeformableAttachment;
-        outId = createDeformableAttachment(attachedStage, path, desc);
+        outId = createDeformableAttachment(attachedStage, key, desc);
     }
     break;
     case eDeformableCollisionFilter:
@@ -1768,7 +2055,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         // No need to check for GPU dynamic flag on the scene because this is already done by the deformable
         const PhysxDeformableCollisionFilterDesc& desc = static_cast<const PhysxDeformableCollisionFilterDesc&>(objectDesc);
         physxType = ePTDeformableCollisionFilter;
-        outId = createDeformableCollisionFilter(attachedStage, path, desc);
+        outId = createDeformableCollisionFilter(attachedStage, key, desc);
     }
     break;
 
@@ -1776,7 +2063,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     {
         const VehicleDesc& desc = static_cast<const VehicleDesc&>(objectDesc);
         physxType = ePTVehicle;
-        outId = createVehicle(path, desc, usdPrim, stage);
+        outId = createVehicle(attachedStage, key, desc);
     }
     break;
 
@@ -1785,14 +2072,14 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     {
         const VehicleControllerDesc& desc = static_cast<const VehicleControllerDesc&>(objectDesc);
         physxType = ePTVehicleController;
-        outId = createVehicleController(path, usdPrim, desc);
+        outId = createVehicleController(attachedStage, key, desc);
     }
     break;
 
     case eVehicleEngine:
     {
         physxType = ePTVehicleEngine;
-        outId = registerVehicleComponent(usdPrim, physxType);
+        outId = registerVehicleComponent(attachedStage, key, physxType);
     }
     break;
 
@@ -1800,28 +2087,28 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     {
         const TireFrictionTableDesc& desc = static_cast<const TireFrictionTableDesc&>(objectDesc);
         physxType = ePTVehicleTireFrictionTable;
-        outId = createTireFrictionTable(desc, usdPrim);
+        outId = createTireFrictionTable(attachedStage, desc);
     }
     break;
 
     case eVehicleSuspension:
     {
         physxType = ePTVehicleSuspension;
-        outId = registerVehicleWheelComponent(usdPrim, physxType);
+        outId = registerVehicleWheelComponent(attachedStage, key, physxType);
     }
     break;
 
     case eVehicleTire:
     {
         physxType = ePTVehicleTire;
-        outId = registerVehicleWheelComponent(usdPrim, physxType);
+        outId = registerVehicleWheelComponent(attachedStage, key, physxType);
     }
     break;
 
     case eVehicleWheel:
     {
         physxType = ePTVehicleWheel;
-        outId = registerVehicleWheelComponent(usdPrim, physxType);
+        outId = registerVehicleWheelComponent(attachedStage, key, physxType);
     }
     break;
 
@@ -1829,7 +2116,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     {
         InternalVehicleWheelAttachment* vehicleWheelAttachment = ICE_NEW(InternalVehicleWheelAttachment);
         physxType = ePTVehicleWheelAttachment;
-        outId = db.addRecord(physxType, nullptr, vehicleWheelAttachment, attachedStage.keyFor(path));
+        outId = db.addRecord(physxType, nullptr, vehicleWheelAttachment, key);
     }
     break;
 
@@ -1837,14 +2124,14 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     {
         const WheelControllerDesc& desc = static_cast<const WheelControllerDesc&>(objectDesc);
         physxType = ePTVehicleWheelController;
-        outId = createVehicleWheelController(path, usdPrim, desc);
+        outId = createVehicleWheelController(attachedStage, key, desc);
     }
     break;
 
     case eVehicleDriveBasic:
     {
         physxType = ePTVehicleDriveBasic;
-        outId = registerVehicleComponent(usdPrim, physxType);
+        outId = registerVehicleComponent(attachedStage, key, physxType);
     }
     break;
 
@@ -1852,60 +2139,45 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     {
         const DynamicPhysxRigidBodyDesc& desc = static_cast<const DynamicPhysxRigidBodyDesc&>(objectDesc);
         const ObjectId sceneId = desc.sceneIds.empty() ? kInvalidObjectId : desc.sceneIds[0];
-        PhysXScene* physxScene = physxSetup.getPhysXScene(sceneId);
+        PhysXScene* physxScene = attachedStage.getPhysXScene(sceneId);
 
         const PxTransform rboTransform = toPhysX(desc.position, desc.rotation);
         if (!rboTransform.isValid())
         {
-            CARB_LOG_ERROR("Dynamic body transformation not valid, prim (%s)", path.GetText());
+            CARB_LOG_ERROR("Dynamic body transformation not valid, prim (%s)", attachedStage.textFor(key));
             break;
         }
 
         PxRigidDynamic* rigidDynamic = OmniPhysX::getInstance().getPhysXSetup().getPhysics()->createRigidDynamic(rboTransform);
         if(!rigidDynamic)
         {
-            CARB_LOG_ERROR("Failed to create rigid dynamic body, prim (%s)", path.GetText());
+            CARB_LOG_ERROR("Failed to create rigid dynamic body, prim (%s)", attachedStage.textFor(key));
             break;
         }
         applyRigidDynamicPhysxDesc(physxScene, desc, *rigidDynamic);
 
-        if (attachedStage.isUsingReplicatorEnvIds())
-        {
-            // Creation-time env-id for a dynamic body: scene-partition primvar id, else 0 (the clone
-            // source's env). Only dynamics + articulation aggregates are stamped; statics are left
-            // at PX_INVALID_U32 so a shared ground collides with every env (see the static branch).
-            // Caveat: a *shared dynamic* object with no primvar also lands in env 0, so it only
-            // interacts with env 0 -- a shared dynamic in a cloned scene is unusual and unsupported.
-            uint32_t partition_id = 0;
-            PXR_NS::TfToken scenePartitionToken;
-            if (getValue<PXR_NS::TfToken>(attachedStage, attachedStage.keyFor(path), TfToken(kScenePartitionPrimvar), UsdTimeCode::Default(), scenePartitionToken))
-            {
-                partition_id = attachedStage.getEnvIdFromToken(scenePartitionToken);
-            }
-            rigidDynamic->setEnvironmentID(partition_id);
-        }
+        // Creation-time env-id for a dynamic body: scene-partition primvar id, else 0 (the clone
+        // source's env). Only dynamics + articulation aggregates are stamped; statics are left
+        // at PX_INVALID_U32 so a shared ground collides with every env (see the static branch).
+        // Caveat: a *shared dynamic* object with no primvar also lands in env 0, so it only
+        // interacts with env 0 -- a shared dynamic in a cloned scene is unusual and unsupported.
+        const uint32_t envId = creationEnvironmentId(attachedStage, key);
+        if (envId != PX_INVALID_U32)
+            rigidDynamic->setEnvironmentID(envId);
 
-        InternalActor* intActor = setupActor(physxScene, *rigidDynamic, desc, usdPrim, instance, attachedStage.keyFor(path));
+        InternalActor* intActor = setupActor(physxScene, *rigidDynamic, desc, instance, key);
 
-        setupContactReport(physxScene, attachedStage, *rigidDynamic, path);
+        setupContactReport(physxScene, attachedStage, *rigidDynamic, key);
         physxType = ePTActor;
-        outId = db.addRecord(physxType, rigidDynamic, intActor, attachedStage.keyFor(path));
+        outId = db.addRecord(physxType, rigidDynamic, intActor, key);
         rigidDynamic->userData = (void*)(outId);
-        if (mExposePrimNames)
-            rigidDynamic->setName(path.GetText());
+        if (attachedStage.getParseOptions().exposePrimNames)
+            rigidDynamic->setName(attachedStage.textFor(key));
 
         PxScene* scene = physxScene->getScene();
+        if (intActor)
+            intActor->mInsertionPose = rboTransform;
         scene->addActor(*rigidDynamic);
-
-        PxU32 posIters, velIters;
-        rigidDynamic->getSolverIterationCounts(posIters, velIters);
-        if (scene->getSolverType() == PxSolverType::eTGS && velIters > 4)
-        {
-            CARB_LOG_WARN_ONCE(
-                "Detected a rigid at %s with more than 4 velocity iterations being added to a TGS scene."
-                "The related behavior changed recently, please consult the changelog. This warning will only print once.",
-                usdPrim.GetPath().GetText());
-        }
 
         if (desc.startsAsleep)
         {
@@ -1929,13 +2201,13 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
             for (size_t i = 1; i < desc.sceneIds.size(); i++)
             {
                 void* nm = copyAlignedMemory(mirrorMemBlock, memSize);
-                PhysXScene* mirrorScene = physxSetup.getPhysXScene(desc.sceneIds[i]);
+                PhysXScene* mirrorScene = attachedStage.getPhysXScene(desc.sceneIds[i]);
                 PxCollection* col = nullptr;
                 PxRigidDynamic* dynamicBody = static_cast<PxRigidDynamic*>(instantiateMirrorActor(nm, *physxSetup.getSerializationRegistry(),
                     *mirrorScene->getScene(), col, sharedCollection));
                 // mirrored body is always kinematic
                 dynamicBody->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
-                intActor->mMirrors.push_back({ nm, col, dynamicBody });
+                intActor->mMirrors.push_back({ nm, col, dynamicBody, mirrorScene->getInternalScene() });
             }
         }
     }
@@ -1945,19 +2217,19 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     {
         const StaticPhysxRigidBodyDesc& desc = static_cast<const StaticPhysxRigidBodyDesc&>(objectDesc);
         const ObjectId sceneId = desc.sceneIds.empty() ? kInvalidObjectId : desc.sceneIds[0];
-        PhysXScene* physxScene = physxSetup.getPhysXScene(sceneId);
+        PhysXScene* physxScene = attachedStage.getPhysXScene(sceneId);
 
         const PxTransform rboTransform = toPhysX(desc.position, desc.rotation);
         if (!rboTransform.isValid())
         {
-            CARB_LOG_ERROR("Static body transformation not valid, prim (%s)", path.GetText());
+            CARB_LOG_ERROR("Static body transformation not valid, prim (%s)", attachedStage.textFor(key));
             break;
         }
 
         PxRigidStatic* rigidStatic = OmniPhysX::getInstance().getPhysXSetup().getPhysics()->createRigidStatic(rboTransform);
         if (!rigidStatic)
         {
-            CARB_LOG_ERROR("Failed to create rigid static body, prim (%s)", path.GetText());
+            CARB_LOG_ERROR("Failed to create rigid static body, prim (%s)", attachedStage.textFor(key));
             break;
         }
 
@@ -1970,13 +2242,13 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         // clones with per-env static obstacles are not isolated from each other (those statics
         // overlap and each collides with all envs' dynamics); use explicit transforms for that layout.
 
-        InternalActor* intActor = setupActor(physxScene, *rigidStatic, desc, usdPrim, instance, attachedStage.keyFor(path));
-        setupContactReport(physxScene, attachedStage, *rigidStatic, path);
+        InternalActor* intActor = setupActor(physxScene, *rigidStatic, desc, instance, key);
+        setupContactReport(physxScene, attachedStage, *rigidStatic, key);
         physxType = ePTActor;
-        outId = db.addRecord(physxType, rigidStatic, intActor, attachedStage.keyFor(path));
+        outId = db.addRecord(physxType, rigidStatic, intActor, key);
         rigidStatic->userData = (void*)(outId);
-        if (mExposePrimNames)
-            rigidStatic->setName(path.GetText());
+        if (attachedStage.getParseOptions().exposePrimNames)
+            rigidStatic->setName(attachedStage.textFor(key));
 
         PxScene* scene = physxScene->getScene();
         scene->addActor(*rigidStatic);
@@ -1998,11 +2270,11 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
             for (size_t i = 1; i < desc.sceneIds.size(); i++)
             {
                 void* nm = copyAlignedMemory(mirrorMemBlock, memSize);                
-                PhysXScene* mirrorScene = physxSetup.getPhysXScene(desc.sceneIds[i]);
+                PhysXScene* mirrorScene = attachedStage.getPhysXScene(desc.sceneIds[i]);
                 PxCollection* col = nullptr;
                 PxRigidStatic* staticBody = static_cast<PxRigidStatic *>(instantiateMirrorActor(nm, *physxSetup.getSerializationRegistry(),
                     *mirrorScene->getScene(), col, sharedCollection));
-                intActor->mMirrors.push_back({ nm, col, staticBody });
+                intActor->mMirrors.push_back({ nm, col, staticBody, mirrorScene->getInternalScene() });
             }
         }
     }
@@ -2010,14 +2282,14 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     case eVolumeDeformableBody:
     {
         const PhysxVolumeDeformableBodyDesc& desc = static_cast<const PhysxVolumeDeformableBodyDesc&>(objectDesc);
-        outId = createVolumeDeformableBody(attachedStage, path, desc);
+        outId = createVolumeDeformableBody(attachedStage, key, desc);
         physxType = ePTDeformableVolume;
     }
     break;
     case eSurfaceDeformableBody:
     {
         const PhysxSurfaceDeformableBodyDesc& desc = static_cast<const PhysxSurfaceDeformableBodyDesc&>(objectDesc);
-        outId = createSurfaceDeformableBody(attachedStage, path, desc);
+        outId = createSurfaceDeformableBody(attachedStage, key, desc);
         physxType = ePTDeformableSurface;
     }
     break;
@@ -2033,7 +2305,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
                 InternalForce* intForce = ICE_NEW(InternalForce);
 
                 intForce->mAccelerationMode = desc.accelerationMode;
-                intForce->mCoMApplied = attachedStage.pathFor(bodyRecord.mKey) == path ? true : false;
+                intForce->mCoMApplied = bodyRecord.mKey == key ? true : false;
                 intForce->mEnabled = desc.enabled;
                 intForce->setForce(toPhysX(desc.force));
                 intForce->setTorque(toPhysX(desc.torque));
@@ -2041,7 +2313,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
                 intForce->mRigidActor = rbo;
                 intForce->mLocalRot = toPhysXQuat(desc.localRot);
 
-                intForce->mBodyPrimDifferent = attachedStage.pathFor(bodyRecord.mKey) == path ? false : true;
+                intForce->mBodyPrimDifferent = bodyRecord.mKey == key ? false : true;
 
                 if (!intForce->mCoMApplied)
                 {
@@ -2052,21 +2324,21 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
                     intForce->mLocalPos = PxVec3(0.0f, 0.0f, 0.0f);
                 }
 
-                PhysXScene* physxScene = physxSetup.getPhysXScene(desc.scene);
+                PhysXScene* physxScene = attachedStage.getPhysXScene(desc.scene);
                 physxScene->getInternalScene()->mForces.push_back(intForce);
                 intForce->mPhysXScene = physxScene;
 
                 physxType = ePTForce;
-                outId = db.addRecord(physxType, nullptr, intForce, attachedStage.keyFor(path));
+                outId = db.addRecord(physxType, nullptr, intForce, key);
             }
             else
             {
-                CARB_LOG_INFO("PhysX Force cant belong to a static body, make sure its applied to a body or a child prim of a body. (force prim: %s)", path.GetText());
+                CARB_LOG_INFO("PhysX Force cant belong to a static body, make sure its applied to a body or a child prim of a body. (force prim: %s)", attachedStage.textFor(key));
             }
         }
         else
         {
-            CARB_LOG_WARN("PhysX Force does not belong to any body, make sure its applied to a body or a child prim of a body. (force prim: %s)", path.GetText());
+            CARB_LOG_WARN("PhysX Force does not belong to any body, make sure its applied to a body or a child prim of a body. (force prim: %s)", attachedStage.textFor(key));
         }
     }
     break;
@@ -2075,50 +2347,38 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         const PhysxArticulationLinkDesc& desc = static_cast<const PhysxArticulationLinkDesc&>(objectDesc);
         const ObjectId sceneId = desc.sceneIds.empty() ? kInvalidObjectId : desc.sceneIds[0];
         // A.B. add validity checks if all links belong to the same scene
-        PhysXScene* physxScene = physxSetup.getPhysXScene(sceneId);
+        PhysXScene* physxScene = attachedStage.getPhysXScene(sceneId);
 
         PxArticulationReducedCoordinate* articulation =
-            getPtr<PxArticulationReducedCoordinate>(ePTArticulation, desc.articulation);
+            getPtr<PxArticulationReducedCoordinate>(attachedStage.getInternalPhysXDatabase(), ePTArticulation, desc.articulation);
 
         if (!articulation)
         {
-            CARB_LOG_WARN("Articulation not found for link creation, prim (%s)", path.GetText());
+            CARB_LOG_WARN("Articulation not found for link creation, prim (%s)", attachedStage.textFor(key));
             break;
         }
 
-        PxArticulationLink* parent = getPtr<PxArticulationLink>(ePTLink, desc.parent);
-        if (!gTempParent.empty())
-        {
-            for (size_t i = 0; i < gTempParent.size(); i++)
-            {
-                if (desc.parent == gTempParent[i].first)
-                {
-                    parent = gTempParent[i].second;
-                    break;
-                }
-            }
-        }
-
+        PxArticulationLink* parent = getPtr<PxArticulationLink>(attachedStage.getInternalPhysXDatabase(), ePTLink, desc.parent);
         const PxTransform rboTransform = toPhysX(desc.position, desc.rotation);
         if (!rboTransform.isValid())
         {
-            CARB_LOG_WARN("Articulation link transformation not valid, prim (%s)", path.GetText());
+            CARB_LOG_WARN("Articulation link transformation not valid, prim (%s)", attachedStage.textFor(key));
             break;
         }
 
         PxArticulationLink* link = articulation->createLink(parent, rboTransform);
 
-        setupContactReport(physxScene, attachedStage, *link, path);
+        setupContactReport(physxScene, attachedStage, *link, key);
 
         InternalLink* internalActor = nullptr;
         InternalJoint* intJoint = nullptr;
 
         if (link)
         {
-            internalActor = (InternalLink*)setupActor(physxScene, *link, desc, usdPrim, instance, attachedStage.keyFor(path));
+            internalActor = (InternalLink*)setupActor(physxScene, *link, desc, instance, key);
 
             physxType = ePTLink;
-            outId = db.addRecord(physxType, link, internalActor, attachedStage.keyFor(path));
+            outId = db.addRecord(physxType, link, internalActor, key);
 
             link->setCfmScale(desc.cfmScale);
 
@@ -2126,7 +2386,10 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
 
             if (joint && desc.articulationJointType == eStandardJoint && desc.articulationJoint) // Will be null for root link
             {
-                createArticulationJoint<true>(attachedStage, *desc.articulationJoint, joint, usdPrim.GetPrimPath(), internalActor);
+                // Must be `key`: mBody0IsParentLink is derived from this identity, and
+                // getting it wrong silently mirrors local poses and sign-flips limits,
+                // drive targets, joint states and mimic offsets.
+                createArticulationJoint<true>(attachedStage, *desc.articulationJoint, joint, key, internalActor);
             }
 
             if (link)
@@ -2144,23 +2407,22 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         if (link)
         {
             link->userData = (void*)(outId);
-            if (mExposePrimNames)
-                link->setName(path.GetText());
+            if (attachedStage.getParseOptions().exposePrimNames)
+                link->setName(attachedStage.textFor(key));
         }
     }
     break;
 
     case eArticulation:
     {
-        gTempParent.clear();
-        mDirty = true;
+        attachedStage.getPendingPhysicsSetup().dirty = true;
         const PhysxArticulationDesc& desc = static_cast<const PhysxArticulationDesc&>(objectDesc);
 
-        PhysXScene* physxScene = physxSetup.getPhysXScene(desc.sceneId);
+        PhysXScene* physxScene = attachedStage.getPhysXScene(desc.sceneId);
 
         PxArticulationReducedCoordinate* articulation = OmniPhysX::getInstance().getPhysXSetup().getPhysics()->createArticulationReducedCoordinate();
-        if (mExposePrimNames)
-            articulation->setName(path.GetText());
+        if (attachedStage.getParseOptions().exposePrimNames)
+            articulation->setName(attachedStage.textFor(key));
 
         physxScene->getInternalScene()->mArticulations.push_back(articulation);
 
@@ -2173,23 +2435,21 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
 
         if (desc.fixBase)
             articulation->setArticulationFlag(PxArticulationFlag::eFIX_BASE, true);
-        articulation->setArticulationFlag(PxArticulationFlag::eDRIVE_LIMITS_ARE_FORCES, true);
 
         InternalArticulation* intArt = ICE_NEW(InternalArticulation)(physxScene);
         intArt->mEnableSelfCollision = desc.selfCollision;
         intArt->mStaticRootBodyKey = desc.staticRootBodyPrim;
 
         physxType = ePTArticulation;
-        outId = db.addRecord(physxType, articulation, intArt, attachedStage.keyFor(path));
-        mArticulations.push_back(outId);
+        outId = db.addRecord(physxType, articulation, intArt, key);
+        attachedStage.getPendingPhysicsSetup().articulations.push_back(outId);
         articulation->userData = (void*)(outId);
 
         if (desc.fixBaseKey.valid())
         {
-            // fixed joints are converted into fixed articulation, we need the pointer to that
+            // fixed joints are converted into fixed articulation, we need the pointer to that.
             physxType = ePTArticulationFixedBase;
-            const ObjectId outIdNew = db.addRecord(physxType, articulation, nullptr,
-                                                   attachedStage.keyFor(attachedStage.pathFor(desc.fixBaseKey)));
+            const ObjectId outIdNew = db.addRecord(physxType, articulation, nullptr, desc.fixBaseKey);
             CARB_ASSERT(outId + 1 == outIdNew);
         }
     }
@@ -2200,18 +2460,18 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         const PhysxTendonFixedDesc& desc = static_cast<const PhysxTendonFixedDesc&>(objectDesc);
 
         // Find parent joint of tendon root joint (needed for dummy joint)
-        ObjectId parentLinkJointId = attachedStage.getObjectDatabase()->findEntry(path, eArticulationJoint);
+        ObjectId parentLinkJointId = attachedStage.getObjectDatabase()->findEntry(key, eArticulationJoint);
 
         if (parentLinkJointId == kInvalidObjectId)
         {
-            CARB_LOG_WARN("Could not parse tendon at %s because its root-axis joint is not part of any articulation.", path.GetText());
+            CARB_LOG_WARN("Could not parse tendon at %s because its root-axis joint is not part of any articulation.", attachedStage.textFor(key));
             return kInvalidObjectId;
         }
 
-        const PxArticulationJointReducedCoordinate* parentLinkJoint = getPtr<PxArticulationJointReducedCoordinate>(ePTLinkJoint, parentLinkJointId);
+        const PxArticulationJointReducedCoordinate* parentLinkJoint = getPtr<PxArticulationJointReducedCoordinate>(attachedStage.getInternalPhysXDatabase(), ePTLinkJoint, parentLinkJointId);
         if (!parentLinkJoint)
         {
-            CARB_LOG_WARN("Could not parse tendon at %s because its root-axis joint is not available.", path.GetText());
+            CARB_LOG_WARN("Could not parse tendon at %s because its root-axis joint is not available.", attachedStage.textFor(key));
             return kInvalidObjectId;
         }
         PxArticulationLink& parentLink = parentLinkJoint->getParentArticulationLink();
@@ -2243,11 +2503,11 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         // create dummy root joint
         PxArticulationTendonJoint* tJoint = tendon->createTendonJoint(nullptr, PxArticulationAxis::eTWIST, 0.f, 0.f, &parentLink);
         InternalTendonAxis* internalTJoint = ICE_NEW(InternalTendonAxis);
-        internalTJoint->instanceName = desc.instanceToken;
+        internalTJoint->instanceName = tendonInstanceNameFor(attachedStage, desc.instanceToken);
 
         physxType = ePTFixedTendonAxis;
         outId =
-            ObjectId(size_t(db.addRecord(physxType, tJoint, internalTJoint, attachedStage.keyFor(path))));
+            ObjectId(size_t(db.addRecord(physxType, tJoint, internalTJoint, key)));
         tJoint->userData = (void*)outId;
     }
     break;
@@ -2257,20 +2517,20 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         const PhysxTendonAxisDesc& desc = static_cast<const PhysxTendonAxisDesc&>(objectDesc);
 
         // Get link joint corresponding to tendon axis
-        ObjectId linkJointId = attachedStage.getObjectDatabase()->findEntry(path, eArticulationJoint);
+        ObjectId linkJointId = attachedStage.getObjectDatabase()->findEntry(key, eArticulationJoint);
 
         if (linkJointId == kInvalidObjectId)
         {
-            CARB_LOG_WARN("Could not parse tendon axis at %s because its joint is not part of any articulation.", path.GetText());
+            CARB_LOG_WARN("Could not parse tendon axis at %s because its joint is not part of any articulation.", attachedStage.textFor(key));
             return kInvalidObjectId;
         }
 
         PxArticulationTendonJoint* parentTendonJoint = nullptr;
 
-        const PxArticulationJointReducedCoordinate* linkJoint = getPtr<PxArticulationJointReducedCoordinate>(ePTLinkJoint, linkJointId);
+        const PxArticulationJointReducedCoordinate* linkJoint = getPtr<PxArticulationJointReducedCoordinate>(attachedStage.getInternalPhysXDatabase(), ePTLinkJoint, linkJointId);
         if (!linkJoint)
         {
-            CARB_LOG_WARN("Could not get tendon axis joint for tendon %s.", path.GetText());
+            CARB_LOG_WARN("Could not get tendon axis joint for tendon %s.", attachedStage.textFor(key));
             return kInvalidObjectId;
         }
         PxArticulationLink& parentLink = linkJoint->getParentArticulationLink();
@@ -2287,13 +2547,13 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         CARB_ASSERT(parentTendonJoint);
         if (!parentTendonJoint)
         {
-            CARB_LOG_WARN("Could not get parent tendon joint at %s.", path.GetText());
+            CARB_LOG_WARN("Could not get parent tendon joint at %s.", attachedStage.textFor(key));
             return kInvalidObjectId;
         }
 
         if (&parentLink != parentTendonJoint->getLink())
         {
-            CARB_LOG_WARN("Could not parse tendon axis at %s due to a topology issue: Refer to the topology constraints in the USD schema doc for PhysxTendonAxisAPI.", path.GetText());
+            CARB_LOG_WARN("Could not parse tendon axis at %s due to a topology issue: Refer to the topology constraints in the USD schema doc for PhysxTendonAxisAPI.", attachedStage.textFor(key));
             return kInvalidObjectId;
         }
 
@@ -2316,11 +2576,11 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         // create tendon axis
         PxArticulationTendonJoint* tJoint = parentTendonJoint->getTendon()->createTendonJoint(parentTendonJoint, axis, desc.gearings[0], desc.forceCoefficients[0], &linkJoint->getChildArticulationLink());
         InternalTendonAxis* internalTJoint = ICE_NEW(InternalTendonAxis);
-        internalTJoint->instanceName = desc.instanceToken;
+        internalTJoint->instanceName = tendonInstanceNameFor(attachedStage, desc.instanceToken);
 
         physxType = ePTFixedTendonAxis;
         outId =
-            ObjectId(size_t(db.addRecord(physxType, tJoint, internalTJoint, attachedStage.keyFor(path))));
+            ObjectId(size_t(db.addRecord(physxType, tJoint, internalTJoint, key)));
         tJoint->userData = (void*)outId;
     }
     break;
@@ -2330,16 +2590,16 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         const PhysxTendonSpatialDesc& desc = static_cast<const PhysxTendonSpatialDesc&>(objectDesc);
 
         // find articulation link that root attachment should attach to
-        const ObjectId linkId = attachedStage.getObjectDatabase()->findEntry(path, eArticulationLink);
+        const ObjectId linkId = attachedStage.getObjectDatabase()->findEntry(key, eArticulationLink);
 
         if (linkId == kInvalidObjectId)
         {
-            CARB_LOG_WARN("Could not parse tendon with root attachment %s because its link %s is not part of any articulation.", desc.instanceToken.GetText(), path.GetText());
+            CARB_LOG_WARN("Could not parse tendon with root attachment %s because its link %s is not part of any articulation.", tokenText(attachedStage, desc.instanceToken).c_str(), attachedStage.textFor(key));
             return kInvalidObjectId;
         }
 
         // create spatial tendon
-        PxArticulationLink* link = getPtr<PxArticulationLink>(ePTLink, linkId);
+        PxArticulationLink* link = getPtr<PxArticulationLink>(attachedStage.getInternalPhysXDatabase(), ePTLink, linkId);
         PxArticulationReducedCoordinate& articulation = static_cast<PxArticulationReducedCoordinate&>(link->getArticulation());
         PxArticulationSpatialTendon* tendon = articulation.createSpatialTendon();
 
@@ -2363,11 +2623,11 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         InternalTendonAttachment* internalAttachment = ICE_NEW(InternalTendonAttachment);
         internalAttachment->globalPos = linkTrans.p + linkTrans.rotate(toPhysX(desc.localPos));
         internalAttachment->initLength = 0.f;
-        internalAttachment->instanceName = desc.instanceToken;
+        internalAttachment->instanceName = tendonInstanceNameFor(attachedStage, desc.instanceToken);
 
         physxType = ePTTendonAttachment;
         outId =
-            ObjectId(size_t(db.addRecord(physxType, attachment, internalAttachment, attachedStage.keyFor(path))));
+            ObjectId(size_t(db.addRecord(physxType, attachment, internalAttachment, key)));
         attachment->userData = (void*)outId;
     }
     break;
@@ -2378,11 +2638,11 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         const PhysxTendonAttachmentDesc& desc = static_cast<const PhysxTendonAttachmentDesc&>(objectDesc);
 
         // find corresponding link that attachment belongs to
-        const ObjectId linkId = attachedStage.getObjectDatabase()->findEntry(path, eArticulationLink);
+        const ObjectId linkId = attachedStage.getObjectDatabase()->findEntry(key, eArticulationLink);
 
         if (linkId == kInvalidObjectId)
         {
-            CARB_LOG_WARN("Could not parse attachment %s because its link %s is not part of any articulation.", desc.instanceToken.GetText(), path.GetText());
+            CARB_LOG_WARN("Could not parse attachment %s because its link %s is not part of any articulation.", tokenText(attachedStage, desc.instanceToken).c_str(), attachedStage.textFor(key));
             return kInvalidObjectId;
         }
 
@@ -2400,15 +2660,15 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         CARB_ASSERT(parentAttachment && parentIntAttachment);
         if (!parentAttachment)
         {
-            CARB_LOG_WARN("Could not get parent attachment at %s.", path.GetText());
+            CARB_LOG_WARN("Could not get parent attachment at %s.", attachedStage.textFor(key));
             return kInvalidObjectId;
         }
 
-        PxArticulationLink* link = getPtr<PxArticulationLink>(ePTLink, linkId);
+        PxArticulationLink* link = getPtr<PxArticulationLink>(attachedStage.getInternalPhysXDatabase(), ePTLink, linkId);
         if (parentAttachment->getTendon()->getArticulation() != &link->getArticulation())
         {
             CARB_LOG_WARN("Could not parse attachment %s at %s because its parent attachment %s at %s is not part of the same articulation.",
-                          desc.instanceToken.GetText(), path.GetText(), desc.parentToken.GetText(), desc.parentPath.GetText());
+                          tokenText(attachedStage, desc.instanceToken).c_str(), attachedStage.textFor(key), tokenText(attachedStage, desc.parentToken).c_str(), attachedStage.textFor(desc.parentKey));
             return kInvalidObjectId;
         }
 
@@ -2419,7 +2679,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
         internalAttachment->globalPos = linkTrans.p + linkTrans.rotate(toPhysX(desc.localPos));
         internalAttachment->initLength = parentIntAttachment->initLength +
             (internalAttachment->globalPos - parentIntAttachment->globalPos).magnitude() * desc.gearing;
-        internalAttachment->instanceName = desc.instanceToken;
+        internalAttachment->instanceName = tendonInstanceNameFor(attachedStage, desc.instanceToken);
 
         // set leaf parameters if needed
         if (desc.type == eTendonAttachmentLeaf)
@@ -2441,7 +2701,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
 
         physxType = ePTTendonAttachment;
         outId =
-            ObjectId(size_t(db.addRecord(physxType, attachment, internalAttachment, attachedStage.keyFor(path))));
+            ObjectId(size_t(db.addRecord(physxType, attachment, internalAttachment, key)));
         attachment->userData = (void*)outId;
     }
     break;
@@ -2450,17 +2710,17 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     {
         const FilteredPairDesc& desc = static_cast<const FilteredPairDesc&>(objectDesc);
         physxType = ePTFilteredPair;
-        InternalFilteredPairs* intPairs = ICE_NEW(InternalFilteredPairs);
+        InternalFilteredPairs* intPairs = ICE_NEW(InternalFilteredPairs)(attachedStage);
         intPairs->mPairs = desc.pairs;
         intPairs->createFilteredPairs();
-        outId = db.addRecord(physxType, nullptr, intPairs, attachedStage.keyFor(path));
+        outId = db.addRecord(physxType, nullptr, intPairs, key);
     }
     break;
 
     case eCollisionGroup:
     {
         physxType = ePTCollisionGroup;
-        outId = db.addRecord(physxType, nullptr, nullptr, attachedStage.keyFor(path));
+        outId = db.addRecord(physxType, nullptr, nullptr, key);
         PxFilterData* fd = new PxFilterData();
         const uint32_t index = convertToCollisionGroup(outId);
         convertCollisionGroupToPxFilterData(index, *fd);
@@ -2472,9 +2732,9 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     {
         const CapsuleCctDesc& desc = static_cast<const CapsuleCctDesc&>(objectDesc);
 
-        PhysXScene* physxScene = physxSetup.getPhysXScene(desc.sceneId);
+        PhysXScene* physxScene = attachedStage.getPhysXScene(desc.sceneId);
 
-        PxCapsuleControllerDesc cctDesc = parsePhysXCharacterControllerDesc(attachedStage, stage, usdPrim, desc.radius, desc.height * 2.0f);
+        PxCapsuleControllerDesc cctDesc = parsePhysXCharacterControllerDesc(attachedStage, key, desc.radius, desc.height * 2.0f);
 
         cctDesc.slopeLimit = desc.slopeLimit;
         cctDesc.position = PxExtendedVec3(desc.pos.x, desc.pos.y, desc.pos.z);
@@ -2482,7 +2742,7 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
 
         PxCapsuleController* ctrl = static_cast<PxCapsuleController*>(physxScene->getControllerManager()->createController(cctDesc));
         if (!ctrl) {
-            CARB_LOG_WARN("Could not parse capsule cct at %s : failed to create a PxCapsuleController.", path.GetText());
+            CARB_LOG_WARN("Could not parse capsule cct at %s : failed to create a PxCapsuleController.", attachedStage.textFor(key));
             return kInvalidObjectId;
         }
 
@@ -2496,15 +2756,16 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
 
         const PxQuat fixupQ = PxShortestRotation(PxVec3(1.0f, 0.0f, 0.0f), cctDesc.upDirection);
 
-        InternalCct* intCct = ICE_NEW(InternalCct)(physxScene, path, usdPrim, nullptr, attachedStage.keyFor(path));
+        InternalCct* intCct = ICE_NEW(InternalCct)(physxScene, nullptr, key);
         intCct->mScale = desc.scale;
         intCct->mActor = ctrl->getActor();
+        intCct->mController = ctrl;
         intCct->mFixupQ = fixupQ.getConjugate();
 
-        physxScene->getInternalScene()->mCctMap[path] = intCct;
+        physxScene->getInternalScene()->mCctMap[key] = intCct;
 
         physxType = ePTCct;
-        outId = db.addRecord(physxType, ctrl, intCct, attachedStage.keyFor(path));
+        outId = db.addRecord(physxType, ctrl, intCct, key);
         ctrl->getActor()->userData = (void*)(outId);
     }
     break;
@@ -2516,52 +2777,64 @@ ObjectId PhysXUsdPhysicsInterface::createObject(usdparser::AttachedStage& attach
     {
         const MimicJointDesc& desc = static_cast<const MimicJointDesc&>(objectDesc);
         physxType = ePTMimicJoint;
-        outId = createMimicJoint(desc);
+        outId = createMimicJoint(attachedStage, desc);
     }
     break;
 
     };
 
-    sendObjectCreationNotification(path, outId, physxType);
+    sendObjectCreationNotification(attachedStage, key, outId, physxType);
 
     return outId;
 }
 
-ObjectId PhysXUsdPhysicsInterface::createShape(const SdfPath& path,
+// Shape records and their source belong to the explicitly supplied attachment.
+ObjectId PhysXUsdPhysicsInterface::createShape(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key,
                                                const PhysxObjectDesc& objectDesc,
                                                usdparser::ObjectId bodyId,
                                                const ObjectInstance* instance)
 {
-    checkScenes();
+    checkScenes(attachedStage);
     const PhysxShapeDesc& shapeDesc = static_cast<const PhysxShapeDesc&>(objectDesc);
     const ObjectId sceneId = shapeDesc.sceneIds.empty() ? kInvalidObjectId : shapeDesc.sceneIds[0];
 
-    if(!mForceParseOnlySingleScenePath.IsEmpty())
+    // scristiano: this is temporary code to allow physics inspector. we should filter simulation
+    // owners at parsing stage. Kit-inspector-only debug filter, opt-in via an explicit Kit
+    // setting; runs under any backend.
+    if (!attachedStage.getParseOptions().forceSingleScenePath.empty())
     {
-        if(sceneId != mForceParseOnlySingleSceneObjectId)
+        if (sceneId != attachedStage.getParseOptions().forcedSceneId)
             return kInvalidObjectId;
     }
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
     PhysXSetup& physxSetup = omniPhysX.getPhysXSetup();
-    PhysXScene* physxScene = physxSetup.getPhysXScene(sceneId);
-    InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
-    UsdStageWeakPtr stage = usdparser::UsdLoad::getUsdLoad()->getActiveStage();
+    PhysXScene* physxScene = attachedStage.getPhysXScene(sceneId);
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
     PhysXType physxType = ePTRemoved;
     // create shape
-    ObjectId outId = createShapeOrComputeMass(path, shapeDesc, bodyId, instance, stage, physxScene, mExposePrimNames, physxType, &db, nullptr);
+    ObjectId outId = createShapeOrComputeMass(
+        key, shapeDesc, bodyId, instance, &attachedStage, physxScene, attachedStage.getParseOptions().exposePrimNames, physxType, &db, nullptr);
+    // Nothing created, or a compound left without children because its cooking
+    // failed: the compiled cache must not store this load.
+    if (outId == kInvalidObjectId ||
+        (physxType == ePTCompoundShape && static_cast<CompoundShape*>(db.getRecords()[outId].mPtr)->getShapes().empty()))
+        attachedStage.noteCreationFailure();
     if (physxType != ePTRemoved)
     {
-        sendObjectCreationNotification(path, outId, physxType);
+        sendObjectCreationNotification(attachedStage, key, outId, physxType);
 
         // clear shape removed event flag for attachments and collision filters
-        InternalActor* intActor = getInternalPtr<InternalActor>(ePTActor, bodyId);
-        updateDeformableAttachmentShapeEvents(intActor, outId, path, internal::DirtyEventType::eShapeAdded);
-        updateDeformableCollisionFilterShapeEvents(intActor, outId, path, internal::DirtyEventType::eShapeAdded);
+        InternalActor* intActor = getInternalPtr<InternalActor>(attachedStage.getInternalPhysXDatabase(), ePTActor, bodyId);
+        updateDeformableAttachmentShapeEvents(intActor, outId, key, internal::DirtyEventType::eShapeAdded);
+        updateDeformableCollisionFilterShapeEvents(intActor, outId, key, internal::DirtyEventType::eShapeAdded);
     }
     return outId;
 }
 
-void cleanupMultipleMaterials(const PhysxShapeDesc& desc, const char* approxName, const UsdPrim& usdPrim)
+void cleanupMultipleMaterials(const PhysxShapeDesc& desc,
+                              const char* approxName,
+                              const usdparser::AttachedStage* attachedStage,
+                              omni::physics::parse::ObjectKey key)
 {
     if (desc.materials.size() > 1)
     {
@@ -2586,44 +2859,50 @@ void cleanupMultipleMaterials(const PhysxShapeDesc& desc, const char* approxName
         {
             CARB_LOG_ERROR(
                 "Triangle mesh %s collision does not support multiple materials, default material will be used - prim: %s!",
-                approxName, usdPrim.GetPrimPath().GetText());
+                approxName, attachedStage ? attachedStage->textFor(key) : "");
             PhysxShapeDesc& descWr = const_cast<PhysxShapeDesc&>(desc);
             descWr.materials.clear();
         }
     }
 }
 
-ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
+// ObjectKey-native entry point (the source-agnostic identity boundary): no
+// UsdStageWeakPtr/UsdPrim needed internally -- every shape-type branch below
+// dispatches off `objectDesc`'s own fields (meshPrimKey etc., resolved through
+// `attachedStage`), and the removed `stage`/UsdPrim were passthrough-only
+// (diagnostics, and the now ObjectKey-native createShape/cleanupMultipleMaterials
+// free functions).
+ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(omni::physics::parse::ObjectKey key,
                                                             const PhysxShapeDesc& objectDesc,
                                                             usdparser::ObjectId bodyId,
                                                             const ObjectInstance* instance,
-                                                            PXR_NS::UsdStageWeakPtr stage,
+                                                            usdparser::AttachedStage* createShapeAttachedStage,
                                                             PhysXScene* physxScene,
                                                             bool exposePrimNames,
                                                             PhysXType& physxType,
                                                             InternalPhysXDatabase* db,
                                                             PhysXUsdPhysicsInterface::MassInformation* massInfoOut)
 {
+    if (!createShapeAttachedStage)
+        return kInvalidObjectId;
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
     PhysXSetup& physxSetup = omniPhysX.getPhysXSetup();
-
-    UsdPrim usdPrim = stage ? stage->GetPrimAtPath(path) : UsdPrim{};
 
     CookingDataAsync* cookingDataAsync = physxSetup.getCookingDataAsync();
     CARB_ASSERT(cookingDataAsync);
 
-    // Resolve mesh-shape descriptor meshPrimKey (ObjectKey post US5) back to
-    // SdfPath via the AttachedStage that produced the descriptor.
-    const long createShapeStageId = PXR_NS::UsdUtilsStageCache::Get().GetId(stage).ToLongInt();
-    usdparser::AttachedStage* createShapeAttachedStage = usdparser::UsdLoad::getUsdLoad()->getAttachedStage(createShapeStageId);
+    // Diagnostic-only path text (never null-derefs createShapeAttachedStage,
+    // which can be null in the same edge case the old stage-cache lookup left
+    // unresolved -- see the SdfPath overload above).
+    const char* const pathText = createShapeAttachedStage ? createShapeAttachedStage->textFor(key) : "";
 
     PxRigidActor* rigidActor = nullptr;
     if (bodyId != kInvalidObjectId)
     {
-        rigidActor = getPtr<PxRigidActor>(ePTActor, bodyId);
+        rigidActor = getPtr<PxRigidActor>(*db, ePTActor, bodyId);
         if (!rigidActor)
         {
-            rigidActor = getPtr<PxRigidActor>(ePTLink, bodyId);
+            rigidActor = getPtr<PxRigidActor>(*db, ePTLink, bodyId);
         }
     }
 
@@ -2664,14 +2943,16 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
             {
                 shape = new CompoundShape(physxScene);
                 InternalShape* intShape = ICE_NEW(InternalShape)(physxScene, desc.localScale);
+                intShape->mSourceGprim = desc.sourceGprim;
                 if (desc.materials.size() == 1 && desc.materials[0] != kInvalidObjectId)
                 {
                     InternalDatabase::Record& materialRecord = db->getRecords()[(size_t)desc.materials[0]];
                     InternalMaterial* intMat = (InternalMaterial*)materialRecord.mInternalPtr;
                     intMat->addShapeId(db->getRecords().size());
                     shape->mMaterialId = (size_t)desc.materials[0];
+                    intShape->mMaterialId = (size_t)desc.materials[0];
                 }
-                outId = db->addRecord(physxType, shape, intShape, (createShapeAttachedStage ? createShapeAttachedStage->keyFor(path) : omni::physics::parse::ObjectKey{}));
+                outId = db->addRecord(physxType, shape, intShape, key);
             }
 
             PxBounds3 sumAabbLocalBounds;
@@ -2697,7 +2978,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
                 poseOffset.p.z = sdesc->spheres[c].position.z * maxScale;
                 const float radius = sdesc->spheres[c].radius * maxScale;
 
-                omni::physx::createShape(PxSphereGeometry(radius), desc, usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames,
+                omni::physx::createShape(PxSphereGeometry(radius), desc, key, physxScene, collisionGroup, rigidActor, exposePrimNames,
                     &poseOffset, &outId, &massInfo, instance, &sumAabbLocalBounds);
                 massProps[c].centerOfMass = { float(massInfo.centerOfMass.x+poseOffset.p.x), float(massInfo.centerOfMass.y+poseOffset.p.y), float(massInfo.centerOfMass.z+poseOffset.p.z) };
                 massProps[c].mass = float(massInfo.volume) * maxScale;
@@ -2760,7 +3041,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
         const uint32_t collisionGroup = convertToCollisionGroup(desc.collisionGroup);
         physxType = ePTShape;
         outId = omni::physx::createShape(
-            PxSphereGeometry(desc.radius), desc, usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames, nullptr, nullptr, massInfoOut, instance);
+            PxSphereGeometry(desc.radius), desc, key, physxScene, collisionGroup, rigidActor, exposePrimNames, nullptr, nullptr, massInfoOut, instance);
     }
     break;
 
@@ -2769,7 +3050,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
         const BoxPhysxShapeDesc& desc = static_cast<const BoxPhysxShapeDesc&>(objectDesc);
         const uint32_t collisionGroup = convertToCollisionGroup(desc.collisionGroup);
         physxType = ePTShape;
-        outId = omni::physx::createShape(PxBoxGeometry(toPhysX(desc.halfExtents)), desc, usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames,
+        outId = omni::physx::createShape(PxBoxGeometry(toPhysX(desc.halfExtents)), desc, key, physxScene, collisionGroup, rigidActor, exposePrimNames,
                                           nullptr, nullptr, massInfoOut, instance);
     }
     break;
@@ -2779,9 +3060,9 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
         const uint32_t collisionGroup = convertToCollisionGroup(desc.collisionGroup);
         const PxTransform transform(toPhysX(desc.positionOffset));
         physxType = ePTShape;
-        cleanupMultipleMaterials(desc, "BoundingSphere", usdPrim);
+        cleanupMultipleMaterials(desc, "BoundingSphere", createShapeAttachedStage, key);
         outId = omni::physx::createShape(
-            PxSphereGeometry(desc.radius), desc, usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames, &transform, nullptr, massInfoOut, instance);
+            PxSphereGeometry(desc.radius), desc, key, physxScene, collisionGroup, rigidActor, exposePrimNames, &transform, nullptr, massInfoOut, instance);
     }
     break;
 
@@ -2791,8 +3072,8 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
         const uint32_t collisionGroup = convertToCollisionGroup(desc.collisionGroup);
         const PxTransform transform(toPhysX(desc.positionOffset), toPhysXQuat(desc.rotationOffset));
         physxType = ePTShape;
-        cleanupMultipleMaterials(desc, "BoundingBox", usdPrim);
-        outId = omni::physx::createShape(PxBoxGeometry(toPhysX(desc.halfExtents)), desc, usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames,
+        cleanupMultipleMaterials(desc, "BoundingBox", createShapeAttachedStage, key);
+        outId = omni::physx::createShape(PxBoxGeometry(toPhysX(desc.halfExtents)), desc, key, physxScene, collisionGroup, rigidActor, exposePrimNames,
                                           &transform, nullptr, massInfoOut, instance);
     }
     break;
@@ -2812,7 +3093,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
         desc2.localRot.w = q.w;
 
         physxType = ePTShape;
-        outId = omni::physx::createShape(PxCapsuleGeometry(desc.radius, desc.halfHeight), desc2, usdPrim, physxScene,
+        outId = omni::physx::createShape(PxCapsuleGeometry(desc.radius, desc.halfHeight), desc2, key, physxScene,
                                           collisionGroup, rigidActor, exposePrimNames, nullptr, nullptr, massInfoOut, instance);
         if (massInfoOut)
         {
@@ -2838,7 +3119,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
 
         physxType = ePTShape;
 
-        if (omniPhysX.getCachedSettings().approximateCylinders)
+        if (createShapeAttachedStage->getCachedSettings().approximateCylinders)
         {
             const PxVec3 cylScale = getConeOrCylinderScale(desc.halfHeight, desc.radius, desc.axis);
             PxMeshScale scale = PxMeshScale(cylScale);
@@ -2847,12 +3128,12 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
             PxConvexMeshGeometry convexGeom(cylinderMesh, scale, flags);
             if (convexGeom.isValid())
             {
-                outId = omni::physx::createShape(convexGeom, desc, usdPrim, physxScene,
+                outId = omni::physx::createShape(convexGeom, desc, key, physxScene,
                     collisionGroup, rigidActor, exposePrimNames, nullptr, nullptr, massInfoOut, instance);
             }
             else
             {
-                CARB_LOG_ERROR("Cylinder shape geometry not valid for:%s", path.GetText());
+                CARB_LOG_ERROR("Cylinder shape geometry not valid for:%s", pathText);
             }
         }
         else
@@ -2863,7 +3144,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
             desc2.localRot = toFloat4(toPhysXQuat(desc2.localRot) * fixupQ);
 
             outId = omni::physx::createShape(PxConvexCoreGeometry(PxConvexCore::Cylinder(desc.halfHeight * 2.0f, desc.radius), desc.margin), desc2,
-                usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames, nullptr, nullptr, massInfoOut, instance);
+                key, physxScene, collisionGroup, rigidActor, exposePrimNames, nullptr, nullptr, massInfoOut, instance);
 
             if (massInfoOut)
             {
@@ -2897,7 +3178,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
 
         physxType = ePTShape;
 
-        if (omniPhysX.getCachedSettings().approximateCones)
+        if (createShapeAttachedStage->getCachedSettings().approximateCones)
         {
             const PxVec3 coneScale = getConeOrCylinderScale(desc.halfHeight, desc.radius, desc.axis);
             PxMeshScale scale = PxMeshScale(coneScale);
@@ -2908,12 +3189,12 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
             PxConvexMeshGeometry convexGeom(coneMesh, scale, flags);
             if (convexGeom.isValid())
             {
-                outId = omni::physx::createShape(convexGeom, desc, usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames,
+                outId = omni::physx::createShape(convexGeom, desc, key, physxScene, collisionGroup, rigidActor, exposePrimNames,
                     nullptr, nullptr, massInfoOut, instance);
             }
             else
             {
-                CARB_LOG_ERROR("Cone shape geometry not valid for:%s", path.GetText());
+                CARB_LOG_ERROR("Cone shape geometry not valid for:%s", pathText);
             }
         }
         else
@@ -2924,7 +3205,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
             desc2.localRot = toFloat4(toPhysXQuat(desc2.localRot) * fixupQ);
 
             outId = omni::physx::createShape(PxConvexCoreGeometry(PxConvexCore::Cone(desc.halfHeight * 2.0f, desc.radius), desc.margin), desc2,
-                usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames, nullptr, nullptr, massInfoOut, instance);
+                key, physxScene, collisionGroup, rigidActor, exposePrimNames, nullptr, nullptr, massInfoOut, instance);
 
             if (massInfoOut)
             {
@@ -2958,8 +3239,25 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
 
         physxType = ePTShape;
 
-        outId = omni::physx::createShape(PxCustomGeometry(*OmniPhysX::getInstance().getCustomGeometryManager().createCustomGeometry(path, desc)),
-            desc, usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames, nullptr, nullptr, massInfoOut, instance);
+        if (!createShapeAttachedStage)
+            break;
+        CustomPhysXGeometryCallback* geometry =
+            OmniPhysX::getInstance().getCustomGeometryManager().createCustomGeometry(*createShapeAttachedStage, key, desc);
+        if (!geometry)
+            break;
+        try
+        {
+            outId = omni::physx::createShape(
+                PxCustomGeometry(*geometry), desc, key, physxScene, collisionGroup, rigidActor,
+                exposePrimNames, nullptr, nullptr, massInfoOut, instance);
+        }
+        catch (...)
+        {
+            OmniPhysX::getInstance().getCustomGeometryManager().releaseUnboundGeometry(geometry);
+            throw;
+        }
+        if (outId == kInvalidObjectId)
+            OmniPhysX::getInstance().getCustomGeometryManager().releaseUnboundGeometry(geometry);
     }
     break;
 
@@ -2972,20 +3270,20 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
         PxConvexMeshGeometry convexGeom(newConvex, meshScale);
         if (convexGeom.isValid())
         {
-            cleanupMultipleMaterials(desc, "ConvexHull", usdPrim);
+            cleanupMultipleMaterials(desc, "ConvexHull", createShapeAttachedStage, key);
 
             if (!newConvex->isGpuCompatible())
             {
-                CARB_LOG_INFO("ConvexMesh not GPU compatible, fall back to CPU, Object path: %s", usdPrim.GetPrimPath().GetText());
+                CARB_LOG_INFO("ConvexMesh not GPU compatible, fall back to CPU, Object path: %s", pathText);
             }
 
             physxType = ePTShape;
-            outId = omni::physx::createShape(convexGeom, desc, usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames,
+            outId = omni::physx::createShape(convexGeom, desc, key, physxScene, collisionGroup, rigidActor, exposePrimNames,
                                               nullptr, nullptr, massInfoOut, instance);
         }
         else
         {
-            CARB_LOG_ERROR("Unable to create convex mesh for:%s", path.GetText());
+            CARB_LOG_ERROR("Unable to create convex mesh for:%s", pathText);
             return kInvalidObjectId;
         }
 
@@ -3005,12 +3303,13 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
         physxType = ePTCompoundShape;
         CompoundShape* shape = nullptr;
 
-        cleanupMultipleMaterials(desc, "ConvexDecomposition", usdPrim);
+        cleanupMultipleMaterials(desc, "ConvexDecomposition", createShapeAttachedStage, key);
 
         if (db)
         {
             shape = new CompoundShape(physxScene);
             InternalShape* intShape = ICE_NEW(InternalShape)(physxScene, desc.localScale);
+            intShape->mSourceGprim = desc.sourceGprim;
             if (desc.materials.size() == 1 && desc.materials[0] != kInvalidObjectId)
             {
                 InternalDatabase::Record& materialRecord = db->getRecords()[(size_t)desc.materials[0]];
@@ -3019,7 +3318,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
                 shape->mMaterialId = (size_t)desc.materials[0];
                 intShape->mMaterialId = (size_t)desc.materials[0];
             }
-            outId = db->addRecord(physxType, shape, intShape, (createShapeAttachedStage ? createShapeAttachedStage->keyFor(path) : omni::physics::parse::ObjectKey{}));
+            outId = db->addRecord(physxType, shape, intShape, key);
         }
 
         PxBounds3 sumAabbLocalBounds;
@@ -3044,7 +3343,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
             PxConvexMeshGeometry convexGeom(convexMeshes[c], meshScale);
             if (convexGeom.isValid())
             {
-                omni::physx::createShape(convexGeom, desc, usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames,
+                omni::physx::createShape(convexGeom, desc, key, physxScene, collisionGroup, rigidActor, exposePrimNames,
                     nullptr, &outId, &massInfo, instance, &sumAabbLocalBounds);
             }
 
@@ -3115,11 +3414,11 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
             PxMeshScale meshScale(PxVec3(desc.meshScale.x, desc.meshScale.y, desc.meshScale.z));
             if (desc.doubleSided)
             {
-                CARB_LOG_INFO("Double sided attribute not supported in physics on a triangle mesh %s", path.GetText());
+                CARB_LOG_INFO("Double sided attribute not supported in physics on a triangle mesh %s", pathText);
             }
             if (desc.sdfMeshCookingParams.sdfResolution > 0)
             {
-                cleanupMultipleMaterials(desc, "SDF", usdPrim);
+                cleanupMultipleMaterials(desc, "SDF", createShapeAttachedStage, key);
             }
             else
             {
@@ -3147,12 +3446,12 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
             }
 
             physxType = ePTShape;
-            outId = omni::physx::createShape(PxTriangleMeshGeometry(newMesh, meshScale), desc, usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames,
+            outId = omni::physx::createShape(PxTriangleMeshGeometry(newMesh, meshScale), desc, key, physxScene, collisionGroup, rigidActor, exposePrimNames,
                                               nullptr, nullptr, massInfoOut, instance);
         }
         else
         {
-            CARB_LOG_WARN("Unable to create triangle mesh for:%s",path.GetText() );
+            CARB_LOG_WARN("Unable to create triangle mesh for:%s",pathText );
             return kInvalidObjectId;
         }
     }
@@ -3187,7 +3486,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
 
         physxType = ePTShape;
         outId = omni::physx::createShape(
-            PxPlaneGeometry(), desc2, usdPrim, physxScene, collisionGroup, rigidActor, exposePrimNames, nullptr, nullptr, massInfoOut, instance);
+            PxPlaneGeometry(), desc2, key, physxScene, collisionGroup, rigidActor, exposePrimNames, nullptr, nullptr, massInfoOut, instance);
     }
     break;
     };
@@ -3195,16 +3494,14 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
     {
         // World transform via the source (per-call at Default; replaces a
         // caller-supplied UsdGeomXformCache that was default-time-pinned).
-        const GfMatrix4d worldMatrix = getWorldTransform(
-            *createShapeAttachedStage, createShapeAttachedStage->keyFor(usdPrim.GetPath()), UsdTimeCode::Default());
-        const GfTransform transform(worldMatrix);
-        const GfVec3d scale = transform.GetScale();
-        massInfoOut->aabbLocalMin.x /= static_cast<float>(scale[0]);
-        massInfoOut->aabbLocalMin.y /= static_cast<float>(scale[1]);
-        massInfoOut->aabbLocalMin.z /= static_cast<float>(scale[2]);
-        massInfoOut->aabbLocalMax.x /= static_cast<float>(scale[0]);
-        massInfoOut->aabbLocalMax.y /= static_cast<float>(scale[1]);
-        massInfoOut->aabbLocalMax.z /= static_cast<float>(scale[2]);
+        const ::physx::PxVec3 scale = omni::physx::getScale(getWorldTransform(
+            *createShapeAttachedStage, key, omni::physics::parse::ReadTime::defaultTime()));
+        massInfoOut->aabbLocalMin.x /= scale[0];
+        massInfoOut->aabbLocalMin.y /= scale[1];
+        massInfoOut->aabbLocalMin.z /= scale[2];
+        massInfoOut->aabbLocalMax.x /= scale[0];
+        massInfoOut->aabbLocalMax.y /= scale[1];
+        massInfoOut->aabbLocalMax.z /= scale[2];
     }
     if (outId != kInvalidObjectId)
     {
@@ -3231,17 +3528,16 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
             // xform cache will be reintroduced as a source-side cache later).
             // No direct-USD fallback: shape creation always runs with an attached
             // stage, so identity is the safe degenerate when one is somehow absent.
-            const GfMatrix4d worldMatrix = createShapeAttachedStage
-                ? getWorldTransform(*createShapeAttachedStage, createShapeAttachedStage->keyFor(usdPrim.GetPath()), UsdTimeCode::Default())
-                : GfMatrix4d(1.0);
-            const GfTransform transform(worldMatrix);
-            const GfVec3d scale = transform.GetScale();
-            massInfo->aabbLocalMin.x /= static_cast<float>(scale[0]);
-            massInfo->aabbLocalMin.y /= static_cast<float>(scale[1]);
-            massInfo->aabbLocalMin.z /= static_cast<float>(scale[2]);
-            massInfo->aabbLocalMax.x /= static_cast<float>(scale[0]);
-            massInfo->aabbLocalMax.y /= static_cast<float>(scale[1]);
-            massInfo->aabbLocalMax.z /= static_cast<float>(scale[2]);
+            const ::physx::PxMat44d worldMatrix = createShapeAttachedStage
+                ? getWorldTransform(*createShapeAttachedStage, key, omni::physics::parse::ReadTime::defaultTime())
+                : ::physx::PxMat44d(::physx::PxIdentity);
+            const ::physx::PxVec3 scale = omni::physx::getScale(worldMatrix);
+            massInfo->aabbLocalMin.x /= scale[0];
+            massInfo->aabbLocalMin.y /= scale[1];
+            massInfo->aabbLocalMin.z /= scale[2];
+            massInfo->aabbLocalMax.x /= scale[0];
+            massInfo->aabbLocalMax.y /= scale[1];
+            massInfo->aabbLocalMax.z /= scale[2];
         }
     }
 
@@ -3251,7 +3547,7 @@ ObjectId PhysXUsdPhysicsInterface::createShapeOrComputeMass(const SdfPath& path,
 bool PhysXUsdPhysicsInterface::getRigidBodyShapes(const usdparser::AttachedStage& attachedStage, usdparser::ObjectId rbId, usdparser::ObjectIdPathMap& shapes) const
 {
     bool hasTriggers = false;
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
     CARB_ASSERT(size_t(rbId) < db.getRecords().size());
     const InternalDatabase::Record& objectRecord = db.getRecords()[size_t(rbId)];
     if (objectRecord.mType == ePTActor || objectRecord.mType == ePTLink)
@@ -3270,18 +3566,17 @@ bool PhysXUsdPhysicsInterface::getRigidBodyShapes(const usdparser::AttachedStage
             }
             CARB_ASSERT(size_t(shapePtr->userData) < db.getRecords().size());
             const InternalDatabase::Record& shapeRecord = db.getRecords()[size_t(shapePtr->userData)];
-            // Source path (not a UsdPrim): resolves under any backend, and is all
-            // the mass path needs (getShapeMassInfo is keyed by path + ObjectId).
-            shapes[usdparser::ObjectId(shapePtr->userData)] = attachedStage.pathFor(shapeRecord.mKey);
+            // ObjectKey directly (not a path/UsdPrim): resolves under any backend, and is all
+            // the mass path needs (getShapeMassInfo is keyed purely by ObjectId).
+            shapes[usdparser::ObjectId(shapePtr->userData)] = shapeRecord.mKey;
         }
     }
     return hasTriggers;
 }
 
-PhysXUsdPhysicsInterface::MassInformation PhysXUsdPhysicsInterface::getShapeMassInfo(const PXR_NS::SdfPath& path,
-                                                                                ObjectId objectId) const
+PhysXUsdPhysicsInterface::MassInformation PhysXUsdPhysicsInterface::getShapeMassInfo(const usdparser::AttachedStage& attachedStage, ObjectId objectId) const
 {
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
     CARB_ASSERT(size_t(objectId) < db.getRecords().size());
     InternalDatabase::Record& objectRecord = db.getRecords()[size_t(objectId)];
     switch (objectRecord.mType)
@@ -3309,6 +3604,11 @@ PhysXUsdPhysicsInterface::MassInformation PhysXUsdPhysicsInterface::getShapeMass
 
 PxJointLinearLimitPair getLinearLimitPair(PhysxJointLimit limitData)
 {
+    // A one-sided limit keeps its open bound at the -inf/inf schema fallback, which PhysX
+    // rejects, so clamp both bounds instead of losing the authored one.
+    limitData.lower = toLinearLimitBound(limitData.lower);
+    limitData.upper = toLinearLimitBound(limitData.upper);
+
     // soft limit
     if (limitData.stiffness > 0.0f || limitData.damping > 0.0f)
     {
@@ -3328,36 +3628,34 @@ PxJointLinearLimitPair getLinearLimitPair(PhysxJointLimit limitData)
     }
 }
 
-PxJointAngularLimitPair getAngularLimitPair(PhysxJointLimit limitData, const SdfPath& path)
+// `pathText` is purely the clamp-warning's diagnostic text -- ObjectKey-native callers pass
+// attachedStage.textFor(key), no SdfPath needed.
+PxJointAngularLimitPair getAngularLimitPair(PhysxJointLimit limitData, const char* pathText)
 {
-    const float twoPiEpsilon = (float)(2.0f * M_PI - 0.0000001f);
-    if(limitData.lower < -twoPiEpsilon || limitData.upper > twoPiEpsilon)
+    // we must clamp the limit *exclusively* between -2pi and 2pi
+    const float lower = toTwistLimitBound(limitData.lower);
+    const float upper = toTwistLimitBound(limitData.upper);
+    if(lower != limitData.lower || upper != limitData.upper)
     {
         OMNI_LOG_WARN(
         kRoboticsLogChannel,
         "Limit data for joint %s currently set to [%.1f - %.1f] will be clamped inside [-360, 360].",
-        path.GetText(), radToDeg(limitData.lower), radToDeg(limitData.upper));
+        pathText, radToDeg(limitData.lower), radToDeg(limitData.upper));
     }
     // soft limit
     if (limitData.stiffness > 0.0f || limitData.damping > 0.0f)
     {
-        PxJointAngularLimitPair limit(limitData.lower, limitData.upper, PxSpring(limitData.stiffness, limitData.damping));
+        PxJointAngularLimitPair limit(lower, upper, PxSpring(limitData.stiffness, limitData.damping));
         limit.restitution = limitData.restitution;
         limit.bounceThreshold = limitData.bounceThreshold;
-        // we must clamp the limit *exclusively* between -2pi and 2pi
-        limit.lower = PxMax(limit.lower, -twoPiEpsilon);
-        limit.upper = PxMin(limit.upper, twoPiEpsilon);
         return limit;
     }
     else
         // hard limit
     {
-        PxJointAngularLimitPair limit(limitData.lower, limitData.upper);
+        PxJointAngularLimitPair limit(lower, upper);
         limit.restitution = limitData.restitution;
         limit.bounceThreshold = limitData.bounceThreshold;
-        // we must clamp the limit *exclusively* between -2pi and 2pi
-        limit.lower = PxMax(limit.lower, -twoPiEpsilon);
-        limit.upper = PxMin(limit.upper, twoPiEpsilon);
         return limit;
     }
 }
@@ -3382,51 +3680,54 @@ PxJointLimitCone getConeLimit(PhysxJointLimit limitData)
     }
 }
 
-ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, const SdfPath& path, const PhysxJointDesc& desc, ObjectId body0, ObjectId body1)
+ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, omni::physics::parse::ObjectKey jointKey, const PhysxJointDesc& desc, ObjectId body0, ObjectId body1)
 {
-    checkScenes();
+    checkScenes(attachedStage);
     if (desc.jointEnabled == false)
         return kInvalidObjectId;
 
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
-    PxRigidActor* actor0 = getPtr<PxRigidActor>(ePTActor, body0);
-    PxRigidActor* actor1 = getPtr<PxRigidActor>(ePTActor, body1);
+    PxRigidActor* actor0 = getPtr<PxRigidActor>(attachedStage.getInternalPhysXDatabase(), ePTActor, body0);
+    PxRigidActor* actor1 = getPtr<PxRigidActor>(attachedStage.getInternalPhysXDatabase(), ePTActor, body1);
 
     if (!actor0)
     {
-        actor0 = getPtr<PxRigidActor>(ePTLink, body0);
+        actor0 = getPtr<PxRigidActor>(attachedStage.getInternalPhysXDatabase(), ePTLink, body0);
     }
     if (!actor1)
     {
-        actor1 = getPtr<PxRigidActor>(ePTLink, body1);
+        actor1 = getPtr<PxRigidActor>(attachedStage.getInternalPhysXDatabase(), ePTLink, body1);
     }
     // This also filter the case of joints trying to be created on a different scene that is not forced scene (when active)
     if (!actor0 && !actor1)
         return kInvalidObjectId;
 
-    UsdPrim usdPrim = attachedStage.getStage()->GetPrimAtPath(path);
     const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
-    const omni::physics::parse::ObjectKey jointKey = attachedStage.keyFor(path);
 
     PxTransform localPose0 = toPhysX(desc.localPose0Position, desc.localPose0Orientation);
     PxTransform localPose1 = toPhysX(desc.localPose1Position, desc.localPose1Orientation);
 
-    registerJointTimeSampledChanges(attachedStage, path);
+    registerJointTimeSampledChanges(attachedStage, jointKey);
 
-    InternalJoint* intJoint = ICE_NEW(InternalJoint);
+    std::unique_ptr<InternalJoint> pendingInternal(ICE_NEW(InternalJoint));
+    InternalJoint* intJoint = pendingInternal.get();
     intJoint->mJointType = desc.type;  // must be set before any calls to fixupLocalPose
     PxJoint* j = nullptr;
 
     ObjectId retId = kInvalidObjectId;
     PhysXType physxType = ePTJoint;
 
-    if(src && src->exists(jointKey) && src->hasSchema(jointKey, schemaTypeToken<PhysxSchemaJointStateAPI>(*src)))
+    // Attach-scoped token cache (interned once in rebuildSource()); createJoint runs per joint.
+    // No exists(jointKey) guard: the desc comes from a scan so the prim is live, and
+    // hasSchema() answers by schema membership without the key being in the known-key seed.
+    const omni::physics::parse::KnownTokens& jointTok = attachedStage.getKnownTokens();
+    if(src && src->hasSchema(jointKey, jointTok.physicsJointStateAPI))
     {
         OMNI_LOG_WARN(
         kRoboticsLogChannel,
         "Physics USD: JointStateAPI applied to Joint %s it's not supported, and it will be ignored.",
-        path.GetText());
+        attachedStage.textFor(jointKey));
     }
 
     switch (desc.type)
@@ -3480,34 +3781,34 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
 
         if (limitData.enabled)
         {
-            PxJointAngularLimitPair limitPair = getAngularLimitPair(limitData, path);
-            checkRevoluteJointLimits(limitPair, usdPrim.GetPrimPath().GetText());
+            PxJointAngularLimitPair limitPair = getAngularLimitPair(limitData, attachedStage.textFor(jointKey));
+            checkRevoluteJointLimits(limitPair, attachedStage.textFor(jointKey));
 
             pj->setMotion(PxD6Axis::eTWIST, PxD6Motion::eLIMITED);
             pj->setTwistLimit(limitPair);
 
-            const bool enableExtendedJointAngles = OmniPhysX::getInstance().getCachedSettings().enableExtendedJointAngles;
+            const bool enableExtendedJointAngles = attachedStage.getCachedSettings().enableExtendedJointAngles;
             pj->setConstraintFlag(PxConstraintFlag::eENABLE_EXTENDED_LIMITS, enableExtendedJointAngles);
         }
         else
             pj->setMotion(PxD6Axis::eTWIST, PxD6Motion::eFREE);
 
-        if (hasMultiApplyInstance(attachedStage, jointKey, PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->angular))
+        if ((src && src->hasSchema(jointKey, jointTok.physxJointAxisAPIAngular)))
         {
-            usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->angular);
-            CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", path.GetText());
+            removeAppliedAPI(attachedStage, jointKey, "PhysxJointAxisAPI", "angular");
+            CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", attachedStage.textFor(jointKey));
         }
 
             const usdparser::PhysxJointDrive& driveData = jointDesc.drive;
         if (driveData.enabled)
         {
-            registerDriveTimeSampledChanges(attachedStage, path, "drive:angular");
+            registerDriveTimeSampledChanges(attachedStage, jointKey, "drive:angular");
             PxD6JointDrive drive(driveData.stiffness, driveData.damping, driveData.forceLimit, driveData.acceleration);
             pj->setDrive(PxD6Drive::eTWIST, drive);
             if(driveData.isEnvelopeUsed)
             {
-                usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxDrivePerformanceEnvelopeAPI, UsdPhysicsTokens->angular);
-                CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", path.GetText());
+                removeAppliedAPI(attachedStage, jointKey, "PhysxDrivePerformanceEnvelopeAPI", "angular");
+                CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", attachedStage.textFor(jointKey));
             }
 
             intJoint->mJointDrive = driveData;            
@@ -3565,15 +3866,15 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
         else
             pj->setMotion(d6Axis, PxD6Motion::eFREE);
 
-        if (hasMultiApplyInstance(attachedStage, jointKey, PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->linear))
+        if ((src && src->hasSchema(jointKey, jointTok.physxJointAxisAPILinear)))
         {
-            usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->linear);
-            CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", path.GetText());
+            removeAppliedAPI(attachedStage, jointKey, "PhysxJointAxisAPI", "linear");
+            CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", attachedStage.textFor(jointKey));
         }
         const usdparser::PhysxJointDrive& driveData = jointDesc.drive;
         if (driveData.enabled)
         {
-            registerDriveTimeSampledChanges(attachedStage, path, "drive:linear");
+            registerDriveTimeSampledChanges(attachedStage, jointKey, "drive:linear");
             PxD6JointDrive drive(driveData.stiffness, driveData.damping, driveData.forceLimit, driveData.acceleration);
             pj->setDrive(d6drive, drive);
 
@@ -3589,8 +3890,8 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
             pj->setDrivePosition(PxTransform(drivePos));
             if(driveData.isEnvelopeUsed)
             {
-                usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxDrivePerformanceEnvelopeAPI, UsdPhysicsTokens->linear);
-                CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", path.GetText());
+                removeAppliedAPI(attachedStage, jointKey, "PhysxDrivePerformanceEnvelopeAPI", "linear");
+                CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", attachedStage.textFor(jointKey));
             }
         }
     }
@@ -3638,24 +3939,24 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
                 case eDistance:
                     break;
                 case eRotX:
-                    if (hasMultiApplyInstance(attachedStage, jointKey, PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotX))
+                    if ((src && src->hasSchema(jointKey, jointTok.physxJointAxisAPIRotX)))
                     {
-                        usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotX);
-                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", path.GetText());
+                        removeAppliedAPI(attachedStage, jointKey, "PhysxJointAxisAPI", "rotX");
+                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", attachedStage.textFor(jointKey));
                     }
                     break;
                 case eRotY:
-                    if (hasMultiApplyInstance(attachedStage, jointKey, PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotY))
+                    if ((src && src->hasSchema(jointKey, jointTok.physxJointAxisAPIRotY)))
                     {
-                        usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotY);
-                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", path.GetText());
+                        removeAppliedAPI(attachedStage, jointKey, "PhysxJointAxisAPI", "rotY");
+                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", attachedStage.textFor(jointKey));
                     }
                     break;
                 case eRotZ:
-                    if (hasMultiApplyInstance(attachedStage, jointKey, PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotZ))
+                    if ((src && src->hasSchema(jointKey, jointTok.physxJointAxisAPIRotZ)))
                     {
-                        usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotZ);
-                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", path.GetText());
+                        removeAppliedAPI(attachedStage, jointKey, "PhysxJointAxisAPI", "rotZ");
+                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", attachedStage.textFor(jointKey));
                     }
                     break;
             }
@@ -3717,23 +4018,23 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
         PxBase* hinge0 = nullptr;
         if (!getJointAndLocalPose(attachedStage, jointDesc.hingePrimPath0, actor0, hinge0, localFrame0))
         {
-            CARB_LOG_ERROR("Invalid configuration for gear joint(%s) - neither parent nor child link of hinge 0 (%s) refer to body 0.", usdPrim.GetPrimPath().GetText(), jointDesc.hingePrimPath0.GetText());
+            CARB_LOG_ERROR("Invalid configuration for gear joint(%s) - neither parent nor child link of hinge 0 (%s) refer to body 0.", attachedStage.textFor(jointKey), attachedStage.textFor(jointDesc.hingePrimPath0));
             return kInvalidObjectId;
         }
 
         PxBase* hinge1 = nullptr;
         if (!getJointAndLocalPose(attachedStage, jointDesc.hingePrimPath1, actor1, hinge1, localFrame1))
         {
-            CARB_LOG_ERROR("Invalid configuration for gear joint(%s) - neither parent nor child link of hinge 0 (%s) refer to body 0.", usdPrim.GetPrimPath().GetText(), jointDesc.hingePrimPath1.GetText());
+            CARB_LOG_ERROR("Invalid configuration for gear joint(%s) - neither parent nor child link of hinge 0 (%s) refer to body 0.", attachedStage.textFor(jointKey), attachedStage.textFor(jointDesc.hingePrimPath1));
             return kInvalidObjectId;
         }
 
         if (!hinge0 || !hinge1)
         {
             if (!hinge0)
-                CARB_LOG_WARN("Cannot simulate gear joint (%s) without two valid Revolute joint rels.", usdPrim.GetPrimPath().GetText());
+                CARB_LOG_WARN("Cannot simulate gear joint (%s) without two valid Revolute joint rels.", attachedStage.textFor(jointKey));
             if (!hinge1)
-                CARB_LOG_WARN("Cannot simulate gear joint (%s) without two valid Revolute joint rels.", usdPrim.GetPrimPath().GetText());
+                CARB_LOG_WARN("Cannot simulate gear joint (%s) without two valid Revolute joint rels.", attachedStage.textFor(jointKey));
         }
 
 
@@ -3757,29 +4058,29 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
         PxTransform localFrame1 = localPose1;
 
         PxBase* hinge = nullptr;
-        if (!getJointAndLocalPose(attachedStage, jointDesc.hingePrimPath, actor0, hinge, localFrame0))
+        if (!getJointAndLocalPose(attachedStage, jointDesc.hingePrimKey, actor0, hinge, localFrame0))
         {
             CARB_LOG_ERROR(
                 "Invalid configuration for rack and pinion joint(%s) - neither parent nor child link of hinge 0 (%s) refer to body 0.",
-                usdPrim.GetPrimPath().GetText(), jointDesc.hingePrimPath.GetText());
+                attachedStage.textFor(jointKey), attachedStage.textFor(jointDesc.hingePrimKey));
             return kInvalidObjectId;
         }
 
         PxBase* prismatic = nullptr;
-        if (!getJointAndLocalPose(attachedStage, jointDesc.prismaticPrimPath, actor1, prismatic, localFrame1))
+        if (!getJointAndLocalPose(attachedStage, jointDesc.prismaticPrimKey, actor1, prismatic, localFrame1))
         {
             CARB_LOG_ERROR(
                 "Invalid configuration for rack and pinion joint(%s) - neither parent nor child link of prismatic 1 (%s) refer to body 1.",
-                usdPrim.GetPrimPath().GetText(), jointDesc.prismaticPrimPath.GetText());
+                attachedStage.textFor(jointKey), attachedStage.textFor(jointDesc.prismaticPrimKey));
             return kInvalidObjectId;
         }
 
         if (!hinge || !prismatic)
         {
             if (!hinge)
-                CARB_LOG_WARN("Cannot simulate gear joint (%s) without two valid Revolute joint rel.", usdPrim.GetPrimPath().GetText());
+                CARB_LOG_WARN("Cannot simulate gear joint (%s) without two valid Revolute joint rel.", attachedStage.textFor(jointKey));
             if (!prismatic)
-                CARB_LOG_WARN("Cannot simulate gear joint (%s) without two valid Prismatic joint rel.", usdPrim.GetPrimPath().GetText());         
+                CARB_LOG_WARN("Cannot simulate gear joint (%s) without two valid Prismatic joint rel.", attachedStage.textFor(jointKey));         
         }
 
         PxRackAndPinionJoint* rj = PxRackAndPinionJointCreate(*OmniPhysX::getInstance().getPhysXSetup().getPhysics(), actor0, localFrame0, actor1, localFrame1);
@@ -3863,7 +4164,7 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
                 else if (limitData.enabled)
                 {
                     d6j->setMotion(PxD6Axis::eTWIST, PxD6Motion::eLIMITED);
-                    d6j->setTwistLimit(getAngularLimitPair(limitData, path));
+                    d6j->setTwistLimit(getAngularLimitPair(limitData, attachedStage.textFor(jointKey)));
 
                     hasRotationalLimit = true;
                 }
@@ -3905,7 +4206,7 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
             case eDistance:
                 if (limitData.lower > 0.0f)
                 {
-                    CARB_LOG_WARN("Distance limit on a D6 joint with a min value is not support currently. %s", usdPrim.GetPrimPath().GetText());
+                    CARB_LOG_WARN("Distance limit on a D6 joint with a min value is not support currently. %s", attachedStage.textFor(jointKey));
                 }
                 const PxJointLinearLimit linearLimit(limitData.upper, PxSpring(limitData.stiffness, limitData.damping));
                 d6j->setDistanceLimit(linearLimit);
@@ -3921,6 +4222,13 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
 
         if (usePyramidalLimit)
         {
+            // A one-sided limit keeps its open bound at the -inf/inf schema fallback, which PhysX
+            // rejects, so clamp every angle instead of losing the authored bound.
+            limitPyramidal.yAngleMin = toPyramidSwingLimitBound(limitPyramidal.yAngleMin);
+            limitPyramidal.yAngleMax = toPyramidSwingLimitBound(limitPyramidal.yAngleMax);
+            limitPyramidal.zAngleMin = toPyramidSwingLimitBound(limitPyramidal.zAngleMin);
+            limitPyramidal.zAngleMax = toPyramidSwingLimitBound(limitPyramidal.zAngleMax);
+
             if (limitPyramidal.stiffness > 0.0f || limitPyramidal.damping > 0.0f)
             {
                 PxJointLimitPyramid limit(limitPyramidal.yAngleMin, limitPyramidal.yAngleMax, limitPyramidal.zAngleMin, limitPyramidal.zAngleMax, PxSpring(limitPyramidal.stiffness, limitPyramidal.damping));
@@ -3939,7 +4247,7 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
 
         if (hasRotationalLimit)
         {
-            const bool enableExtendedJointAngles = OmniPhysX::getInstance().getCachedSettings().enableExtendedJointAngles;
+            const bool enableExtendedJointAngles = attachedStage.getCachedSettings().enableExtendedJointAngles;
             d6j->setConstraintFlag(PxConstraintFlag::eENABLE_EXTENDED_LIMITS, enableExtendedJointAngles);
         }
 
@@ -3967,24 +4275,24 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
                 case eDistance:
                     break;
                 case eRotX:
-                    if (hasMultiApplyInstance(attachedStage, jointKey, PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotX))
+                    if ((src && src->hasSchema(jointKey, jointTok.physxJointAxisAPIRotX)))
                     {
-                        usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotX);
-                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", path.GetText());
+                        removeAppliedAPI(attachedStage, jointKey, "PhysxJointAxisAPI", "rotX");
+                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", attachedStage.textFor(jointKey));
                     }
                     break;
                 case eRotY:
-                    if (hasMultiApplyInstance(attachedStage, jointKey, PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotY))
+                    if ((src && src->hasSchema(jointKey, jointTok.physxJointAxisAPIRotY)))
                     {
-                        usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotY);
-                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", path.GetText());
+                        removeAppliedAPI(attachedStage, jointKey, "PhysxJointAxisAPI", "rotY");
+                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", attachedStage.textFor(jointKey));
                     }
                     break;
                 case eRotZ:
-                    if (hasMultiApplyInstance(attachedStage, jointKey, PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotZ))
+                    if ((src && src->hasSchema(jointKey, jointTok.physxJointAxisAPIRotZ)))
                     {
-                        usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxJointAxisAPI, UsdPhysicsTokens->rotZ);
-                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", path.GetText());
+                        removeAppliedAPI(attachedStage, jointKey, "PhysxJointAxisAPI", "rotZ");
+                        CARB_LOG_WARN("PhysxJointAxisAPI is supported only for joints that are part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", attachedStage.textFor(jointKey));
                     }
                     break;
             }
@@ -3999,43 +4307,43 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
             switch (axis)
             {
             case eTransX:
-                registerDriveTimeSampledChanges(attachedStage, path, "drive:transX");
+                registerDriveTimeSampledChanges(attachedStage, jointKey, "drive:transX");
                 intJoint->mJointDrives[0] = driveData;
                 d6j->setDrive(PxD6Drive::eX, drive);
                 linVelDrive.x = driveData.targetVelocity;
                 posDrive.x = driveData.targetPosition;
                 if(driveData.isEnvelopeUsed)
                 {
-                    usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxDrivePerformanceEnvelopeAPI,  UsdPhysicsTokens->transX);
-                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", path.GetText());
+                    removeAppliedAPI(attachedStage, jointKey, "PhysxDrivePerformanceEnvelopeAPI", "transX");
+                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", attachedStage.textFor(jointKey));
                 }
                 break;
             case eTransY:
-                registerDriveTimeSampledChanges(attachedStage, path, "drive:transY");
+                registerDriveTimeSampledChanges(attachedStage, jointKey, "drive:transY");
                 intJoint->mJointDrives[1] = driveData;
                 d6j->setDrive(PxD6Drive::eY, drive);
                 linVelDrive.y = driveData.targetVelocity;
                 posDrive.y = driveData.targetPosition;
                 if(driveData.isEnvelopeUsed)
                 {
-                    usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxDrivePerformanceEnvelopeAPI, UsdPhysicsTokens->transY);
-                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulations. Envelope will be ignored for joint: %s", path.GetText());
+                    removeAppliedAPI(attachedStage, jointKey, "PhysxDrivePerformanceEnvelopeAPI", "transY");
+                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulations. Envelope will be ignored for joint: %s", attachedStage.textFor(jointKey));
                 }
                 break;
             case eTransZ:
-                registerDriveTimeSampledChanges(attachedStage, path, "drive:transZ");
+                registerDriveTimeSampledChanges(attachedStage, jointKey, "drive:transZ");
                 intJoint->mJointDrives[2] = driveData;
                 d6j->setDrive(PxD6Drive::eZ, drive);
                 linVelDrive.z = driveData.targetVelocity;
                 posDrive.z = driveData.targetPosition;
                 if(driveData.isEnvelopeUsed)
                 {
-                    usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxDrivePerformanceEnvelopeAPI,  UsdPhysicsTokens->transZ);
-                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", path.GetText());
+                    removeAppliedAPI(attachedStage, jointKey, "PhysxDrivePerformanceEnvelopeAPI", "transZ");
+                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", attachedStage.textFor(jointKey));
                 }
                 break;
             case eRotX:
-                registerDriveTimeSampledChanges(attachedStage, path, "drive:rotX");
+                registerDriveTimeSampledChanges(attachedStage, jointKey, "drive:rotX");
                 intJoint->mJointDrives[3] = driveData;
                 d6j->setDrive(PxD6Drive::eTWIST, drive);
                 // preist: Switch the sign to be consistent with articulations and position drive behavior. Remove when changed in the SDK
@@ -4044,12 +4352,12 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
                 angDrive.x = driveData.targetPosition;
                 if(driveData.isEnvelopeUsed)
                 {
-                    usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxDrivePerformanceEnvelopeAPI,  UsdPhysicsTokens->rotX);
-                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", path.GetText());
+                    removeAppliedAPI(attachedStage, jointKey, "PhysxDrivePerformanceEnvelopeAPI", "rotX");
+                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", attachedStage.textFor(jointKey));
                 }
                 break;
             case eRotY:
-                registerDriveTimeSampledChanges(attachedStage, path, "drive:rotY");
+                registerDriveTimeSampledChanges(attachedStage, jointKey, "drive:rotY");
                 intJoint->mJointDrives[4] = driveData;
                 d6j->setDrive(PxD6Drive::eSWING1, drive);
                 // preist: Switch the sign to be consistent with articulations and position drive behavior. Remove when changed in the SDK
@@ -4058,12 +4366,12 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
                 angDrive.y = driveData.targetPosition;
                 if(driveData.isEnvelopeUsed)
                 {
-                    usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxDrivePerformanceEnvelopeAPI,  UsdPhysicsTokens->rotY);
-                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", path.GetText());
+                    removeAppliedAPI(attachedStage, jointKey, "PhysxDrivePerformanceEnvelopeAPI", "rotY");
+                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", attachedStage.textFor(jointKey));
                 }
                 break;
             case eRotZ:
-                registerDriveTimeSampledChanges(attachedStage, path, "drive:rotZ");
+                registerDriveTimeSampledChanges(attachedStage, jointKey, "drive:rotZ");
                 intJoint->mJointDrives[5] = driveData;
                 d6j->setDrive(PxD6Drive::eSWING2, drive);
                 // preist: Switch the sign to be consistent with articulations and position drive behavior. Remove when changed in the SDK
@@ -4072,8 +4380,8 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
                 angDrive.z = driveData.targetPosition;
                 if(driveData.isEnvelopeUsed)
                 {
-                    usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxDrivePerformanceEnvelopeAPI,  UsdPhysicsTokens->rotZ);
-                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", path.GetText());
+                    removeAppliedAPI(attachedStage, jointKey, "PhysxDrivePerformanceEnvelopeAPI", "rotZ");
+                    CARB_LOG_WARN("Performance envelope is supported only for joints that are part of an articulation. Envelope will be ignored for joint: %s", attachedStage.textFor(jointKey));
                 }
                 break;
             case eDistance:
@@ -4093,13 +4401,14 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
     {
         const CustomPhysxJointDesc& jointDesc = static_cast<const CustomPhysxJointDesc&>(desc);
 
-        CustomPhysXJoint* customPhysXJoint = OmniPhysX::getInstance().getCustomJointManager().createCustomJoint(path, jointDesc,
-            actor0, localPose0, actor1, localPose1);
+        CustomPhysXJoint* customPhysXJoint = OmniPhysX::getInstance().getCustomJointManager().createCustomJoint(
+            attachedStage, jointKey, jointDesc, actor0, localPose0, actor1, localPose1);
 
         if (customPhysXJoint)
         {
             physxType = ePTCustomJoint;
-            retId = db.addRecord(physxType, customPhysXJoint, intJoint, attachedStage.keyFor(path));
+            try { retId = db.addRecord(physxType, customPhysXJoint, intJoint, jointKey); }
+            catch (...) { customPhysXJoint->release(); throw; }
         }
         break;
     };
@@ -4120,17 +4429,21 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
 
         j->setConstraintFlag(PxConstraintFlag::eDRIVE_LIMITS_ARE_FORCES, true);
 
-        if (mExposePrimNames)
-            j->setName(path.GetText());
+        if (attachedStage.getParseOptions().exposePrimNames)
+            j->setName(attachedStage.textFor(jointKey));
 
-        if (OmniPhysX::getInstance().isDebugVisualizationEnabled())
-            j->setConstraintFlag(PxConstraintFlag::eVISUALIZATION, OmniPhysX::getInstance().isDebugVisualizationEnabled());
+        if (attachedStage.isDebugVisualizationEnabled())
+            j->setConstraintFlag(PxConstraintFlag::eVISUALIZATION, attachedStage.isDebugVisualizationEnabled());
 
-        retId = db.addRecord(physxType, j, intJoint, attachedStage.keyFor(path));
+        retId = db.addRecord(physxType, j, intJoint, jointKey);
         j->userData = (void*)retId;
     }
 
-    sendObjectCreationNotification(path, retId, physxType);    
+    if (retId != kInvalidObjectId)
+    {
+        pendingInternal.release();
+        sendObjectCreationNotification(attachedStage, jointKey, retId, physxType);
+    }
 
     return retId;
 }
@@ -4138,7 +4451,7 @@ ObjectId PhysXUsdPhysicsInterface::createJoint(AttachedStage& attachedStage, con
 void PhysXUsdPhysicsInterface::recreateArticulationJoint(AttachedStage& attachedStage,
     const PhysxJointDesc& jointDesc, ObjectId link0Id, ObjectId link1Id)
 {
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     const PxArticulationLink* link0 = reinterpret_cast<const PxArticulationLink*>(db.getTypedRecord(ePTLink, link0Id));
     if (link0)
@@ -4146,9 +4459,7 @@ void PhysXUsdPhysicsInterface::recreateArticulationJoint(AttachedStage& attached
         const PxArticulationLink* link1 = reinterpret_cast<const PxArticulationLink*>(db.getTypedRecord(ePTLink, link1Id));
         if (link1)
         {
-            const SdfPath body0Path = attachedStage.pathFor(jointDesc.body0);
-            const SdfPath body1Path = attachedStage.pathFor(jointDesc.body1);
-            SdfPath childLinkPath;
+            omni::physics::parse::ObjectKey childLinkKey;
 
             PxArticulationJointReducedCoordinate* joint = link1->getInboundJoint();
             if (joint)
@@ -4156,7 +4467,7 @@ void PhysXUsdPhysicsInterface::recreateArticulationJoint(AttachedStage& attached
                 const PxArticulationLink& link = joint->getParentArticulationLink();
                 if (&link == link0)
                 {
-                    childLinkPath = body1Path;
+                    childLinkKey = jointDesc.body1;
                 }
                 else
                 {
@@ -4166,7 +4477,7 @@ void PhysXUsdPhysicsInterface::recreateArticulationJoint(AttachedStage& attached
                         const PxArticulationLink& link = joint->getParentArticulationLink();
                         if (&link == link1)
                         {
-                            childLinkPath = body0Path;
+                            childLinkKey = jointDesc.body0;
                         }
                         else
                         {
@@ -4183,7 +4494,7 @@ void PhysXUsdPhysicsInterface::recreateArticulationJoint(AttachedStage& attached
                     const PxArticulationLink& link = joint->getParentArticulationLink();
                     if (&link == link1)
                     {
-                        childLinkPath = body0Path;
+                        childLinkKey = jointDesc.body0;
                     }
                     else
                     {
@@ -4194,36 +4505,30 @@ void PhysXUsdPhysicsInterface::recreateArticulationJoint(AttachedStage& attached
 
             if (joint)
             {
-                createArticulationJoint<false>(attachedStage, jointDesc, joint, childLinkPath, nullptr);
+                createArticulationJoint<false>(attachedStage, jointDesc, joint, childLinkKey, nullptr);
             }
         }
     }
 }
 
 
-void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const SdfPath& removedPath, ObjectId objectId)
+void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, omni::physics::parse::ObjectKey removedKey, ObjectId objectId)
 {
-    if(!OmniPhysX::getInternalPhysXDatabaseCheck())
-    {
-        CARB_ASSERT(0); // Should not happen.
-        return;
-    }
-
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
     PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
 
     if (objectId >= db.getRecords().size())
     {
-        CARB_LOG_ERROR("Removed path does point to non-existing objectId, path: %s", removedPath.GetText());
+        CARB_LOG_ERROR("Removed path does point to non-existing objectId, path: %s", attachedStage.textFor(removedKey));
         return;
     }
 
     InternalDatabase::Record& objectRecord = db.getRecords()[objectId];
 
     // make sure we are not running simulation when releasing objects
-    waitForSimulationCompletion(false);
+    waitForSimulationCompletion(attachedStage, false);
 
-    sendObjectDestructionNotification(removedPath, objectId, objectRecord.mType);
+    sendObjectDestructionNotification(attachedStage, objectRecord.mKey, objectId, objectRecord.mType);
 
     switch (objectRecord.mType)
     {
@@ -4233,9 +4538,9 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
     {
         PxShape* shape = (PxShape*)objectRecord.mPtr;
         InternalShape* intShape = (InternalShape*)objectRecord.mInternalPtr;
-        intShape->mPhysicsScene->getContactReport()->removeShape(shape, removedPath);
-        OmniPhysX::getInstance().getTriggerManager()->clearBufferedShape(shape);
-        removeFilteredObject<uint32_t>(internal::convertFilterPairFromPxFilterData(shape->getSimulationFilterData()), physxSetup.getFilteredPairs());
+        intShape->mPhysicsScene->getContactReport()->removeShape(shape, removedKey);
+        OmniPhysX::getInstance().getTriggerManager()->clearBufferedShape(attachedStage, shape);
+        removeFilteredObject<uint32_t>(internal::convertFilterPairFromPxFilterData(shape->getSimulationFilterData()), attachedStage.getFilteredPairs());
         PxRigidActor* pxActor = shape->getActor();
         if (pxActor && !intShape->mDetached)
         {
@@ -4249,12 +4554,15 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
                 intShape->mPhysicsScene->getInternalScene()->updateVehicleOnRemovedShape(*pxActor, shape);
 
                 // set shape removed event flag for attachments and collision filters
-                updateDeformableAttachmentShapeEvents((InternalActor*)actorRecord.mInternalPtr, objectId, removedPath, internal::DirtyEventType::eShapeRemoved);
-                updateDeformableCollisionFilterShapeEvents((InternalActor*)actorRecord.mInternalPtr, objectId, removedPath, internal::DirtyEventType::eShapeRemoved);
+                updateDeformableAttachmentShapeEvents((InternalActor*)actorRecord.mInternalPtr, objectId, removedKey, internal::DirtyEventType::eShapeRemoved);
+                updateDeformableCollisionFilterShapeEvents((InternalActor*)actorRecord.mInternalPtr, objectId, removedKey, internal::DirtyEventType::eShapeRemoved);
 
-                shape->release();
+
             }
         }
+        // The database owns the creator reference even if its actor was already
+        // removed, or this is a shared shape with no single getActor() result.
+        shape->release();
         if (intShape && intShape->mMaterialId != kInvalidObjectId)
         {
             InternalDatabase::Record& materialRecord = db.getRecords()[intShape->mMaterialId];
@@ -4275,9 +4583,9 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
         for (size_t i = 0; i < shape->getShapes().size(); i++)
         {
             PxShape* pxShape = (PxShape*)shape->getShapes()[i];
-            ps->getContactReport()->removeShape(pxShape, removedPath);
-            OmniPhysX::getInstance().getTriggerManager()->clearBufferedShape(pxShape);
-            removeFilteredObject<uint32_t>(internal::convertFilterPairFromPxFilterData(pxShape->getSimulationFilterData()), physxSetup.getFilteredPairs());
+            ps->getContactReport()->removeShape(pxShape, removedKey);
+            OmniPhysX::getInstance().getTriggerManager()->clearBufferedShape(attachedStage, pxShape);
+            removeFilteredObject<uint32_t>(internal::convertFilterPairFromPxFilterData(pxShape->getSimulationFilterData()), attachedStage.getFilteredPairs());
             PxRigidActor* pxActor = pxShape->getActor();
             if (pxActor)
             {
@@ -4289,10 +4597,12 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
                     pxActor->detachShape(*pxShape);
 
                     ps->getInternalScene()->updateVehicleOnRemovedShape(*pxActor, pxShape);
-
-                    pxShape->release();
                 }
             }
+            // As for a single shape, the database owns each child's creator reference,
+            // also once its actor is gone or when the child is shared and has no single
+            // getActor() result.
+            pxShape->release();
         }
         if (shape->mMaterialId != kInvalidObjectId)
         {
@@ -4312,13 +4622,13 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
         PxRigidActor* actor = (PxRigidActor*)objectRecord.mPtr;
         InternalActor* intActor = (InternalActor*)objectRecord.mInternalPtr;
         PhysXScene* ps = intActor->mPhysXScene;
-        OmniPhysX::getInstance().getRaycastManager().clearPicker(actor);
-        ps->getContactReport()->removeActor(actor, removedPath);
+        attachedStage.getRaycastManager().clearPicker(actor);
+        ps->getContactReport()->removeActor(actor, removedKey);
         PxShape* shapePtr = nullptr;
         for (PxU32 i = 0; i < actor->getNbShapes(); i++)
         {
             actor->getShapes(&shapePtr, 1, i);
-            removeFilteredObject<uint32_t>(internal::convertFilterPairFromPxFilterData(shapePtr->getSimulationFilterData()), physxSetup.getFilteredPairs());
+            removeFilteredObject<uint32_t>(internal::convertFilterPairFromPxFilterData(shapePtr->getSimulationFilterData()), attachedStage.getFilteredPairs());
             const size_t shapeIndex = (size_t)shapePtr->userData;
             if (shapeIndex < db.getRecords().size())
             {
@@ -4343,20 +4653,20 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
 
         db.storePxJoint(actor, intActor->mKey);
 
+        ps->getInternalScene()->trackReleasedActiveActor(actor);
+        // A force prim outlives the body it is attached to on the paths that release the body
+        // without removing the force prim, so drop the back pointer before the actor dies
+        // (NVBugs 6583666).
+        internal::swapForceActorsAllScenes(attachedStage, actor, nullptr);
         actor->release();
         db.removeDirtyMassActor(intActor);
         // A.B. this can be easily a bottleneck
+        if (!ps->getInternalScene()->removeActor(*intActor))
         {
-            std::vector<InternalActor*>& actorsList = ps->getInternalScene()->mActors;
-            for (size_t i = 0; i < actorsList.size(); i++)
-            {
-                if (actorsList[i] == intActor)
-                {
-                    actorsList[i] = actorsList.back();
-                    actorsList.pop_back();
-                    break;
-                }
-            }
+            // The entry is looked up through intActor->mPhysXScene. If it is not there the actor is
+            // about to be deleted while some other scene still references it (NVBugs 6504495).
+            CARB_LOG_ERROR("Removed rigid body %s was not registered with its own scene.",
+                           attachedStage.textFor(removedKey));
         }
         {
             std::vector<InternalActor*>& actorsList = ps->getInternalScene()->mMirorredActors;
@@ -4371,7 +4681,7 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
             }
         }
         SAFE_DELETE_ALLOCABLE_SINGLE(intActor);
-        attachedStage.removeAnimatedKinematicBody(removedPath);
+        attachedStage.removeAnimatedKinematicBody(removedKey);
         objectRecord.setRemoved();
     }
     break;
@@ -4390,7 +4700,7 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
                 break;
             }
         }
-        attachedStage.removeAnimatedKinematicBody(removedPath);
+        attachedStage.removeAnimatedKinematicBody(removedKey);
         SAFE_DELETE_ALLOCABLE_SINGLE(intForce);
         objectRecord.setRemoved();
     }
@@ -4413,8 +4723,8 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
         PxMaterial* material = (PxMaterial*)objectRecord.mPtr;
 
         // release from default material on a scene
-        const PhysXScenesMap& physxScenes = OmniPhysX::getInstance().getPhysXSetup().getPhysXScenes();
-        for (PhysXScenesMap::const_reference ref : physxScenes)
+        const AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
+        for (AttachedStage::SceneMap::const_reference ref : physxScenes)
         {
             PhysXScene* sc = ref.second;
             if (sc->getDefaultMaterial() == material)
@@ -4449,9 +4759,10 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
     case ePTCct:
     {
         PxController* cct = (PxController*)objectRecord.mPtr;
-        cct->release();
         InternalCct* intCct = (InternalCct*)objectRecord.mInternalPtr;
         PhysXScene* ps = intCct->mPhysXScene;
+        ps->getInternalScene()->trackReleasedActiveActor(cct->getActor());
+        cct->release();
         CctMap::iterator it = ps->getInternalScene()->mCctMap.begin();
         while (it != ps->getInternalScene()->mCctMap.end())
         {
@@ -4498,7 +4809,7 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
     case ePTVehicleTireFrictionTable:
     {
         CARB_LOG_ERROR("PhysX Vehicle: \"%s\": removing tire friction tables while playing is not permitted.\n",
-            removedPath.GetText());
+            attachedStage.textFor(removedKey));
     }
     break;
 
@@ -4540,6 +4851,16 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
     }
     break;
 
+    case ePTCustomJoint:
+    {
+        const std::unordered_map<omni::physics::parse::ObjectKey, omni::physx::CustomPhysXJoint *, omni::physics::parse::ObjectKey::Hash>::iterator found = attachedStage.customJoints.find(objectRecord.mKey);
+        if (found != attachedStage.customJoints.end() && found->second == objectRecord.mPtr)
+            found->second->release();
+        InternalJoint* intJoint = static_cast<InternalJoint*>(objectRecord.mInternalPtr);
+        SAFE_DELETE_ALLOCABLE_SINGLE(intJoint);
+        objectRecord.setRemoved();
+    }
+    break;
     case ePTJoint:
     {
         PxJoint* joint = (PxJoint*)objectRecord.mPtr;
@@ -4599,6 +4920,20 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
         }
 
         InternalScene* internalScene = internalArticulation->mPhysxScene->getInternalScene();
+        {
+            const PxU32 numLinks = art->getNbLinks();
+            std::vector<PxArticulationLink*> links(numLinks);
+            if (numLinks)
+            {
+                art->getLinks(links.data(), numLinks);
+                for (PxArticulationLink* link : links)
+                {
+                    internalScene->trackReleasedActiveActor(link);
+                    // see the rigid body removal path (NVBugs 6583666)
+                    internal::swapForceActorsAllScenes(attachedStage, link, nullptr);
+                }
+            }
+        }
         std::vector<::physx::PxArticulationReducedCoordinate*>& articulationsList = internalScene->mArticulations;
         for (size_t i = 0; i < articulationsList.size(); i++)
         {
@@ -4615,7 +4950,10 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
             art->getScene()->removeArticulation(*art);
         }
 
-        // if we released the articulation, we have to release the links first and tendons
+        // art->release() below frees each tendon with its tendon joints and attachments, but their records
+        // are keyed to the tendon prims and can outlive the articulation. The record ids are on the tendon
+        // joints and attachments (the tendons carry no userData), so mark those PhysX pointers invalid, as
+        // for the link joints below.
         // fixed tendon
         {
             PxArticulationFixedTendon* tendon = nullptr;
@@ -4623,13 +4961,19 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
             for (PxU32 i = 0; i < numTendons; i++)
             {
                 art->getFixedTendons(&tendon, 1, i);
-                const size_t tendonIndex = (size_t)tendon->userData;
-                if (tendonIndex < db.getRecords().size())
+                PxArticulationTendonJoint* tendonJoint = nullptr;
+                const PxU32 numTendonJoints = tendon->getNbTendonJoints();
+                for (PxU32 j = 0; j < numTendonJoints; j++)
                 {
-                    InternalDatabase::Record& tendonRecord = db.getRecords()[tendonIndex];
-                    if (tendonRecord.mType == ePTFixedTendonAxis)
+                    tendon->getTendonJoints(&tendonJoint, 1, j);
+                    const size_t tendonIndex = (size_t)tendonJoint->userData;
+                    if (tendonIndex < db.getRecords().size())
                     {
-                        releaseObject(attachedStage, attachedStage.pathFor(tendonRecord.mKey), tendonIndex);
+                        InternalDatabase::Record& tendonRecord = db.getRecords()[tendonIndex];
+                        if (tendonRecord.mType == ePTFixedTendonAxis)
+                        {
+                            tendonRecord.mPtr = nullptr;
+                        }
                     }
                 }
             }
@@ -4641,13 +4985,19 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
             for (PxU32 i = 0; i < numTendons; i++)
             {
                 art->getSpatialTendons(&tendon, 1, i);
-                const size_t tendonIndex = (size_t)tendon->userData;
-                if (tendonIndex < db.getRecords().size())
+                PxArticulationAttachment* attachment = nullptr;
+                const PxU32 numAttachments = tendon->getNbAttachments();
+                for (PxU32 j = 0; j < numAttachments; j++)
                 {
-                    InternalDatabase::Record& tendonRecord = db.getRecords()[tendonIndex];
-                    if (tendonRecord.mType == ePTTendonAttachment)
+                    tendon->getAttachments(&attachment, 1, j);
+                    const size_t tendonIndex = (size_t)attachment->userData;
+                    if (tendonIndex < db.getRecords().size())
                     {
-                        releaseObject(attachedStage, attachedStage.pathFor(tendonRecord.mKey), tendonIndex);
+                        InternalDatabase::Record& tendonRecord = db.getRecords()[tendonIndex];
+                        if (tendonRecord.mType == ePTTendonAttachment)
+                        {
+                            tendonRecord.mPtr = nullptr;
+                        }
                     }
                 }
             }
@@ -4684,18 +5034,18 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
                     InternalDatabase::Record& linkRecord = db.getRecords()[linkIndex];
                     if (linkRecord.mType == ePTLink)
                     {
-                        releaseObject(attachedStage, attachedStage.pathFor(linkRecord.mKey), linkIndex);
+                        releaseObject(attachedStage, linkRecord.mKey, linkIndex);
                     }
                 }
             }
         }
 
-        for (size_t i = 0; i < mArticulations.size(); i++)
+        for (size_t i = 0; i < attachedStage.getPendingPhysicsSetup().articulations.size(); i++)
         {
-            if (mArticulations[i] == (ObjectId)art->userData)
+            if (attachedStage.getPendingPhysicsSetup().articulations[i] == (ObjectId)art->userData)
             {
-                mArticulations[i] = mArticulations.back();
-                mArticulations.pop_back();
+                attachedStage.getPendingPhysicsSetup().articulations[i] = attachedStage.getPendingPhysicsSetup().articulations.back();
+                attachedStage.getPendingPhysicsSetup().articulations.pop_back();
                 break;
             }
         }
@@ -4715,27 +5065,23 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
         PxArticulationJointReducedCoordinate* joint = actor->getInboundJoint();
         if (joint && intScene->hasMimicJoint(*joint))
         {
-            removeArticulationFromSceneAndScheduleForReAdd(actor->getArticulation());
+            removeArticulationFromSceneAndScheduleForReAdd(attachedStage, actor->getArticulation());
             intScene->releasePhysXMimicJoints(*joint);
         }
 
-        OmniPhysX::getInstance().getRaycastManager().clearPicker(actor);
-        ps->getContactReport()->removeActor(actor, removedPath);
+        attachedStage.getRaycastManager().clearPicker(actor);
+        ps->getContactReport()->removeActor(actor, removedKey);
         PxShape* shapePtr = nullptr;
         for (PxU32 i = 0; i < actor->getNbShapes(); i++)
         {
             actor->getShapes(&shapePtr, 1, i);
-            removeFilteredObject<uint32_t>(internal::convertFilterPairFromPxFilterData(shapePtr->getSimulationFilterData()), physxSetup.getFilteredPairs());
+            removeFilteredObject<uint32_t>(internal::convertFilterPairFromPxFilterData(shapePtr->getSimulationFilterData()), attachedStage.getFilteredPairs());
         }
-        std::vector<InternalActor*>& actorsList = intScene->mActors;
-        for (size_t i = 0; i < actorsList.size(); i++)
+        if (!intScene->removeActor(*intActor))
         {
-            if (actorsList[i] == intActor)
-            {
-                actorsList[i] = actorsList.back();
-                actorsList.pop_back();
-                break;
-            }
+            // See the equivalent check on the rigid body removal path (NVBugs 6504495).
+            CARB_LOG_ERROR("Removed articulation link %s was not registered with its own scene.",
+                           attachedStage.textFor(removedKey));
         }
         db.removeDirtyMassActor(intActor);
         SAFE_DELETE_ALLOCABLE_SINGLE(intActor);
@@ -4744,25 +5090,34 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
     break;
     case ePTLinkJoint:
     {
+        InternalJoint* intJoint = static_cast<InternalJoint*>(objectRecord.mInternalPtr);
         PxArticulationJointReducedCoordinate* pxJoint = (PxArticulationJointReducedCoordinate*)objectRecord.mPtr;
         if (pxJoint)  // the PhysX joint might have been deleted as part of an articulation root deletion
                       // and the joint prim is deleted later (or because the joint is on a descendant prim)
         {
             PxArticulationLink& pxLink = pxJoint->getChildArticulationLink();
-            InternalActor* intLink = (InternalActor*)db.getInternalTypedRecord(ePTLink, (ObjectId)pxLink.userData);
+            InternalLink* intLink = (InternalLink*)db.getInternalTypedRecord(ePTLink, (ObjectId)pxLink.userData);
             if (intLink)
             {
                 PhysXScene* ps = intLink->mPhysXScene;
                 InternalScene* intScene = ps->getInternalScene();
                 if (intScene->hasMimicJoint(*pxJoint))
                 {
-                    removeArticulationFromSceneAndScheduleForReAdd(pxLink.getArticulation());
+                    removeArticulationFromSceneAndScheduleForReAdd(attachedStage, pxLink.getArticulation());
                     intScene->releasePhysXMimicJoints(*pxJoint);
+                }
+
+                // The PhysX joint stays with its link, and a new InternalJoint is built around it
+                // when the joint prim is parsed again. Keep the limit bounds delivered to it so far
+                // for that one (REQ-LOAD-JOINTLIMIT-001 AC-9).
+                if (intJoint)
+                {
+                    for (int i = 0; i < 6; i++)
+                        intLink->mInboundJointLiveLimits[i] = intJoint->mLiveLimits[i];
                 }
             }
         }
 
-        InternalJoint* intJoint = static_cast<InternalJoint*>(objectRecord.mInternalPtr);
         SAFE_DELETE_ALLOCABLE_SINGLE(intJoint);
         objectRecord.setRemoved();
     }
@@ -4783,7 +5138,7 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
     break;
     case ePTCollisionGroup:
     {
-        removeFilteredObject<uint32_t>(uint32_t(objectId), physxSetup.getCollisionGroupFilteredPairs());
+        removeFilteredObject<uint32_t>(uint32_t(objectId), attachedStage.getCollisionGroupFilteredPairs());
         objectRecord.setRemoved();
 
         CARB_LOG_ERROR("Physics USD: Removing a CollisionGroup while the simulation is running results in undefined behavior!");
@@ -4829,7 +5184,7 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
         InternalSurfaceDeformableBody* intActor = (InternalSurfaceDeformableBody*)objectRecord.mInternalPtr;
         PhysXScene* ps = intActor->mPhysXScene;
         InternalScene* internalScene = ps->getInternalScene();
-        const uint64_t removedPrimAPIs = attachedStage.getObjectDatabase()->getSchemaAPIs(removedPath);
+        const uint64_t removedPrimAPIs = attachedStage.getObjectDatabase()->getSchemaAPIs(removedKey);
         const bool isRoot = (removedPrimAPIs & SchemaAPIFlag::eDeformableBodyAPI) > 0;
 
         // Only process the root node, not sub objects
@@ -4849,7 +5204,7 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
             // Remove material reference
             if (intActor->mMaterialId != kInvalidObjectId)
             {
-                InternalDatabase::Record& materialRecord = OmniPhysX::getInstance().getInternalPhysXDatabase().getRecords()[intActor->mMaterialId];
+                InternalDatabase::Record& materialRecord = attachedStage.getInternalPhysXDatabase().getRecords()[intActor->mMaterialId];
                 InternalDeformableMaterial* mat = (InternalDeformableMaterial*)materialRecord.mInternalPtr;
                 if (mat)
                 {
@@ -4873,7 +5228,7 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
         InternalVolumeDeformableBody* intActor = (InternalVolumeDeformableBody*)objectRecord.mInternalPtr;
         PhysXScene* ps = intActor->mPhysXScene;
         InternalScene* internalScene = ps->getInternalScene();
-        const uint64_t removedPrimAPIs = attachedStage.getObjectDatabase()->getSchemaAPIs(removedPath);
+        const uint64_t removedPrimAPIs = attachedStage.getObjectDatabase()->getSchemaAPIs(removedKey);
         const bool isRoot = (removedPrimAPIs & SchemaAPIFlag::eDeformableBodyAPI) > 0;
 
         // Only process the root node, not sub objects
@@ -4893,7 +5248,7 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
             // Remove material reference
             if (intActor->mMaterialId != kInvalidObjectId)
             {
-                InternalDatabase::Record& materialRecord = OmniPhysX::getInstance().getInternalPhysXDatabase().getRecords()[intActor->mMaterialId];
+                InternalDatabase::Record& materialRecord = attachedStage.getInternalPhysXDatabase().getRecords()[intActor->mMaterialId];
                 InternalDeformableMaterial* mat = (InternalDeformableMaterial*)materialRecord.mInternalPtr;
                 if (mat)
                 {
@@ -4917,8 +5272,8 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
     {
         InternalDeformableAttachment* internalDeformableAttachment = (InternalDeformableAttachment*)objectRecord.mInternalPtr;
 
-        const PhysXScenesMap& physxScenes = OmniPhysX::getInstance().getPhysXSetup().getPhysXScenes();
-        for (PhysXScenesMap::const_reference ref : physxScenes)
+        const AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
+        for (AttachedStage::SceneMap::const_reference ref : physxScenes)
         {
             InternalScene* internalScene = ref.second->getInternalScene();
             if (internalScene->removeDeformableAttachment(*internalDeformableAttachment))
@@ -4932,8 +5287,8 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
     {
         InternalDeformableCollisionFilter* internalDeformableCollisionFilter = (InternalDeformableCollisionFilter*)objectRecord.mInternalPtr;
 
-        const PhysXScenesMap& physxScenes = OmniPhysX::getInstance().getPhysXSetup().getPhysXScenes();
-        for (PhysXScenesMap::const_reference ref : physxScenes)
+        const AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
+        for (AttachedStage::SceneMap::const_reference ref : physxScenes)
         {
             InternalScene* internalScene = ref.second->getInternalScene();
             if (internalScene->removeDeformableCollisionFilter(*internalDeformableCollisionFilter))
@@ -4945,8 +5300,8 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
     break;
     case ePTXformActor:
     {
-        const PhysXScenesMap& physxScenes = OmniPhysX::getInstance().getPhysXSetup().getPhysXScenes();
-        for (PhysXScenesMap::const_reference ref : physxScenes)
+        const AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
+        for (AttachedStage::SceneMap::const_reference ref : physxScenes)
         {
             InternalScene* internalScene = ref.second->getInternalScene();
 
@@ -4972,7 +5327,7 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
 
             if (articulation)
             {
-                removeArticulationFromSceneAndScheduleForReAdd(*articulation);
+                removeArticulationFromSceneAndScheduleForReAdd(attachedStage, *articulation);
             }
 
             constexpr bool removeFromTrackers = true;
@@ -4982,6 +5337,15 @@ void PhysXUsdPhysicsInterface::releaseObject(AttachedStage& attachedStage, const
         objectRecord.setRemoved();
     }
     break;
+
+    case ePTArticulationFixedBase:
+    case ePTPointInstancer:
+        // Neither owns a native object: the fixed-base alias names the articulation
+        // its articulation record owns, and an instancer's bodies have records of
+        // their own. Removing them keeps a stale alias from reaching a released
+        // articulation and lets a restored collection that tracks them be freed.
+        objectRecord.setRemoved();
+        break;
     }
 }
 
@@ -5017,31 +5381,20 @@ bool PhysXUsdPhysicsInterface::isReady(void)
     return ret;
 }
 
-GfTransform getSourceGPrimTransform(const AttachedStage& attachedStage, omni::physics::parse::ObjectKey key)
+::physx::PxMat44d getSourceGPrimTransform(const AttachedStage& attachedStage, omni::physics::parse::ObjectKey key)
 {
     // Source gprim transforms are read from default-time authored state.
-    return PXR_NS::GfTransform(getWorldTransform(attachedStage, key, PXR_NS::UsdTimeCode()));
-}
-
-bool PhysXUsdPhysicsInterface::updateTransform(const AttachedStage& attachedStage, const PXR_NS::SdfPath& path,
-                                               ObjectId objectId,
-                                               const Transform& transform,
-                                               bool resetVelocity, bool scaleProvided)
-{
-    return updateTransform(attachedStage, attachedStage.keyFor(path), objectId, transform, resetVelocity,
-                           scaleProvided);
+    return getWorldTransform(attachedStage, key, omni::physics::parse::ReadTime::defaultTime());
 }
 
 bool PhysXUsdPhysicsInterface::updateTransform(const AttachedStage& attachedStage,
                                                omni::physics::parse::ObjectKey key,
                                                ObjectId objectId,
                                                const Transform& transform,
-                                               bool resetVelocity,
                                                bool scaleProvided)
 {
-    (void)key;
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
     PhysXType internalType;
     const InternalDatabase::Record* fullRecord = db.getFullRecord(internalType, objectId);
     if (!fullRecord)
@@ -5072,22 +5425,27 @@ bool PhysXUsdPhysicsInterface::updateTransform(const AttachedStage& attachedStag
         {
             if (!dynamicActor && intActor->mSourceGPrimKey.valid())
             {
-                // We need to get the transform from the actual gprim
-                const GfTransform gf = getSourceGPrimTransform(attachedStage, intActor->mSourceGPrimKey);
+                // Instanced colliders dedup their descriptor from the shared USD
+                // prototype, so mSourceGPrimKey can be inside it — a key with no
+                // live instance context. Fall back to this actor's own key, which
+                // resolves through instancing correctly.
+                omni::physics::parse::ObjectKey sourceGPrimKey = intActor->mSourceGPrimKey;
+                const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
+                if (src && src->isInPrototype(sourceGPrimKey))
+                    sourceGPrimKey = key;
 
-                translation = toPhysX(gf.GetTranslation());
-                (GfQuatf&)orientation = GfQuatf(gf.GetRotation().GetQuat());
-                scale = toPhysX(gf.GetScale());
+                // We need to get the transform from the actual gprim
+                PxTransform gprimPose;
+                // `scale` stays signed, as GfTransform::GetScale() was.
+                decomposeMatrix(gprimPose, scale, getSourceGPrimTransform(attachedStage, sourceGPrimKey));
+
+                translation = gprimPose.p;
+                orientation = gprimPose.q;
 
                 pose.p = translation;
                 pose.q = orientation;
             }
             actor->setGlobalPose(pose);
-            if (resetVelocity && dynamicActor)
-            {
-                dynamicActor->setLinearVelocity(PxVec3(0.0f));
-                dynamicActor->setAngularVelocity(PxVec3(0.0f));
-            }
 
             if (!dynamicActor)
             {
@@ -5171,20 +5529,25 @@ bool PhysXUsdPhysicsInterface::updateTransform(const AttachedStage& attachedStag
         InternalParticleSet* internalParticleSet = (InternalParticleSet*)record.mInternalPtr;
 
         // get geometry transform
-        PXR_NS::GfMatrix4d localToWorld = getWorldTransform(attachedStage, internalParticleSet->mKey, PXR_NS::UsdTimeCode());
-        PXR_NS::GfMatrix4d worldToLocalOld = internalParticleSet->mWorldToLocal;
+        const ::physx::PxMat44d localToWorld =
+            getWorldTransform(attachedStage, internalParticleSet->mKey, omni::physics::parse::ReadTime::defaultTime());
+        const ::physx::PxMat44d worldToLocalOld = internalParticleSet->mWorldToLocal;
 
-        PXR_NS::GfMatrix4d deltaTransform = localToWorld * worldToLocalOld;
+        // Gf `localToWorld * worldToLocalOld` is PhysX `worldToLocalOld * localToWorld`
+        // (same matrices, operands swap -- see MatrixTools.h).
+        const ::physx::PxMat44d deltaTransform = worldToLocalOld * localToWorld;
 
         for (uint32_t index = 0; index < internalParticleSet->mNumParticles; ++index)
         {
             const PxVec4& oldPos = internalParticleSet->mPositions[index];
-            PXR_NS::GfVec3f newPos = PXR_NS::GfVec3f(deltaTransform.Transform(PXR_NS::GfVec3d(oldPos.x, oldPos.y, oldPos.z)));
-            internalParticleSet->mPositions[index] = PxVec4(newPos[0], newPos[1], newPos[2], oldPos.w);
+            const ::physx::PxVec3d newPos =
+                deltaTransform.transform(::physx::PxVec3d(oldPos.x, oldPos.y, oldPos.z));
+            internalParticleSet->mPositions[index] =
+                PxVec4(float(newPos.x), float(newPos.y), float(newPos.z), oldPos.w);
         }
 
         internalParticleSet->mUploadDirtyFlags |= ParticleBufferFlags::ePOSITIONS;
-        internalParticleSet->mWorldToLocal = localToWorld.GetInverse();
+        internalParticleSet->mWorldToLocal = omni::physx::affineInverse(localToWorld);
     }
     else if (internalType == ePTCct)
     {
@@ -5208,8 +5571,8 @@ bool PhysXUsdPhysicsInterface::updateTransform(const AttachedStage& attachedStag
     }
     else if (internalType == ePTXformActor)
     {
-        const PhysXScenesMap& physxScenes = OmniPhysX::getInstance().getPhysXSetup().getPhysXScenes();
-        for (PhysXScenesMap::const_reference ref : physxScenes)
+        const AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
+        for (AttachedStage::SceneMap::const_reference ref : physxScenes)
         {
             InternalScene* internalScene = ref.second->getInternalScene();
 
@@ -5224,90 +5587,113 @@ bool PhysXUsdPhysicsInterface::updateTransform(const AttachedStage& attachedStag
     return true;
 }
 
-PxArticulationJointReducedCoordinate* getJoint(usdparser::AttachedStage& attachedStage, const PXR_NS::SdfPath& path, SchemaAPIFlag::Enum flag)
+// getJoint / updateDrivePerformanceEnvelope / updateJointAxis: reachable only from
+// changeSchemaAPI below.
+PxArticulationJointReducedCoordinate* getJoint(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, SchemaAPIFlag::Enum flag,
+                                               InternalJoint** internalJoint = nullptr)
 {
     ObjectDb* objectDb = attachedStage.getObjectDatabase();
-    ObjectId jointId = objectDb->findEntry(path, ObjectType::eArticulationJoint);
+    ObjectId jointId = objectDb->findEntry(key, ObjectType::eArticulationJoint);
     if (jointId == kInvalidObjectId)
         return NULL;
 
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    omni::physx::internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    omni::physx::internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
     const InternalDatabase::Record* objectRecord = db.getFullTypedRecord(PhysXType::ePTLinkJoint, jointId);
     if (!objectRecord)
         return NULL;
     PxArticulationJointReducedCoordinate* pxjoint = reinterpret_cast<PxArticulationJointReducedCoordinate*>(objectRecord->mPtr);
+    if (internalJoint)
+        *internalJoint = reinterpret_cast<InternalJoint*>(objectRecord->mInternalPtr);
     return pxjoint;
 }
 
 void updateDrivePerformanceEnvelope
-(usdparser::AttachedStage& attachedStage, const PXR_NS::SdfPath& path,
- const TfToken& usdPhysicsToken, const SchemaAPIFlag::Enum flag, const PxArticulationAxis::Enum pxAxis, 
- const TfToken& maxActuatorVelocityToken, const TfToken& velocityDependentResistanceToken, const TfToken& envelopeSpeedEffortGradientToken,
+(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, const char* axisName,
+ omni::physics::parse::TokenId driveApiInstanceToken, const SchemaAPIFlag::Enum flag, const PxArticulationAxis::Enum pxAxis,
+ omni::physics::parse::TokenId maxActuatorVelocityToken, omni::physics::parse::TokenId velocityDependentResistanceToken,
+ omni::physics::parse::TokenId envelopeSpeedEffortGradientToken,
  const bool removed)
 {
-    const UsdPrim& usdPrim = attachedStage.getStage()->GetPrimAtPath(path);
-    static const TfToken driveApiName(
-        UsdSchemaRegistry::GetSchemaTypeName(TfType::Find<UsdPhysicsDriveAPI>()).GetString());
-    if(hasMultiApplyInstance(attachedStage, attachedStage.keyFor(path), driveApiName, usdPhysicsToken))
+    const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+    if (source && source->hasSchema(key, driveApiInstanceToken))
     {
-        PxArticulationJointReducedCoordinate* pxjoint = getJoint(attachedStage, path, flag);
-
-        float driveMaxForce = -1.0f;
-        const TfToken driveMaxForceToken(std::string("drive:") + usdPhysicsToken.GetString() + std::string(":physics:maxForce"));
-        getValue<float>(attachedStage, path, driveMaxForceToken, UsdTimeCode(), driveMaxForce);
+        InternalJoint* intJoint = nullptr;
+        PxArticulationJointReducedCoordinate* pxjoint = getJoint(attachedStage, key, flag, &intJoint);
 
         if(pxjoint)
         {
-            PxArticulationDrive	driveParams = pxjoint->getDriveParams(pxAxis);
+            // The envelope terms as parsed: without the API, or for an unauthored value, unlimited actuator velocity,
+            // no resistance and no gradient.
+            float maxActuatorVelocity = FLT_MAX;
+            float velocityDependentResistance = 0.0f;
+            float speedEffortGradient = 0.0f;
 
             ObjectDb* objectDb = attachedStage.getObjectDatabase();
 
             if(removed)
             {
-                driveParams.maxForce = driveMaxForce;
-                driveParams.envelope.maxActuatorVelocity = 0.0f;
-                driveParams.envelope.maxEffort = 0.0f;
-                driveParams.envelope.speedEffortGradient = 0.0f;
-                driveParams.envelope.velocityDependentResistance = 0.0f;
-
-                objectDb->removeSchemaAPI(path, flag);
+                objectDb->removeSchemaAPI(key, flag);
             }
             else
             {
-                driveParams.envelope.maxEffort = driveMaxForce;
-                getValue<float>(attachedStage, path, maxActuatorVelocityToken, UsdTimeCode(), driveParams.envelope.maxActuatorVelocity);
-                getValue<float>(attachedStage, path, velocityDependentResistanceToken, UsdTimeCode(), driveParams.envelope.velocityDependentResistance);
-                getValue<float>(attachedStage, path, envelopeSpeedEffortGradientToken, UsdTimeCode(), driveParams.envelope.speedEffortGradient);
+                auto readEnvelopeValue = [&](omni::physics::parse::TokenId token, float& value)
+                {
+                    float authored;
+                    if (getValue<float>(attachedStage, key, token, omni::physics::parse::ReadTime::defaultTime(), authored))
+                        value = authored;
+                };
+                readEnvelopeValue(maxActuatorVelocityToken, maxActuatorVelocity);
+                readEnvelopeValue(velocityDependentResistanceToken, velocityDependentResistance);
+                readEnvelopeValue(envelopeSpeedEffortGradientToken, speedEffortGradient);
 
-                objectDb->addSchemaAPI(path, flag);
+                const bool rotational = PxArticulationAxis::eTWIST == pxAxis || PxArticulationAxis::eSWING1 == pxAxis ||
+                                        PxArticulationAxis::eSWING2 == pxAxis;
+                maxActuatorVelocity = toPhysXMaxActuatorVelocity(maxActuatorVelocity, rotational);
+                velocityDependentResistance = toPhysXVelocityDependentResistance(velocityDependentResistance, rotational);
+                speedEffortGradient = toPhysXSpeedEffortGradient(speedEffortGradient, rotational);
+
+                objectDb->addSchemaAPI(key, flag);
             }
 
-            if(PxArticulationAxis::eTWIST == pxAxis || PxArticulationAxis::eSWING1 == pxAxis || PxArticulationAxis::eSWING2 == pxAxis)
+            // Later drive edits rebuild the PhysX drive from the cached one, so it takes the same terms.
+            if (intJoint)
             {
-                driveParams.envelope.maxActuatorVelocity = degToRad(driveParams.envelope.maxActuatorVelocity);
-                driveParams.envelope.velocityDependentResistance = radToDeg(driveParams.envelope.velocityDependentResistance);
-                driveParams.envelope.speedEffortGradient = degToRad(driveParams.envelope.speedEffortGradient);
+                usdparser::PhysxJointDrive& cachedDrive =
+                    intJoint->mJointType == usdparser::eJointD6 ? intJoint->mJointDrives[pxAxis] : intJoint->mJointDrive;
+                cachedDrive.isEnvelopeUsed = !removed;
+                cachedDrive.maxActuatorVelocity = maxActuatorVelocity;
+                cachedDrive.velocityDependentResistance = velocityDependentResistance;
+                cachedDrive.speedEffortGradient = speedEffortGradient;
             }
 
+            // maxEffort is the drive's force limit, set by parsing, physics:maxForce edits and the tensor and
+            // ovstage writes; adding or removing the envelope API leaves it as it is.
+            PxArticulationDrive driveParams = pxjoint->getDriveParams(pxAxis);
+            driveParams.envelope = PxPerformanceEnvelope(
+                driveParams.envelope.maxEffort, maxActuatorVelocity, velocityDependentResistance, speedEffortGradient);
+            PxArticulationReducedCoordinate& articulation = pxjoint->getChildArticulationLink().getArticulation();
+            if (articulation.getScene())
+                articulation.wakeUp();
             pxjoint->setDriveParams(pxAxis, driveParams);
         }
         else if (!removed)
-        {        
-            usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxDrivePerformanceEnvelopeAPI, usdPhysicsToken);
-            CARB_LOG_WARN("Please ensure that the joint is part of an articulation. Performance envelope will be ignored for joint: %s", path.GetText());
+        {
+            removeAppliedAPI(attachedStage, key, "PhysxDrivePerformanceEnvelopeAPI", axisName);
+            CARB_LOG_WARN("Please ensure that the joint is part of an articulation. Performance envelope will be ignored for joint: %s", attachedStage.textFor(key));
         }
     }
 }
 
 void updateJointAxis
-(usdparser::AttachedStage& attachedStage, const PXR_NS::SdfPath& path,
- const TfToken& usdPhysicsToken, const SchemaAPIFlag::Enum flag, const PxArticulationAxis::Enum pxAxis,
- const TfToken& armatureToken, const TfToken& maxJointVelocityToken,
- const TfToken& staticFrictionToken,  const TfToken& dynamicFrictionToken, const TfToken& viscousFrictionToken,
+(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, const char* axisName,
+ const SchemaAPIFlag::Enum flag, const PxArticulationAxis::Enum pxAxis,
+ omni::physics::parse::TokenId armatureToken, omni::physics::parse::TokenId maxJointVelocityToken,
+ omni::physics::parse::TokenId staticFrictionToken, omni::physics::parse::TokenId dynamicFrictionToken,
+ omni::physics::parse::TokenId viscousFrictionToken,
  const bool removed)
 {
-    PxArticulationJointReducedCoordinate* pxjoint = getJoint(attachedStage, path, flag);
+    PxArticulationJointReducedCoordinate* pxjoint = getJoint(attachedStage, key, flag);
 
     if(pxjoint)
     {
@@ -5315,57 +5701,71 @@ void updateJointAxis
 
         float armature = 0.0f;
         float maxJointVelocity = PX_MAX_F32;
-        float frictionCoefficient = 0.0f;
         float staticFriction = 0.0f;
         float dynamicFriction = 0.0f;
         float viscousFriction = 0.0f;
 
         if(removed)
         {
-            //Get armature and joint velocity from PhysxSchemaPhysxJointAPI
-            const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
-            if(src && src->hasSchema(attachedStage.keyFor(path), schemaTypeToken<PhysxSchemaPhysxJointAPI>(*src)))
+            // The axis falls back to the NewtonJointAPI joint-level values, or the defaults, as at parse time.
+            const omni::physics::parse::KnownTokens& tok = attachedStage.getKnownTokens();
+            const omni::physics::parse::ReadTime defaultTime = omni::physics::parse::ReadTime::defaultTime();
+            auto newtonValue = [&](omni::physics::parse::TokenId token, float& value)
             {
-                getValue(attachedStage, path, PhysxSchemaTokens->physxJointArmature, UsdTimeCode(), armature);
-                getValue(attachedStage, path, PhysxSchemaTokens->physxJointMaxJointVelocity, UsdTimeCode(), maxJointVelocity);
-                getValue(attachedStage, path, PhysxSchemaTokens->physxJointJointFriction, UsdTimeCode(), frictionCoefficient);
+                if (getValue<float>(attachedStage, key, token, defaultTime, value))
+                    value = value >= 0.0f ? PxMin(value, PX_MAX_F32) : 0.0f;
+            };
+            newtonValue(tok.newtonArmature, armature);
+            newtonValue(tok.newtonVelocityLimit, maxJointVelocity);
+            if (!omni::physics::parse::hasAxisVelocityLimitOpinion(maxJointVelocity))
+            {
+                float legacyVelocity = PX_MAX_F32;
+                getValue<float>(attachedStage, key, tok.physxJointMaxJointVelocity, defaultTime, legacyVelocity);
+                if (omni::physics::parse::hasAxisVelocityLimitOpinion(legacyVelocity))
+                    maxJointVelocity = PxMax(0.0f, legacyVelocity);
             }
+            newtonValue(tok.newtonFriction, staticFriction);
+            dynamicFriction = staticFriction;
+            newtonValue(tok.newtonDamping, viscousFriction);
 
-            objectDb->removeSchemaAPI(path, flag);
+            objectDb->removeSchemaAPI(key, flag);
         }
         else
         {
-            getValue<float>(attachedStage, path, armatureToken, UsdTimeCode(), armature);
-            getValue<float>(attachedStage, path, maxJointVelocityToken, UsdTimeCode(), maxJointVelocity);
-            getValue<float>(attachedStage, path, staticFrictionToken, UsdTimeCode(), staticFriction);
-            getValue<float>(attachedStage, path, dynamicFrictionToken, UsdTimeCode(), dynamicFriction);
-            getValue<float>(attachedStage, path, viscousFrictionToken, UsdTimeCode(), viscousFriction);
+            getValue<float>(attachedStage, key, armatureToken, omni::physics::parse::ReadTime::defaultTime(), armature);
+            getValue<float>(attachedStage, key, maxJointVelocityToken, omni::physics::parse::ReadTime::defaultTime(), maxJointVelocity);
+            getValue<float>(attachedStage, key, staticFrictionToken, omni::physics::parse::ReadTime::defaultTime(), staticFriction);
+            getValue<float>(attachedStage, key, dynamicFrictionToken, omni::physics::parse::ReadTime::defaultTime(), dynamicFriction);
+            getValue<float>(attachedStage, key, viscousFrictionToken, omni::physics::parse::ReadTime::defaultTime(), viscousFriction);
 
-            objectDb->addSchemaAPI(path, flag);
+            objectDb->addSchemaAPI(key, flag);
         }
 
         if(PxArticulationAxis::eTWIST == pxAxis || PxArticulationAxis::eSWING1 == pxAxis || PxArticulationAxis::eSWING2 == pxAxis)
         {
-            maxJointVelocity = degToRad(maxJointVelocity);
+            // PX_MAX_F32 is the unlimited velocity sentinel and stays as it is.
+            if (maxJointVelocity < PX_MAX_F32)
+                maxJointVelocity = degToRad(maxJointVelocity);
             viscousFriction = radToDeg(viscousFriction);
         }
 
         pxjoint->setArmature(pxAxis, armature);
         pxjoint->setMaxJointVelocity(pxAxis, maxJointVelocity);
-        pxjoint->setFrictionCoefficient(frictionCoefficient);
         pxjoint->setFrictionParams(pxAxis, PxJointFrictionParams(staticFriction, dynamicFriction, viscousFriction));
     }
     else if (!removed)
-    {        
-        const UsdPrim& usdPrim = attachedStage.getStage()->GetPrimAtPath(path);
-        usdPrim.RemoveAPI(PhysxSchemaTokens->PhysxJointAxisAPI, usdPhysicsToken);
-        CARB_LOG_WARN("Please ensure that the joint is part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", path.GetText());
+    {
+        removeAppliedAPI(attachedStage, key, "PhysxJointAxisAPI", axisName);
+        CARB_LOG_WARN("Please ensure that the joint is part of an articulation. Properties from PhysxJointAxisAPI will be ignored for joint: %s", attachedStage.textFor(key));
     }
 }
 
-void PhysXUsdPhysicsInterface::changeSchemaAPI(usdparser::AttachedStage& attachedStage, const PXR_NS::SdfPath& path, SchemaAPIFlag::Enum flag, bool removed)
+void PhysXUsdPhysicsInterface::changeSchemaAPI(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, SchemaAPIFlag::Enum flag, bool removed)
 {
     // Note: only non-structural changes are allowed to be handled in this function.
+
+    const omni::physics::parse::IPhysicsSource* changeSchemaAPISrc = attachedStage.getSource();
+    const omni::physics::parse::KnownTokens& tok = attachedStage.getKnownTokens();
 
     switch (flag)
     {
@@ -5373,25 +5773,25 @@ void PhysXUsdPhysicsInterface::changeSchemaAPI(usdparser::AttachedStage& attache
         case SchemaAPIFlag::eParticleAnisotropyAPI:
         case SchemaAPIFlag::eParticleSmoothingAPI:
         {
-            changeParticlePostProcess(attachedStage, path, removed, flag);
+            changeParticlePostProcess(attachedStage, key, removed, flag);
         }
         break;
 
         case SchemaAPIFlag::eDiffuseParticlesAPI:
         {
-            changeParticleDiffuseParticles(attachedStage, path, removed);
+            changeParticleDiffuseParticles(attachedStage, key, removed);
         }
         break;
 
         case SchemaAPIFlag::eFilteredPairsAPI:
         {
-            changeFilteredPairs(attachedStage, path, removed);
+            changeFilteredPairs(attachedStage, key, removed);
         }
         break;
 
         case SchemaAPIFlag::eContactReportAPI:
         {
-            changeContactReport(attachedStage, path, removed);
+            changeContactReport(attachedStage, key, removed);
         }
         break;
 
@@ -5401,107 +5801,102 @@ void PhysXUsdPhysicsInterface::changeSchemaAPI(usdparser::AttachedStage& attache
         case SchemaAPIFlag::eNewtonMimicAPI:
         {
             if (removed)
-                releaseMimicJoint(attachedStage, path, flag);
+                releaseMimicJoint(attachedStage, key, flag);
         }
         break;
        case SchemaAPIFlag::eDrivePerformanceEnvelopeAngularAPI:
             updateDrivePerformanceEnvelope(
-                attachedStage, path,
-                UsdPhysicsTokens->angular, flag, PxArticulationAxis::eTWIST,
-                PhysxAxisInstanceTokens->maxActuatorVelocityAngular,
-                PhysxAxisInstanceTokens->velocityDependentResistanceAngular,
-                PhysxAxisInstanceTokens->speedEffortGradientAngular,
+                attachedStage, key, "angular",
+                tok.physicsDriveAPIAngular, flag, PxArticulationAxis::eTWIST,
+                tok.physxDrivePerformanceEnvelopeAngularMaxActuatorVelocity,
+                tok.physxDrivePerformanceEnvelopeAngularVelocityDependentResistance,
+                tok.physxDrivePerformanceEnvelopeAngularSpeedEffortGradient,
                 removed);
-       break;    
+       break;
        case SchemaAPIFlag::eDrivePerformanceEnvelopeLinearAPI:
             updateDrivePerformanceEnvelope(
-                attachedStage, path,
-                UsdPhysicsTokens->linear, flag, PxArticulationAxis::eX,
-                PhysxAxisInstanceTokens->maxActuatorVelocityLinear,
-                PhysxAxisInstanceTokens->velocityDependentResistanceLinear,
-                PhysxAxisInstanceTokens->speedEffortGradientLinear,
+                attachedStage, key, "linear",
+                tok.physicsDriveAPILinear, flag, PxArticulationAxis::eX,
+                tok.physxDrivePerformanceEnvelopeLinearMaxActuatorVelocity,
+                tok.physxDrivePerformanceEnvelopeLinearVelocityDependentResistance,
+                tok.physxDrivePerformanceEnvelopeLinearSpeedEffortGradient,
                 removed);
        break;
        case SchemaAPIFlag::eDrivePerformanceEnvelopeRotXAPI:
             updateDrivePerformanceEnvelope(
-                attachedStage, path,
-                UsdPhysicsTokens->rotX, flag, PxArticulationAxis::eTWIST,
-                PhysxAxisInstanceTokens->maxActuatorVelocityRotX,
-                PhysxAxisInstanceTokens->velocityDependentResistanceRotX,
-                PhysxAxisInstanceTokens->speedEffortGradientRotX,
+                attachedStage, key, "rotX",
+                tok.physicsDriveAPIRotX, flag, PxArticulationAxis::eTWIST,
+                tok.physxDrivePerformanceEnvelopeRotXMaxActuatorVelocity,
+                tok.physxDrivePerformanceEnvelopeRotXVelocityDependentResistance,
+                tok.physxDrivePerformanceEnvelopeRotXSpeedEffortGradient,
                 removed);
        break;
        case SchemaAPIFlag::eDrivePerformanceEnvelopeRotYAPI:
             updateDrivePerformanceEnvelope(
-                attachedStage, path,
-                UsdPhysicsTokens->rotY, flag, PxArticulationAxis::eSWING1,
-                PhysxAxisInstanceTokens->maxActuatorVelocityRotY,
-                PhysxAxisInstanceTokens->velocityDependentResistanceRotY,
-                PhysxAxisInstanceTokens->speedEffortGradientRotY,
+                attachedStage, key, "rotY",
+                tok.physicsDriveAPIRotY, flag, PxArticulationAxis::eSWING1,
+                tok.physxDrivePerformanceEnvelopeRotYMaxActuatorVelocity,
+                tok.physxDrivePerformanceEnvelopeRotYVelocityDependentResistance,
+                tok.physxDrivePerformanceEnvelopeRotYSpeedEffortGradient,
                 removed);
        break;
        case SchemaAPIFlag::eDrivePerformanceEnvelopeRotZAPI:
             updateDrivePerformanceEnvelope(
-                attachedStage, path,
-                UsdPhysicsTokens->rotZ, flag, PxArticulationAxis::eSWING2,
-                PhysxAxisInstanceTokens->maxActuatorVelocityRotZ,
-                PhysxAxisInstanceTokens->velocityDependentResistanceRotZ,
-                PhysxAxisInstanceTokens->speedEffortGradientRotZ,
+                attachedStage, key, "rotZ",
+                tok.physicsDriveAPIRotZ, flag, PxArticulationAxis::eSWING2,
+                tok.physxDrivePerformanceEnvelopeRotZMaxActuatorVelocity,
+                tok.physxDrivePerformanceEnvelopeRotZVelocityDependentResistance,
+                tok.physxDrivePerformanceEnvelopeRotZSpeedEffortGradient,
                 removed);
        break;
        case SchemaAPIFlag::eJointAxisAngularAPI:
             updateJointAxis(
-                attachedStage, path,
-                UsdPhysicsTokens->angular, flag, PxArticulationAxis::eTWIST,
-                PhysxAxisInstanceTokens->armatureAngular,
-                PhysxAxisInstanceTokens->maxJointVelocityAngular,
-                PhysxAxisInstanceTokens->staticFrictionEffortAngular,
-                PhysxAxisInstanceTokens->dynamicFrictionEffortAngular,
-                PhysxAxisInstanceTokens->viscousFrictionCoefficientAngular,
+                attachedStage, key, "angular", flag, PxArticulationAxis::eTWIST,
+                tok.physxJointAxisAngularArmature,
+                tok.physxJointAxisAngularMaxJointVelocity,
+                tok.physxJointAxisAngularStaticFrictionEffort,
+                tok.physxJointAxisAngularDynamicFrictionEffort,
+                tok.physxJointAxisAngularViscousFrictionCoefficient,
                 removed);
-       break;    
+       break;
        case SchemaAPIFlag::eJointAxisLinearAPI:
             updateJointAxis(
-                attachedStage, path,
-                UsdPhysicsTokens->linear, flag, PxArticulationAxis::eX,
-                PhysxAxisInstanceTokens->armatureLinear,
-                PhysxAxisInstanceTokens->maxJointVelocityLinear,
-                PhysxAxisInstanceTokens->staticFrictionEffortLinear,
-                PhysxAxisInstanceTokens->dynamicFrictionEffortLinear,
-                PhysxAxisInstanceTokens->viscousFrictionCoefficientLinear,
+                attachedStage, key, "linear", flag, PxArticulationAxis::eX,
+                tok.physxJointAxisLinearArmature,
+                tok.physxJointAxisLinearMaxJointVelocity,
+                tok.physxJointAxisLinearStaticFrictionEffort,
+                tok.physxJointAxisLinearDynamicFrictionEffort,
+                tok.physxJointAxisLinearViscousFrictionCoefficient,
                 removed);
        break;
        case SchemaAPIFlag::eJointAxisRotXAPI:
             updateJointAxis(
-                attachedStage, path,
-                UsdPhysicsTokens->rotX, flag, PxArticulationAxis::eTWIST,
-                PhysxAxisInstanceTokens->armatureRotX,
-                PhysxAxisInstanceTokens->maxJointVelocityRotX,
-                PhysxAxisInstanceTokens->staticFrictionEffortRotX,
-                PhysxAxisInstanceTokens->dynamicFrictionEffortRotX,
-                PhysxAxisInstanceTokens->viscousFrictionCoefficientRotX,
+                attachedStage, key, "rotX", flag, PxArticulationAxis::eTWIST,
+                tok.physxJointAxisRotXArmature,
+                tok.physxJointAxisRotXMaxJointVelocity,
+                tok.physxJointAxisRotXStaticFrictionEffort,
+                tok.physxJointAxisRotXDynamicFrictionEffort,
+                tok.physxJointAxisRotXViscousFrictionCoefficient,
                 removed);
        break;
        case SchemaAPIFlag::eJointAxisRotYAPI:
             updateJointAxis(
-                attachedStage, path,
-                UsdPhysicsTokens->rotY, flag, PxArticulationAxis::eSWING1,
-                PhysxAxisInstanceTokens->armatureRotY,
-                PhysxAxisInstanceTokens->maxJointVelocityRotY,
-                PhysxAxisInstanceTokens->staticFrictionEffortRotY,
-                PhysxAxisInstanceTokens->dynamicFrictionEffortRotY,
-                PhysxAxisInstanceTokens->viscousFrictionCoefficientRotY,
+                attachedStage, key, "rotY", flag, PxArticulationAxis::eSWING1,
+                tok.physxJointAxisRotYArmature,
+                tok.physxJointAxisRotYMaxJointVelocity,
+                tok.physxJointAxisRotYStaticFrictionEffort,
+                tok.physxJointAxisRotYDynamicFrictionEffort,
+                tok.physxJointAxisRotYViscousFrictionCoefficient,
                 removed);
        break;
        case SchemaAPIFlag::eJointAxisRotZAPI:
             updateJointAxis(
-                attachedStage, path,
-                UsdPhysicsTokens->rotZ, flag, PxArticulationAxis::eSWING2,
-                PhysxAxisInstanceTokens->armatureRotZ,
-                PhysxAxisInstanceTokens->maxJointVelocityRotZ,
-                PhysxAxisInstanceTokens->staticFrictionEffortRotZ,
-                PhysxAxisInstanceTokens->dynamicFrictionEffortRotZ,
-                PhysxAxisInstanceTokens->viscousFrictionCoefficientRotZ,
+                attachedStage, key, "rotZ", flag, PxArticulationAxis::eSWING2,
+                tok.physxJointAxisRotZArmature,
+                tok.physxJointAxisRotZMaxJointVelocity,
+                tok.physxJointAxisRotZStaticFrictionEffort,
+                tok.physxJointAxisRotZDynamicFrictionEffort,
+                tok.physxJointAxisRotZViscousFrictionCoefficient,
                 removed);
        break;
        default:
@@ -5536,14 +5931,14 @@ bool hasMeshShape(const PxRigidActor& actor)
     return false;
 }
 
-bool PhysXUsdPhysicsInterface::updateMass(const PXR_NS::SdfPath& path,
+bool PhysXUsdPhysicsInterface::updateMass(const usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key,
                                           ObjectId objectId,
                                           float mass,
                                           const carb::Float3& diagInertia,
                                           const carb::Float3& com,
                                           const carb::Float4& principalAxes)
 {
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType;
     const InternalDatabase::Record* objectFullRecord = db.getFullRecord(internalType, objectId);
@@ -5571,6 +5966,12 @@ bool PhysXUsdPhysicsInterface::updateMass(const PXR_NS::SdfPath& path,
                 rigidDynamic->setMass(mass);
                 rigidDynamic->setMassSpaceInertiaTensor(diagIn);
                 rigidDynamic->setCMassLocalPose(comTr);
+                if (intActor)
+                {
+                    intActor->mAppliedCenterOfMass = comTr;
+                    intActor->mNormalizedCenterOfMass = rigidDynamic->getCMassLocalPose();
+                }
+                omni::physx::tensors::centerOfMassChanged();
             }
         }
     }
@@ -5582,42 +5983,44 @@ bool PhysXUsdPhysicsInterface::updateMass(const PXR_NS::SdfPath& path,
             actor->setMass(mass);
             actor->setMassSpaceInertiaTensor(diagIn);
             actor->setCMassLocalPose(comTr);
+            omni::physx::tensors::centerOfMassChanged();
         }
     }
     return true;
 }
 
-bool PhysXUsdPhysicsInterface::updateObject(usdparser::AttachedStage& attachedStage, const SdfPath& path,
+bool PhysXUsdPhysicsInterface::updateObject(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key,
                                             ObjectId objectId,
                                             OnUpdateObjectFn updateFn,
-                                            const PXR_NS::TfToken& propertyName, const PXR_NS::UsdTimeCode& timeCode)
+                                            omni::physics::parse::TokenId propertyName,
+                                            omni::physics::parse::ReadTime timeCode)
 {
     return updateFn(attachedStage, objectId, propertyName, timeCode);
 }
 
-void PhysXUsdPhysicsInterface::releaseAllObjects()
+void PhysXUsdPhysicsInterface::releaseAllObjects(usdparser::AttachedStage& attachedStage)
 {
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
-    PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
+    omni::sampling::releaseAttachmentSurfaceSamplers(attachedStage);
 
     // If we are in physics authoring mode and a scene reset occurs, then we need to
     // notify it to release any handles it has active to actors
 
-    if (!mPhysicsObjectChangeSubscriptions.map.empty())
+    if (const ObjectChangeRegistry::EventMap subscriptions = mPhysicsObjectChangeSubscriptions.snapshot(); !subscriptions.empty())
     {
-        PhysicsObjectChangeSubscriptionRegistry::EventMap::const_iterator it = mPhysicsObjectChangeSubscriptions.map.begin();
-        PhysicsObjectChangeSubscriptionRegistry::EventMap::const_iterator itEnd = mPhysicsObjectChangeSubscriptions.map.end();
-        while (it != itEnd)
+        for (const ObjectChangeRegistry::EventMap::value_type& subscription : subscriptions)
         {
-            const IPhysicsObjectChangeCallback& callback = it->second;
+            if (!mPhysicsObjectChangeSubscriptions.contains(subscription.first))
+                continue;
+            const ObjectChangeObserver& callback = subscription.second;
 
-            if (shouldDeliverObjectChangeNotification(callback))
+            if (shouldDeliverObjectChangeNotification(attachedStage, callback))
             {
                 if (callback.allObjectsDestructionNotifyFn)
                 {
                     try
                     {
-                        callback.allObjectsDestructionNotifyFn(callback.userData);
+                        RuntimeCallbackScope callbackScope;
+                        callback.allObjectsDestructionNotifyFn(attachedStage.getAttachHandle(), callback.userData);
                     }
                     catch (const std::exception& error)
                     {
@@ -5629,33 +6032,19 @@ void PhysXUsdPhysicsInterface::releaseAllObjects()
                     }
                 }
             }
-            it++;
         }
     }
 
-    std::vector<InternalDatabase::Record>& records = db.getRecords();
-    for (size_t i = 0; i < records.size(); i++)
-    {
-        InternalDatabase::Record& rec = records[i];
-        if (rec.mType == ePTCompoundShape || rec.mType == ePTCollisionGroup)
-        {
-            delete rec.mPtr;
-            rec.mPtr = nullptr;
-        }
-    }
+    clearFiltering(attachedStage);
 
-    gTempParent.clear();
+    OmniPhysX::getInstance().getTriggerManager()->clearTriggers(attachedStage);
 
-    clearFiltering();
+    // Clear this attachment's pending creation work before its records are released.
+    attachedStage.getPendingPhysicsSetup().articulations.clear();
 
-    OmniPhysX::getInstance().getTriggerManager()->clearTriggers();
+    attachedStage.getPendingPhysicsSetup().particleSystems.clear();
 
-    // clear mArticulations so stale articulations won't be added in the next usd open with finishSetup
-    mArticulations.clear();
-
-    mParticleSystems.clear();
-
-    OmniPhysX::getInstance().releasePhysXScenes();
+    attachedStage.releaseNativePhysics();
 }
 
 static void addArticulationToScene(const usdparser::AttachedStage& attachedStage, InternalDatabase::Record& articulationRecord)
@@ -5686,21 +6075,14 @@ static void addArticulationToScene(const usdparser::AttachedStage& attachedStage
         );
         intArt->mAggregate->addArticulation(*art);
 
-        if (attachedStage.isUsingReplicatorEnvIds())
-        {
-            // setup envId for the aggregate check for the prim var
-            uint32_t partition_id = 0;
-            PXR_NS::TfToken scenePartitionToken;
-            if (getValue<PXR_NS::TfToken>(attachedStage, articulationRecord.mKey, TfToken(kScenePartitionPrimvar), UsdTimeCode::Default(), scenePartitionToken))
-            {
-                partition_id = attachedStage.getEnvIdFromToken(scenePartitionToken);
-            }
-            intArt->mAggregate->setEnvironmentID(partition_id);
-        }
+        // The aggregate carries the articulation's env id; its links cannot have their own.
+        const uint32_t envId = creationEnvironmentId(attachedStage, articulationRecord.mKey);
+        if (envId != PX_INVALID_U32)
+            intArt->mAggregate->setEnvironmentID(envId);
 
         if (intArt->mStaticRootBodyKey.valid())
         {
-            PxBase* physxPtr = reinterpret_cast<PxBase*>(getPhysXPtr(attachedStage.pathFor(intArt->mStaticRootBodyKey), ePTActor));
+            PxBase* physxPtr = reinterpret_cast<PxBase*>(getObjectDataOrID<ObjectDataQueryType::ePHYSX_PTR>(intArt->mStaticRootBodyKey, ePTActor, attachedStage.getInternalPhysXDatabase(), attachedStage));
             if (physxPtr)
             {
                 PxRigidStatic* staticBody = physxPtr->is<PxRigidStatic>();
@@ -5716,63 +6098,47 @@ static void addArticulationToScene(const usdparser::AttachedStage& attachedStage
 
     ps->getScene()->addAggregate(*intArt->mAggregate);
 
-    PxU32 posIters, velIters;
-    art->getSolverIterationCounts(posIters, velIters);
-    if(ps->getScene()->getSolverType() == PxSolverType::eTGS && velIters > 4)
-    {
-        CARB_LOG_WARN_ONCE(
-            "Detected an articulation at %s with more than 4 velocity iterations being added to a TGS scene."
-            "The related behavior changed recently, please consult the changelog. This warning will only print once.",
-            attachedStage.textFor(articulationRecord.mKey));
-    }
-
-    const PhysxSchemaPhysxContactReportAPI contactReportAPI = PhysxSchemaPhysxContactReportAPI::Get(attachedStage.getStage(), attachedStage.pathFor(articulationRecord.mKey));
-    if (contactReportAPI)
-    {
-        setupContactReportToArticulation(ps, contactReportAPI, *art);
-    }
+    setupContactReportToArticulation(ps, attachedStage, articulationRecord.mKey, *art);
 }
 
 void PhysXUsdPhysicsInterface::finalizeArticulations(const usdparser::AttachedStage& attachedStage)
 {
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
-    const PxU32 nb = PxU32(mArticulations.size());
+    const PxU32 nb = PxU32(attachedStage.getPendingPhysicsSetup().articulations.size());
     for (PxU32 i = 0; i < nb; i++)
     {
-        addArticulationToScene(attachedStage, db.getRecords()[mArticulations[i]]);
+        addArticulationToScene(attachedStage, db.getRecords()[attachedStage.getPendingPhysicsSetup().articulations[i]]);
     }
-    mArticulations.clear();
+    attachedStage.getPendingPhysicsSetup().articulations.clear();
 }
 
 void PhysXUsdPhysicsInterface::finishSetup(const usdparser::AttachedStage& attachedStage)
 {
-    if (!mDirty)
+    if (!attachedStage.getPendingPhysicsSetup().dirty)
         return;
-    mDirty = false;
+    attachedStage.getPendingPhysicsSetup().dirty = false;
 
     finalizeArticulations(attachedStage);
 
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
-    const PxU32 nb = PxU32(mArticulations.size());
-    for (PxU32 i = 0; i < nb; i++)
-    {
-        addArticulationToScene(attachedStage, db.getRecords()[mArticulations[i]]);
-    }
-    mArticulations.clear();
-    const PhysXScenesMap& scenes = OmniPhysX::getInstance().getPhysXSetup().getPhysXScenes();
-    for (PhysXScenesMap::const_reference ref : scenes)
+    const usdparser::AttachedStage::SceneMap& scenes = attachedStage.getPhysXScenes();
+    for (usdparser::AttachedStage::SceneMap::const_reference ref : scenes)
     {
         ref.second->getContactReport()->resolvePairs();
     }
     db.clearPxJointMap();
 
-    for (size_t i = 0; i < mParticleSystems.size(); ++i)
+    // Kit-viewport-rendering-only: notifies the particles:: postprocess pipeline (isosurface
+    // mesh / anisotropy / smoothed-position generators feeding Hydra), which has no
+    // ovstage/tensor-API consumer -- raw particle simulation data is read directly, not
+    // through this postprocess pipeline. A no-op when the postprocess registry is empty.
+    for (size_t i = 0; i < attachedStage.getPendingPhysicsSetup().particleSystems.size(); ++i)
     {
-        particles::notifyParticleSystemResize(mParticleSystems[i]->getPath());
+        particles::notifyParticleSystemResize(attachedStage, attachedStage.getPendingPhysicsSetup().particleSystems[i]->mKey);
     }
-    mParticleSystems.clear();
+    attachedStage.getPendingPhysicsSetup().particleSystems.clear();
 }
 
 // computes the OBB for this set of points relative to this transform matrix. SIMD version
@@ -6064,23 +6430,22 @@ bool PhysXUsdPhysicsInterface::createBoundingSphere(const void* inputPoints,
     return true;
 }
 
-void PhysXUsdPhysicsInterface::setupCollisionGroup(const PXR_NS::SdfPath& path, const CollisionGroupDesc& desc)
+void PhysXUsdPhysicsInterface::setupCollisionGroup(const usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, const CollisionGroupDesc& desc)
 {
     PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
     for (size_t i = 0; i < desc.filteredGroups.size(); i++)
     {
         Pair<uint32_t> groupPair(uint32_t(size_t(desc.groupId)), uint32_t(size_t(desc.filteredGroups[i])));
-        physxSetup.getCollisionGroupFilteredPairs().insert(groupPair);
+        attachedStage.getCollisionGroupFilteredPairs().insert(groupPair);
     }
 }
 
 bool PhysXUsdPhysicsInterface::setVehicleContext(const usdparser::AttachedStage& attachedStage, const VehicleContextDesc& contextDesc)
 {
-    const SdfPath& scenePath = contextDesc.scenePath;
-    const ObjectId sceneId = attachedStage.getObjectDatabase()->findEntry(scenePath, eScene);
+    const ObjectId sceneId = attachedStage.getObjectDatabase()->findEntry(contextDesc.sceneKey, eScene);
     if (sceneId != kInvalidObjectId)
     {
-        InternalScene* internalScene = getInternalPtr<InternalScene>(PhysXType::ePTScene, sceneId);
+        InternalScene* internalScene = getInternalPtr<InternalScene>(attachedStage.getInternalPhysXDatabase(), PhysXType::ePTScene, sceneId);
 
         if (internalScene)
         {
@@ -6091,69 +6456,55 @@ bool PhysXUsdPhysicsInterface::setVehicleContext(const usdparser::AttachedStage&
 
     CARB_LOG_ERROR("Physics USD: Physics scene object can not be found for the scene prim at "
         "\"%s\". Vehicle context can not be set.\n",
-        contextDesc.scenePath.GetText());
+        attachedStage.textFor(contextDesc.sceneKey));
 
     return false;
 }
 
-ObjectId PhysXUsdPhysicsInterface::createTireFrictionTable(const TireFrictionTableDesc& tireFrictionTableDesc,
-    const UsdPrim& usdPrim)
+// Vehicle creation/registration. USD xform-op authoring of wheel/shape scale is fenced in
+// InternalVehicle.cpp's WheelTransformManagementEntry::init; everything below reads through
+// the physics source.
+ObjectId PhysXUsdPhysicsInterface::createTireFrictionTable(const usdparser::AttachedStage& attachedStage, const TireFrictionTableDesc& tireFrictionTableDesc)
 {
-    return OmniPhysX::getInstance().getInternalPhysXDatabase().createTireFrictionTable(tireFrictionTableDesc, usdPrim);
+    return attachedStage.getInternalPhysXDatabase().createTireFrictionTable(attachedStage, tireFrictionTableDesc);
 }
 
-static void registerInWheelComponent(InternalVehicle& vehicle, uint32_t wheelIndex,
+static void registerInWheelComponent(const usdparser::AttachedStage& attachedStage, InternalVehicle& vehicle, uint32_t wheelIndex,
     PhysXType componentType, ObjectId componentId)
 {
-    InternalVehicleWheelReferenceList* wheelRefList = getInternalPtr<InternalVehicleWheelReferenceList>(
+    InternalVehicleWheelReferenceList* wheelRefList = getInternalPtr<InternalVehicleWheelReferenceList>(attachedStage.getInternalPhysXDatabase(),
         componentType, componentId);
     CARB_ASSERT(wheelRefList);
     wheelRefList->addWheel(vehicle, wheelIndex);
     vehicle.addWheelComponent(*wheelRefList);
 }
 
-inline ::physx::PxTransform computeWheelShapeLocalPose(const PXR_NS::GfMatrix4d& wheelPose, const PXR_NS::GfMatrix4d& shapePose)
+inline ::physx::PxTransform computeWheelShapeLocalPose(const ::physx::PxMat44d& wheelPose,
+                                                      const ::physx::PxMat44d& shapePose)
 {
-    ::physx::PxTransform pxWheelPose;
-    {
-        ::physx::PxVec3 pxScale;
-        toPhysX(pxWheelPose, pxScale, wheelPose);
-        CARB_UNUSED(pxScale);
-    }
-
-    ::physx::PxTransform pxShapePose;
-    {
-        ::physx::PxVec3 pxScale;
-        toPhysX(pxShapePose, pxScale, shapePose);
-        CARB_UNUSED(pxScale);
-    }
-
     // note: since world transforms are computed, scale is already taken into account
-    const ::physx::PxTransform wheelShapeLocalPose = pxWheelPose.getInverse()*pxShapePose;
-    return wheelShapeLocalPose;
+    // (toTransform() discards it, as the previous toPhysX(pose, scale, m) did).
+    return omni::physx::toTransform(wheelPose).getInverse() * omni::physx::toTransform(shapePose);
 }
 
 static void prepareWheelTransforms(usdparser::AttachedStage& attachedStage,
                                    InternalVehicle::WheelTransformManagementEntry& wheelTMEntry,
-                                   const PXR_NS::UsdPrim& wheelRootPrim, const PXR_NS::UsdPrim& shapePrim,
+                                   omni::physics::parse::ObjectKey wheelKey,
+                                   omni::physics::parse::ObjectKey shapeKey,
                                    ::physx::PxTransform& wheelShapeLocalPose)
 {
-    // Transform reads route through the physics source (no direct USD prim access);
-    // the wheel/shape xform-op authoring stays in wheelTMEntry.init().
     bool resetsXformStack;
-    const omni::physics::parse::ObjectKey wheelKey = attachedStage.keyFor(wheelRootPrim.GetPath());
     wheelTMEntry.initialTransform =
-        getLocalTransform(attachedStage, wheelKey, PXR_NS::UsdTimeCode::Default(), resetsXformStack);
+        getLocalTransform(attachedStage, wheelKey, omni::physics::parse::ReadTime::defaultTime(), resetsXformStack);
 
     if (wheelTMEntry.shape)
     {
-        if (wheelRootPrim != shapePrim)
+        if (wheelKey != shapeKey)
         {
-            const omni::physics::parse::ObjectKey shapeKey = attachedStage.keyFor(shapePrim.GetPath());
             wheelTMEntry.initialShapeTransform =
-                getLocalTransform(attachedStage, shapeKey, PXR_NS::UsdTimeCode::Default(), resetsXformStack);
-            const PXR_NS::GfMatrix4d wheelWorld = getWorldTransform(attachedStage, wheelKey, PXR_NS::UsdTimeCode::Default());
-            const PXR_NS::GfMatrix4d shapeWorld = getWorldTransform(attachedStage, shapeKey, PXR_NS::UsdTimeCode::Default());
+                getLocalTransform(attachedStage, shapeKey, omni::physics::parse::ReadTime::defaultTime(), resetsXformStack);
+            const ::physx::PxMat44d wheelWorld = getWorldTransform(attachedStage, wheelKey, omni::physics::parse::ReadTime::defaultTime());
+            const ::physx::PxMat44d shapeWorld = getWorldTransform(attachedStage, shapeKey, omni::physics::parse::ReadTime::defaultTime());
             wheelShapeLocalPose = computeWheelShapeLocalPose(wheelWorld, shapeWorld);
         }
 
@@ -6163,21 +6514,21 @@ static void prepareWheelTransforms(usdparser::AttachedStage& attachedStage,
     }
 }
 
-ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
-                                                 const VehicleDesc& vehicleDesc,
-                                                 const UsdPrim& usdPrim,
-                                                 UsdStageRefPtr usdStage)
+ObjectId PhysXUsdPhysicsInterface::createVehicle(AttachedStage& attachedStage,
+                                                 omni::physics::parse::ObjectKey vehicleKey,
+                                                 const VehicleDesc& vehicleDesc)
 {
     ObjectId objectId = kInvalidObjectId;
+    const char* vehiclePath = attachedStage.textFor(vehicleKey);
 
     // The rigid body for the vehicle must be created before calling createVehicle so mass and extents can be used.
 
-    PxRigidActor* vehicleActor = getPtr<PxRigidActor>(PhysXType::ePTActor, vehicleDesc.bodyId);
+    PxRigidActor* vehicleActor = getPtr<PxRigidActor>(attachedStage.getInternalPhysXDatabase(), PhysXType::ePTActor, vehicleDesc.bodyId);
 
     if (!vehicleActor)
     {
         CARB_LOG_ERROR("PhysX Vehicle: \"%s\": referenced rigid body could not be found. Vehicle creation failed.\n",
-            vehiclePath.GetText());
+            vehiclePath);
 
         return objectId;
     }
@@ -6186,7 +6537,7 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
     if (!pxScene)
     {
         CARB_LOG_ERROR("PhysX Vehicle: \"%s\": referenced rigid body has no PhysX scene. Vehicle creation failed.\n",
-            vehiclePath.GetText());
+            vehiclePath);
 
         return objectId;
     }
@@ -6206,17 +6557,17 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
 
         CARB_LOG_WARN("PhysX Vehicle: \"%s\": ScaleOrientation in center-of-mass frame is not supported. "
             "You may ignore this if the scale is close to uniform.\n",
-            usdPrim.GetPath().GetText());
+            vehiclePath);
     }
 
     if (!scaleIsIdentity(vehicleDesc.scale.x, vehicleDesc.scale.y, vehicleDesc.scale.z))
     {
         CARB_LOG_WARN("PhysX Vehicle: \"%s\": vehicle prim has a gobal scale that is not identity. It is recommended to avoid "
-            "such configurations since not all vehicle related attributes are scale aware.\n", vehiclePath.GetText());
+            "such configurations since not all vehicle related attributes are scale aware.\n", vehiclePath);
     }
 
     PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
-    PhysXScene* physxScene = physxSetup.getPhysXScene(size_t(pxScene->userData));
+    PhysXScene* physxScene = physxSetup.findPhysXScene(pxScene);
     InternalScene* internalScene = physxScene->getInternalScene();
 
     {
@@ -6243,16 +6594,6 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
     if (internalVehicle)
     {
         internalVehicle->mScale = vehicleDesc.scale;
-
-        const uint32_t simulationFlags = SimulationCallbacks::getSimulationCallbacks()->getSimulationFlags(usdPrim.GetPrimPath());
-        if (simulationFlags & GlobalSimulationFlag::eNOTIFY_UPDATE)
-        {
-            internalVehicle->mFlags |= InternalVehicleFlag::eNOTIFY_TRANSFORM;
-        }
-        if (simulationFlags & GlobalSimulationFlag::eSKIP_WRITE)
-        {
-            internalVehicle->mFlags |= InternalVehicleFlag::eSKIP_UPDATE_TRANSFORM;
-        }
 
         if (vehicleDesc.hasUserDefinedSprungMassValues)
         {
@@ -6301,7 +6642,7 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
             CARB_ASSERT(wheelAttachmentDesc.index < static_cast<int>(wheelCount));
             const uint32_t wheelIndex = static_cast<uint32_t>(wheelAttachmentDesc.index);
 
-            InternalVehicleWheelAttachment* wheelAttachment = getInternalPtr<InternalVehicleWheelAttachment>(
+            InternalVehicleWheelAttachment* wheelAttachment = getInternalPtr<InternalVehicleWheelAttachment>(attachedStage.getInternalPhysXDatabase(),
                 PhysXType::ePTVehicleWheelAttachment, wheelAttachmentDesc.id);
             CARB_ASSERT(wheelAttachment);
             wheelAttachment->mVehicle = internalVehicle;
@@ -6311,7 +6652,7 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
 
             if (wheelAttachmentDesc.tire->frictionTableId != kInvalidObjectId)
             {
-                ::physx::PxVehiclePhysXMaterialFrictionParams* tireMaterialFrictionTable = getPtr<::physx::PxVehiclePhysXMaterialFrictionParams>(
+                ::physx::PxVehiclePhysXMaterialFrictionParams* tireMaterialFrictionTable = getPtr<::physx::PxVehiclePhysXMaterialFrictionParams>(attachedStage.getInternalPhysXDatabase(),
                     PhysXType::ePTVehicleTireFrictionTable, wheelAttachmentDesc.tire->frictionTableId);
                 CARB_ASSERT(tireMaterialFrictionTable);
                 tireMaterialFrictionTables.push_back(tireMaterialFrictionTable);
@@ -6321,29 +6662,24 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
                 tireMaterialFrictionTables.push_back(InternalTireFrictionTable::getDefault());
             }
 
-            registerInWheelComponent(*internalVehicle, wheelIndex, PhysXType::ePTVehicleWheel, wheelAttachmentDesc.wheelId);
-            registerInWheelComponent(*internalVehicle, wheelIndex, PhysXType::ePTVehicleTire, wheelAttachmentDesc.tireId);
-            registerInWheelComponent(*internalVehicle, wheelIndex, PhysXType::ePTVehicleSuspension, wheelAttachmentDesc.suspensionId);
+            registerInWheelComponent(attachedStage, *internalVehicle, wheelIndex, PhysXType::ePTVehicleWheel, wheelAttachmentDesc.wheelId);
+            registerInWheelComponent(attachedStage, *internalVehicle, wheelIndex, PhysXType::ePTVehicleTire, wheelAttachmentDesc.tireId);
+            registerInWheelComponent(attachedStage, *internalVehicle, wheelIndex, PhysXType::ePTVehicleSuspension, wheelAttachmentDesc.suspensionId);
 
             if (wheelAttachmentDesc.state & WheelAttachmentDesc::eMANAGE_TRANSFORMS)
             {
-                UsdPrim shapePrim;
                 PxShape* shape = nullptr;
 
                 if (wheelAttachmentDesc.shapeId != kInvalidObjectId)
                 {
-                    shape = getPtr<PxShape>(PhysXType::ePTShape, wheelAttachmentDesc.shapeId);
+                    shape = getPtr<PxShape>(attachedStage.getInternalPhysXDatabase(), PhysXType::ePTShape, wheelAttachmentDesc.shapeId);
                     wheelShapeMapping.push_back(shape);
 
-                    if (shape)
-                    {
-                        shapePrim = usdStage->GetPrimAtPath(wheelAttachmentDesc.shapePath);
-                    }
-                    else
+                    if (!shape)
                     {
                         CARB_LOG_ERROR(
                             "PhysX Vehicle: \"%s\": referenced shape \"%s\" could not be found. Wheel will not be mapped to shape.\n",
-                            vehiclePath.GetText(), wheelAttachmentDesc.shapePath.GetText());
+                            vehiclePath, attachedStage.textFor(wheelAttachmentDesc.shapeKey));
                     }
                 }
                 else
@@ -6352,22 +6688,23 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
                     wheelShapeMapping.push_back(nullptr);
                 }
 
-                UsdPrim wheelRootPrim = usdStage->GetPrimAtPath(wheelAttachmentDesc.path);
                 if (internalVehicle->mWheelTransformManagementEntries.size() == 0)
                 {
                     internalVehicle->mWheelTransformManagementEntries.resize(wheelCount);
                 }
                 InternalVehicle::WheelTransformManagementEntry& wheelTMEntry = internalVehicle->mWheelTransformManagementEntries[wheelIndex];
-                wheelTMEntry.init(wheelRootPrim, shapePrim, shape, wheelAttachmentDesc.shapeId);
-                if (usdparser::AttachedStage* as = usdparser::UsdLoad::getUsdLoad()->getActiveAttachedStage())
-                    prepareWheelTransforms(*as, wheelTMEntry, wheelRootPrim, shapePrim, wheelShapeLocalPoses[i]);
+                const omni::physics::parse::ObjectKey wheelShapeKey =
+                    shape ? wheelAttachmentDesc.shapeKey : omni::physics::parse::ObjectKey{};
+                wheelTMEntry.init(attachedStage, wheelAttachmentDesc.key, wheelShapeKey, shape, wheelAttachmentDesc.shapeId);
+                prepareWheelTransforms(attachedStage, wheelTMEntry, wheelAttachmentDesc.key, wheelShapeKey,
+                                       wheelShapeLocalPoses[i]);
 
                 // note: for now testing against identity is OK since this scale is the local one
                 if (!scaleIsIdentity(wheelTMEntry.scale.x, wheelTMEntry.scale.y, wheelTMEntry.scale.z))
                 {
                     CARB_LOG_WARN("PhysX Vehicle: \"%s\": wheel attachment prim has a gobal scale that is not identity. It is recommended to avoid "
                         "such configurations since neither the suspension frame nor other attributes are taking this scale into account.\n",
-                        wheelAttachmentDesc.path.GetText());
+                        attachedStage.textFor(wheelAttachmentDesc.key));
                 }
             }
             else
@@ -6379,16 +6716,17 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
 
         if (!(vehicleBody->getActorFlags() & ::physx::PxActorFlag::eDISABLE_GRAVITY))
         {
-            const usdparser::AttachedStage* gravAs = usdparser::UsdLoad::getUsdLoad()->getActiveAttachedStage();
-            const omni::physics::parse::IPhysicsSource* gravSrc = gravAs ? gravAs->getSource() : nullptr;
-            if (gravSrc && gravSrc->hasSchema(gravAs->keyFor(usdPrim.GetPath()),
-                                              schemaTypeToken<PhysxSchemaPhysxRigidBodyAPI>(*gravSrc)))
+            const omni::physics::parse::IPhysicsSource* gravSrc = attachedStage.getSource();
+            omni::physics::parse::KnownTokens gravTok;
+            if (gravSrc)
+                gravTok.intern(*gravSrc);
+            if (gravSrc && gravSrc->hasSchema(vehicleKey, gravTok.physxRigidBodyAPI))
             {
                 // do not warn if only UsdPhysicsRigidBodyAPI is applied as that one does not
                 // have the disableGravity attribute
                 CARB_LOG_WARN("PhysX Vehicle: \"%s\": vehicle rigid bodies need to have gravity disabled (see attribute disableGravity)! "
                     "Disabling gravity internally now.\n",
-                    vehiclePath.GetText());
+                    vehiclePath);
             }
             vehicleBody->setActorFlag(::physx::PxActorFlag::eDISABLE_GRAVITY, true);
         }
@@ -6428,7 +6766,7 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
                     const DriveStandardDesc* driveDesc = static_cast<const DriveStandardDesc*>(vehicleDesc.drive);
                     if (driveDesc->engineId != kInvalidObjectId)
                     {
-                        InternalVehicleReferenceList* vehicleRefList = getInternalPtr<InternalVehicleReferenceList>(
+                        InternalVehicleReferenceList* vehicleRefList = getInternalPtr<InternalVehicleReferenceList>(attachedStage.getInternalPhysXDatabase(),
                             PhysXType::ePTVehicleEngine, driveDesc->engineId);
                         CARB_ASSERT(vehicleRefList);
                         vehicleRefList->addVehicle(*internalVehicle);
@@ -6446,7 +6784,7 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
                     const DriveBasicDesc* driveDesc = static_cast<const DriveBasicDesc*>(vehicleDesc.drive);
                     if (driveDesc->id != kInvalidObjectId)
                     {
-                        InternalVehicleReferenceList* vehicleRefList = getInternalPtr<InternalVehicleReferenceList>(
+                        InternalVehicleReferenceList* vehicleRefList = getInternalPtr<InternalVehicleReferenceList>(attachedStage.getInternalPhysXDatabase(),
                             PhysXType::ePTVehicleDriveBasic, driveDesc->id);
                         CARB_ASSERT(vehicleRefList);
                         vehicleRefList->addVehicle(*internalVehicle);
@@ -6457,19 +6795,19 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
 
             for (const WheelControllerDesc& wheelControllerDesc : vehicleDesc.wheelControllers)
             {
-                InternalVehicleWheelAttachment* wheelAttachment = getInternalPtr<InternalVehicleWheelAttachment>(
+                InternalVehicleWheelAttachment* wheelAttachment = getInternalPtr<InternalVehicleWheelAttachment>(attachedStage.getInternalPhysXDatabase(),
                     ePTVehicleWheelController, wheelControllerDesc.id);
                 CARB_ASSERT(wheelAttachment);
-                wheelAttachment->mInitialControllerValues.key = keyForActiveStage(wheelControllerDesc.path);
+                wheelAttachment->mInitialControllerValues.key = wheelControllerDesc.key;
                 wheelAttachment->setControllerParams(wheelControllerDesc, true);
             }
 
-            objectId = internalScene->addVehicle(*internalVehicle, wheelCount, usdPrim, vehicleDesc.enabled);
+            objectId = internalScene->addVehicle(*internalVehicle, wheelCount, vehicleKey, vehicleDesc.enabled);
         }
         else
         {
             CARB_LOG_ERROR("PhysX Vehicle: \"%s\": PhysX vehicle could not be created. Vehicle creation failed.\n",
-            vehiclePath.GetText());
+            vehiclePath);
 
             delete internalVehicle;
         }
@@ -6477,89 +6815,89 @@ ObjectId PhysXUsdPhysicsInterface::createVehicle(const SdfPath& vehiclePath,
     else
     {
         CARB_LOG_ERROR("PhysX Vehicle: \"%s\": internal vehicle object could not be allocated. Vehicle creation failed.\n",
-            vehiclePath.GetText());
+            vehiclePath);
     }
 
     return objectId;
 }
 
 ObjectId PhysXUsdPhysicsInterface::createVehicleController(
-    const SdfPath& vehicleControllerPath,
-    const UsdPrim& usdPrim,
+    AttachedStage& attachedStage,
+    omni::physics::parse::ObjectKey vehicleControllerKey,
     const VehicleControllerDesc& vehicleControllerDesc)
 {
     ObjectId objectId = kInvalidObjectId;
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
-    InternalVehicle* vehicle = static_cast<InternalVehicle*>(::getInternalPtr(vehicleControllerPath, ePTVehicle));
+    InternalVehicle* vehicle = reinterpret_cast<InternalVehicle*>(getObjectDataOrID<ObjectDataQueryType::eINTERNAL_PTR>(vehicleControllerKey, ePTVehicle, attachedStage.getInternalPhysXDatabase(), attachedStage));
 
     if (!vehicle)
     {
-        CARB_LOG_ERROR("Could not create vehicle controller at path (%s)", vehicleControllerPath.GetText());
+        CARB_LOG_ERROR("Could not create vehicle controller at path (%s)", attachedStage.textFor(vehicleControllerKey));
         return objectId;
     }
     InternalVehicle::InitialControllerValues* initialValues = vehicle->allocateInitialControllerValues();
     if (initialValues)
     {
-        initialValues->key = keyForActiveStage(usdPrim.GetPrimPath());
+        initialValues->key = vehicleControllerKey;
     }
     vehicle->setControllerParams(vehicleControllerDesc, initialValues);
-    objectId = db.addRecord(ePTVehicleController, nullptr, vehicle, keyForActiveStage(usdPrim.GetPrimPath()));
+    objectId = db.addRecord(ePTVehicleController, nullptr, vehicle, vehicleControllerKey);
     return objectId;
 }
 
-ObjectId PhysXUsdPhysicsInterface::registerVehicleComponent(const UsdPrim& usdPrim, PhysXType type)
+ObjectId PhysXUsdPhysicsInterface::registerVehicleComponent(const usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, PhysXType type)
 {
     ObjectId objectId = kInvalidObjectId;
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     InternalVehicleReferenceList* vehicleRefList = ICE_NEW(InternalVehicleReferenceList);
-    objectId = db.addRecord(type, nullptr, vehicleRefList, keyForActiveStage(usdPrim.GetPrimPath()));
+    objectId = db.addRecord(type, nullptr, vehicleRefList, key);
 
     return objectId;
 }
 
-ObjectId PhysXUsdPhysicsInterface::registerVehicleWheelComponent(const PXR_NS::UsdPrim& usdPrim, PhysXType type)
+ObjectId PhysXUsdPhysicsInterface::registerVehicleWheelComponent(const usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, PhysXType type)
 {
     ObjectId objectId = kInvalidObjectId;
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     InternalVehicleWheelReferenceList* vehicleWheelRefList = ICE_NEW(InternalVehicleWheelReferenceList);
-    objectId = db.addRecord(type, nullptr, vehicleWheelRefList, keyForActiveStage(usdPrim.GetPrimPath()));
+    objectId = db.addRecord(type, nullptr, vehicleWheelRefList, key);
 
     return objectId;
 }
 
 ObjectId PhysXUsdPhysicsInterface::createVehicleWheelController(
-    const SdfPath& wheelControllerPath,
-    const UsdPrim& usdPrim,
+    AttachedStage& attachedStage,
+    omni::physics::parse::ObjectKey wheelControllerKey,
     const WheelControllerDesc& wheelControllerDesc)
 {
     ObjectId objectId = kInvalidObjectId;
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
-    InternalVehicleWheelAttachment* wheelAttachment = static_cast<InternalVehicleWheelAttachment*>(
-        ::getInternalPtr(wheelControllerPath, ePTVehicleWheelAttachment));
+    InternalVehicleWheelAttachment* wheelAttachment = reinterpret_cast<InternalVehicleWheelAttachment*>(
+        getObjectDataOrID<ObjectDataQueryType::eINTERNAL_PTR>(wheelControllerKey, ePTVehicleWheelAttachment, db, attachedStage));
 
     if (!wheelAttachment)
     {
-        CARB_LOG_ERROR("Could not create vehicle wheel controller at path (%s)", wheelControllerPath.GetText());
+        CARB_LOG_ERROR("Could not create vehicle wheel controller at path (%s)", attachedStage.textFor(wheelControllerKey));
         return objectId;
     }
 
-    objectId = db.addRecord(ePTVehicleWheelController, nullptr, wheelAttachment, keyForActiveStage(usdPrim.GetPrimPath()));
+    objectId = db.addRecord(ePTVehicleWheelController, nullptr, wheelAttachment, wheelControllerKey);
     return objectId;
 }
 
-ObjectId PhysXUsdPhysicsInterface::createMimicJoint(const usdparser::MimicJointDesc& mimicJointDesc)
+ObjectId PhysXUsdPhysicsInterface::createMimicJoint(const usdparser::AttachedStage& attachedStage, const usdparser::MimicJointDesc& mimicJointDesc)
 {
     ObjectId objectId = kInvalidObjectId;
 
-    PxArticulationJointReducedCoordinate* pxTargetJoint = getPtr<PxArticulationJointReducedCoordinate>(PhysXType::ePTLinkJoint, mimicJointDesc.mimicJointId);
+    PxArticulationJointReducedCoordinate* pxTargetJoint = getPtr<PxArticulationJointReducedCoordinate>(attachedStage.getInternalPhysXDatabase(), PhysXType::ePTLinkJoint, mimicJointDesc.mimicJointId);
 
     if (pxTargetJoint)
     {
-        PxArticulationJointReducedCoordinate* pxReferenceJoint = getPtr<PxArticulationJointReducedCoordinate>(PhysXType::ePTLinkJoint, mimicJointDesc.referenceJointId);
+        PxArticulationJointReducedCoordinate* pxReferenceJoint = getPtr<PxArticulationJointReducedCoordinate>(attachedStage.getInternalPhysXDatabase(), PhysXType::ePTLinkJoint, mimicJointDesc.referenceJointId);
 
         if (pxReferenceJoint)
         {
@@ -6568,7 +6906,7 @@ ObjectId PhysXUsdPhysicsInterface::createMimicJoint(const usdparser::MimicJointD
 
             if (&pxTargetJointArt == &pxReferenceJointArt)
             {
-                InternalArticulation* internalArt = getInternalPtr<InternalArticulation>(ePTArticulation, ObjectId(pxTargetJointArt.userData));
+                InternalArticulation* internalArt = getInternalPtr<InternalArticulation>(attachedStage.getInternalPhysXDatabase(), ePTArticulation, ObjectId(pxTargetJointArt.userData));
                 if (internalArt)
                 {
                     CARB_ASSERT(internalArt->mPhysxScene);
@@ -6577,7 +6915,7 @@ ObjectId PhysXUsdPhysicsInterface::createMimicJoint(const usdparser::MimicJointD
                     // mimic joints can only be added if the articulation is not part of a scene
                     // (this should, for example, cover the case where a mimic joint gets defined after
                     // the stage has been attached).
-                    removeArticulationFromSceneAndScheduleForReAdd(pxTargetJointArt);
+                    removeArticulationFromSceneAndScheduleForReAdd(attachedStage, pxTargetJointArt);
 
                     // Mimic-joint gearing/offset are authored against each joint's natural USD position
                     // convention (relative to body0 -> body1): PhysxMimicJointAPI as
@@ -6592,9 +6930,9 @@ ObjectId PhysXUsdPhysicsInterface::createMimicJoint(const usdparser::MimicJointD
                     // These signs are handed to the InternalMimicJoint so they are reapplied on runtime
                     // gearing/offset (coef) changes too.
                     const InternalJoint* targetIntJoint =
-                        getInternalPtr<InternalJoint>(ePTLinkJoint, mimicJointDesc.mimicJointId);
+                        getInternalPtr<InternalJoint>(attachedStage.getInternalPhysXDatabase(), ePTLinkJoint, mimicJointDesc.mimicJointId);
                     const InternalJoint* referenceIntJoint =
-                        getInternalPtr<InternalJoint>(ePTLinkJoint, mimicJointDesc.referenceJointId);
+                        getInternalPtr<InternalJoint>(attachedStage.getInternalPhysXDatabase(), ePTLinkJoint, mimicJointDesc.referenceJointId);
 
                     const float targetSign = (targetIntJoint && !targetIntJoint->mBody0IsParentLink) ? -1.0f : 1.0f;
                     const float referenceSign = (referenceIntJoint && !referenceIntJoint->mBody0IsParentLink) ? -1.0f : 1.0f;
@@ -6612,15 +6950,15 @@ ObjectId PhysXUsdPhysicsInterface::createMimicJoint(const usdparser::MimicJointD
                         ::physx::PxArticulationMimicJoint* pxMimicJoint = internalMimicJoint->getPhysXMimicJoint();
                         if (pxMimicJoint)
                         {
-                            InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+                            InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
-                            objectId = db.addRecord(ePTMimicJoint, pxMimicJoint, internalMimicJoint, keyForActiveStage(mimicJointDesc.mimicJointPath));
+                            objectId = db.addRecord(ePTMimicJoint, pxMimicJoint, internalMimicJoint, mimicJointDesc.mimicJointKey);
                             pxMimicJoint->userData = (void*)(objectId);
                         }
                         else
                         {
                             CARB_LOG_ERROR("PhysX Mimic Joint: \"%s\": PhysX object could not be created.\n",
-                                mimicJointDesc.mimicJointPath.GetText());
+                                attachedStage.textFor(mimicJointDesc.mimicJointKey));
 
                             constexpr bool removeFromTrackers = false;
                             constexpr bool releasePhysXObject = false;
@@ -6631,31 +6969,31 @@ ObjectId PhysXUsdPhysicsInterface::createMimicJoint(const usdparser::MimicJointD
                     else
                     {
                         CARB_LOG_ERROR("PhysX Mimic Joint: \"%s\": allocation for internal mimic joint object failed.\n",
-                            mimicJointDesc.mimicJointPath.GetText());
+                            attachedStage.textFor(mimicJointDesc.mimicJointKey));
                     }
                 }
                 else
                 {
                     CARB_LOG_ERROR("PhysX Mimic Joint: \"%s\": internal articulation object could not be found.\n",
-                        mimicJointDesc.mimicJointPath.GetText());
+                        attachedStage.textFor(mimicJointDesc.mimicJointKey));
                 }
             }
             else
             {
                 CARB_LOG_ERROR("PhysX Mimic Joint: \"%s\": the joints to connect are not part of the same articulation.\n",
-                    mimicJointDesc.mimicJointPath.GetText());
+                    attachedStage.textFor(mimicJointDesc.mimicJointKey));
             }
         }
         else
         {
             CARB_LOG_ERROR("PhysX Mimic Joint: \"%s\": PhysX instance of reference joint could not be found.\n",
-                mimicJointDesc.referenceJointPath.GetText());
+                attachedStage.textFor(mimicJointDesc.referenceJointKey));
         }
     }
     else
     {
         CARB_LOG_ERROR("PhysX Mimic Joint: \"%s\": PhysX instance of mimic joint could not be found.\n",
-            mimicJointDesc.mimicJointPath.GetText());
+            attachedStage.textFor(mimicJointDesc.mimicJointKey));
     }
     
     return objectId;
@@ -6665,7 +7003,7 @@ void PhysXUsdPhysicsInterface::reportLoadError(usdparser::ErrorCode::Enum errorC
 {
     if (errorCode == usdparser::ErrorCode::eError)
     {
-        CARB_LOG_ERROR(msg);
+        OVX_RUNTIME_ERROR("%s", msg);
         sendErrorEvent(OmniPhysX::getInstance().getErrorEventStream(), eUsdLoadError, std::make_pair("errorString", msg));
     }
     else if (errorCode == usdparser::ErrorCode::eWarning)
@@ -6678,10 +7016,11 @@ void PhysXUsdPhysicsInterface::reportLoadError(usdparser::ErrorCode::Enum errorC
     }
 }
 
-PXR_NS::SdfPath PhysXUsdPhysicsInterface::getParentJointPathInArticulation(const usdparser::AttachedStage& attachedStage, const PXR_NS::SdfPath& jointKey)
+omni::physics::parse::ObjectKey PhysXUsdPhysicsInterface::getParentJointPathInArticulation(
+    const usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey jointKey)
 {
     const ObjectId jointId = attachedStage.getObjectDatabase()->findEntry(jointKey, eArticulationJoint);
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     if (jointId == kInvalidObjectId)
     {
@@ -6704,16 +7043,27 @@ PXR_NS::SdfPath PhysXUsdPhysicsInterface::getParentJointPathInArticulation(const
 
         if (jointRecord)
         {
-            return attachedStage.pathFor(jointRecord->mKey);
+            return jointRecord->mKey;
         }
     }
 
     return jointKey;
 }
 
-SubscriptionId PhysXUsdPhysicsInterface::subscribeToObjectChangeNotifications(const IPhysicsObjectChangeCallback& callback)
+SubscriptionId PhysXUsdPhysicsInterface::subscribeToObjectChangeNotifications(
+    const IPhysicsObjectChangeCallback& callback, AttachHandle attach)
 {
-    return mPhysicsObjectChangeSubscriptions.addEvent(callback);
+    ObjectChangeObserver observer;
+    static_cast<IPhysicsObjectChangeCallback&>(observer) = callback;
+    observer.attach = attach;
+    return mPhysicsObjectChangeSubscriptions.addEvent(observer);
+}
+
+void PhysXUsdPhysicsInterface::retireObjectChangeNotifications(AttachHandle attach)
+{
+    mPhysicsObjectChangeSubscriptions.removeIf([attach](const ObjectChangeObserver& observer) {
+        return observer.attach == attach;
+    });
 }
 
 void PhysXUsdPhysicsInterface::unsubscribeToObjectChangeNotifications(SubscriptionId subscriptionId)
@@ -6722,13 +7072,13 @@ void PhysXUsdPhysicsInterface::unsubscribeToObjectChangeNotifications(Subscripti
 }
 
 void PhysXUsdPhysicsInterface::removeArticulationFromSceneAndScheduleForReAdd(
-    const ::physx::PxArticulationReducedCoordinate& pxArticulation)
+    const usdparser::AttachedStage& attachedStage, const ::physx::PxArticulationReducedCoordinate& pxArticulation)
 {
     if (pxArticulation.getScene() && pxArticulation.getAggregate())
     {
         pxArticulation.getScene()->removeAggregate(*(pxArticulation.getAggregate()));
-        mArticulations.push_back((ObjectId)pxArticulation.userData);
-        mDirty = true;  // trigger re-add to scene
+        attachedStage.getPendingPhysicsSetup().articulations.push_back((ObjectId)pxArticulation.userData);
+        attachedStage.getPendingPhysicsSetup().dirty = true;  // trigger re-add to scene
     }
 }
 

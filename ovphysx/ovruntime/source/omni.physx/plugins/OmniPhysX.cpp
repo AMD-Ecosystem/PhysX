@@ -1,7 +1,37 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+// @implements REQ-EVENT-QUEUE-001
+// @covers AC-4
+
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1 AC-2 AC-3 AC-4
+
+// @implements REQ-ATTACH-LIFETIME-001
+// @covers AC-1 AC-3 AC-4
+
+// @implements REQ-OMNIPVD-LATE-001
+// @covers AC-9
+
+// @implements REQ-SDK-LIFECYCLE-002
+// @covers AC-1 AC-2 AC-4
+
+/**
+ * @implements REQ-COOK-LIFETIME-001
+ * @covers AC-1 AC-3
+ *
+ * @implements REQ-SIM-OVSTAGE-ATTACH-001
+ * @covers AC-1 AC-2
+ *
+ * @implements REQ-REPLICATE-002
+ * @covers AC-1 AC-2 AC-3
+ */
+
+// This file is pxr-free. OmniPhysX::physXAttach -- the only USD-specific member left here --
+// is defined in the pxr-free usdBridge/RuntimeBridge.cpp (ADR-0027).
+#include "ScopedNoticeLock.h"
+#include <stdexcept>
+#include <omni/physics/parse/CustomTokens.h>
 
 #include "Setup.h"
 #include "OmniPhysX.h"
@@ -12,21 +42,19 @@
 #include "PhysXPropertyQuery.h"
 #include "PhysXSettings.h"
 #include "PhysXUpdate.h"
+#include "RuntimeExecution.h"
 #include "PhysXDebugVisualization.h"
-#include "CookingDataAsync.h"
 #include "CookingDataAsync.h"
 #include "Raycast.h"
 #include "usdLoad/LoadUsd.h"
 #include "usdLoad/Scene.h"
 #include "PhysXFoundation.h"
-
-#include <omni/physics/usd/CustomTokens.h>
+#include "usdInterface/UsdInterface.h"
 
 #include "particles/PhysXParticlePost.h"
 
 #include <common/utilities/MemoryMacros.h>
 
-using namespace PXR_NS;
 using namespace ::physx;
 using namespace carb;
 using namespace omni::physx;
@@ -45,12 +73,14 @@ static constexpr char kViewportGizmoScalePath[] = PERSISTENT_SETTINGS_PREFIX "/a
 
 ///////////////////////////////////////////////////////////////////////////////
 
-void OmniPhysX::sendSimulationEvent(SimulationEvent type)
+void OmniPhysX::sendSimulationEvent(SimulationEvent type, AttachHandle attach)
 {
     using namespace carb::events;
     {
         carb::events::IEventPtr event = carb::stealObject(
             mSimulationEventStreamV2->createEventPtr(static_cast<EventType>(type), kGlobalSenderId));
+        getIDictionary()->makeInt64AtPath(event->payload, "attachHandle", static_cast<int64_t>(attach));
+        RuntimeCallbackScope callbackScope;
         mSimulationEventStreamV2->dispatch(event.get());
     }
 }
@@ -58,178 +88,90 @@ void OmniPhysX::sendSimulationEvent(SimulationEvent type)
 void OmniPhysX::releasePhysXScenes()
 {
     //update postprocess before any particle sets are released
-    omni::physx::particles::notifyPhysXRelease();
-    releaseInternalPhysXDatabase();
+    omni::physx::particles::notifyAllPhysXRelease();
     mPhysXSetup.releasePhysXScenes();
-    createInternalPhysXDatabase();
     mCustomJointManager->clear();
     mCustomGeometryManager->clear();
     for (ReplicatorMap::reference ref : mReplicatorMap)
     {
-        ref.second.clear();
+        ref.second->clear();
     }
 
     mProfileStats.clear();
     mCrossProfileStats.clear();
 }
 
-void OmniPhysX::releaseInternalPhysXDatabase()
+
+
+// OmniPhysX::physXAttach is defined in usdBridge/RuntimeBridge.cpp: its body resolves stageId
+// through the reparse seam. Both call sites (loadTargetStage/loadTargetStage_Id in PhysX.cpp)
+// are benchmark-harness-only; with no seam it is an error-logging stub.
+
+AttachHandle OmniPhysX::physXAttachOvstage(const void* ovstageAttachPayload,
+                                  uint64_t readOrdinal,
+                                  AttachOvstageBackingStageHandle backingStage,
+                                  uint64_t effectiveBackingStageId,
+                                  const PhysxAttachOptions& options)
 {
-    SAFE_DELETE_SINGLE(mInternalPhysXDatabase);
-}
-
-void OmniPhysX::createInternalPhysXDatabase()
-{
-    if (!mInternalPhysXDatabase)
-        mInternalPhysXDatabase = ICE_NEW(InternalPhysXDatabase);
-}
-
-void OmniPhysX::physXAttachSession(PXR_NS::UsdStageWeakPtr stage)
-{
-    createInternalPhysXDatabase();
-
-    SimulationCallbacks::getSimulationCallbacks()->reset();
-
-    // Ensure the PxPhysics singleton. Pass the stage explicitly: the AttachedStage
-    // is not registered with UsdLoad until the attach() call below, so
-    // getActiveStage() would be empty here on first physics creation. For a
-    // stageless (ovstage) attach the handle is empty and PhysX uses default
-    // tolerances (RESIDUAL: route tolerances through the source units — part of the
-    // remaining null-stage decoupling sweep).
-    // A.B. TODO tolerances are per-stage and should move into individual scenes.
-    if (stage)
-        getPhysXSetup().getPhysics(stage);
-    else
-        getPhysXSetup().getPhysics();
-
-    mCurrentTimestampOffset = mSimulationTimestamp;
+    // Candidates snapshot these parser defaults during construction. Do not
+    // create an active database or change a live attachment's clocks here.
     getPhysXUsdPhysicsInterface().setExposePrimNames(mISettings->getAsBool(kSettingExposePrimPathNames));
     const char* forceSingleScene = mISettings->getStringBuffer(kSettingForceParseOnlySingleScene);
-    getPhysXUsdPhysicsInterface().setForceParseOnlySingleScene(
-        forceSingleScene ? PXR_NS::SdfPath(forceSingleScene) : PXR_NS::SdfPath());
+    getPhysXUsdPhysicsInterface().setForceParseOnlySingleScene(forceSingleScene ? forceSingleScene : std::string());
+
+    return UsdLoad::getUsdLoad()->attachOvstage(ovstageAttachPayload, readOrdinal,
+        effectiveBackingStageId, &getPhysXUsdPhysicsInterface(), /*loadPhysics=*/true,
+        backingStage, &options);
 }
 
-void OmniPhysX::physXAttach(long int stageId, bool loadPhysics)
+bool OmniPhysX::physXUpdateFromOvStage(AttachHandle attach, uint64_t fromOrdinal, uint64_t toOrdinal)
 {
-    UsdStageRefPtr stage = UsdUtilsStageCache::Get().Find(UsdStageCache::Id::FromLongInt(stageId));
-    if (!stage)
-    {
-        CARB_LOG_ERROR("PhysX could not find USD stage");
-        return;
-    }
-
-    physXAttachSession(stage);
-
-    PhysXReplicator* replicator = getReplicator(stageId);
-    if (replicator && loadPhysics)
-    {
-        replicator->attach(stageId, &getPhysXUsdPhysicsInterface(), true);
-    }
-    else
-    {
-        UsdLoad::getUsdLoad()->attach(loadPhysics, stageId, &getPhysXUsdPhysicsInterface());
-    }
-}
-
-bool OmniPhysX::physXAttachOvstage(const void* ovstageAttachPayload,
-                                  uint64_t readOrdinal,
-                                  PXR_NS::UsdStageWeakPtr backingStage,
-                                  uint64_t effectiveBackingStageId)
-{
-    // Same session prologue as the USD attach, with no stage; the only divergence
-    // is the stageless attachOvstage() entry (which installs the ovstage backends).
-    physXAttachSession(PXR_NS::UsdStageWeakPtr{});
-
-    // Use the same preclassified local id for replicator selection and stage
-    // registration. Re-querying the payload here would happen after the session
-    // prologue and could disagree with the StageCache residency decision.
-    PhysXReplicator* replicator =
-        effectiveBackingStageId ? getReplicator(effectiveBackingStageId) : nullptr;
-
-    const bool attached = UsdLoad::getUsdLoad()->attachOvstage(ovstageAttachPayload,
-                                                               readOrdinal,
-                                                               backingStage,
-                                                               effectiveBackingStageId,
-                                                               &getPhysXUsdPhysicsInterface(),
-                                                               /*loadPhysics=*/replicator == nullptr);
-    if (!attached)
-        return false;
-
-    if (replicator)
-        replicator->attach(effectiveBackingStageId, &getPhysXUsdPhysicsInterface(), /*attachStage=*/false);
-
-    return true;
-}
-
-bool OmniPhysX::physXUpdateFromOvStage(uint64_t fromOrdinal, uint64_t toOrdinal)
-{
-    // Route to the single active AttachedStage (ovstage attaches stageless, so it
-    // resolves through getActiveAttachedStage()). Its change feed pulls the delta
-    // for [fromOrdinal, toOrdinal] and drives the incremental-update callbacks.
-    AttachedStage* attachedStage = UsdLoad::getUsdLoad()->getActiveAttachedStage();
+    AttachedStage* attachedStage = UsdLoad::getUsdLoad()->getAttachedStageByHandle(attach);
     return attachedStage ? attachedStage->updateFromOvStage(fromOrdinal, toOrdinal) : false;
 }
 
-void OmniPhysX::physXDetach()
+bool OmniPhysX::physXDetach(AttachHandle attach)
 {
-    // Drain queued property-query requests before tearing down the stage. Pending
-    // requests hold UsdStageWeakPtrs whose targets get destroyed here; firing their
-    // queryFinishedCallback now (with eERROR_RUNTIME) prevents a later
-    // updateQueuedRequests tick from dereferencing an expired/null weak ptr.
-    // This is the common detach path - reached from both physxSimulationDetach() and
-    // onPhysXDetach(), so it covers direct API and Kit stage-update teardowns.
-    getPropertyQueryManager().cancelAllPendingRequests(PhysxPropertyQueryResult::eERROR_RUNTIME);
-
-    {
-        std::unique_lock<carb::tasking::MutexWrapper> simStartedLock(mSimParamMutex);
-        if (mHasSimulationStarted)
-        {
-            mHasSimulationStarted = false;
-            sendSimulationEvent(SimulationEvent::eStopped);
-        }
-    }
-
-    UsdLoad::getUsdLoad()->detach(UsdLoad::getUsdLoad()->getActiveStageId());
-
-    releasePhysXScenes();
-
-    SimulationCallbacks::getSimulationCallbacks()->reset();
+    UsdLoad* loader = UsdLoad::getUsdLoad();
+    AttachedStage* owner = loader->getAttachedStageByHandle(attach);
+    if (!owner)
+        return false;
+    waitForSimulationCompletion(*owner, false);
+    getPropertyQueryManager().cancelStageRequests(owner->getStageId(), PhysxPropertyQueryResult::eERROR_RUNTIME);
+    unregisterReplicator(attach);
+    const bool stopped = owner->hasSimulationStarted();
+    if (!loader->retireAttachment(attach))
+        return false;
+    if (stopped)
+        sendSimulationEvent(SimulationEvent::eStopped, attach);
+    return true;
 }
 
-void OmniPhysX::resetSimulation()
+void OmniPhysX::resetSimulation(AttachedStage& owner)
 {
     OmniPhysX& omniPhysX = *this;
 
-    const bool outputVelocitiesLocalSpace = omniPhysX.getISettings()->getAsBool(kSettingOutputVelocitiesLocalSpace);
-    const bool useUsdUpdate = omniPhysX.getISettings()->getAsBool(kSettingUpdateToUsd);
-    const bool useUsdVelocitiesUpdate = omniPhysX.getISettings()->getAsBool(kSettingUpdateVelocitiesToUsd);
+    const OmniCachedSettings& settings = owner.getCachedSettings();
+    const bool outputVelocitiesLocalSpace = settings.outputVelocitiesLocalSpace;
+    const bool useUsdUpdate = settings.updateToUsd;
+    const bool useUsdVelocitiesUpdate = settings.updateVelocitiesToUsd;
 
-    waitForSimulationCompletion(false);
+    waitForSimulationCompletion(owner, false);
+    retireRuntimeExecution(owner.getAttachHandle());
 
-    UsdLoad::getUsdLoad()->blockUSDUpdate(true);
+    AttachedStage* attachedStage = &owner;
+    ScopedNoticeBlock blockNotices(*attachedStage);
 
-    cookingdataasync::CookingDataAsync* cookingDataAsync = omniPhysX.getPhysXSetup().getCookingDataAsync();
-    if (cookingDataAsync)
-    {
-        cookingDataAsync->blockUSDUpdate(true);
-    }
-
-    omni::physx::internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
-    if (!omniPhysX.getCachedSettings().disableResetOnStop && omniPhysX.getISettings()->getAsBool(kSettingResetOnStop))
+    omni::physx::internal::InternalPhysXDatabase& db = owner.getInternalPhysXDatabase();
+    if (!settings.disableResetOnStop && settings.resetOnStop)
         db.resetStartProperties(useUsdUpdate, useUsdVelocitiesUpdate, outputVelocitiesLocalSpace);
 
-    if (cookingDataAsync)
-    {
-        cookingDataAsync->blockUSDUpdate(false); // needs to be called before releasePhysicsObjects tears the cooking down
-    }
+    getPhysXUsdPhysicsInterface().enableObjectChangeNotifications(*attachedStage, false);  // do not send these notifications when the simulation is to end
+    UsdLoad::getUsdLoad()->releasePhysicsObjects(owner.getAttachHandle());
 
-    getPhysXUsdPhysicsInterface().enableObjectChangeNotifications(false);  // do not send these notifications when the simulation is to end
-    UsdLoad::getUsdLoad()->releasePhysicsObjects(UsdLoad::getUsdLoad()->getActiveStageId());
-    UsdLoad::getUsdLoad()->blockUSDUpdate(false);
-
-    omniPhysX.sendSimulationEvent(SimulationEvent::eStopped);
-    omniPhysX.setSimulationStarted(false);
-    omniPhysX.setSimulationRunning(false);
+    omniPhysX.sendSimulationEvent(SimulationEvent::eStopped, attachedStage->getAttachHandle());
+    owner.setSimulationStarted(false);
+    owner.setSimulationRunning(false);
 }
 
 static void readPersistentSettings()
@@ -255,6 +197,181 @@ void enableLogChannel(const omni::log::LogChannelData& channel, bool enable)
     }
 }
 
+// Process-lifetime identities, including across runtime shutdown/reinitialize.
+// Never recycle IDs: a removed subscription must not alias a later observer.
+static SubscriptionId nextRuntimeEventId()
+{
+    static std::atomic<SubscriptionId> next{ 0 };
+    SubscriptionId value = next.load(std::memory_order_relaxed);
+    while (value < kInvalidSubscriptionId)
+    {
+        if (next.compare_exchange_weak(value, value + 1, std::memory_order_relaxed))
+            return value;
+    }
+    return kInvalidSubscriptionId;
+}
+
+SubscriptionId OmniPhysX::addOnStepEventSubscription(AttachHandle attach, std::function<void(float, void*)> onUpdate,
+                                                    void* userData, bool preStep, int order)
+{
+    auto owner = UsdLoad::getUsdLoad()->acquireAttachment(attach);
+    if (!owner)
+        return kInvalidSubscriptionId;
+
+    if (!onUpdate)
+        return kInvalidSubscriptionId;
+    const SubscriptionId id = nextRuntimeEventId();
+    if (id != kInvalidSubscriptionId)
+    {
+        std::lock_guard<carb::tasking::MutexWrapper> lock(owner->eventMutex);
+        StepEventMap& subscriptions = preStep ? owner->preStepSubscriptions : owner->postStepSubscriptions;
+        subscriptions.emplace(std::make_pair(order, id), StepEventSub{ attach, onUpdate, userData });
+    }
+    return id;
+}
+
+void OmniPhysX::removeOnStepEventSubscription(SubscriptionId id)
+{
+    for (const auto& entry : UsdLoad::getUsdLoad()->getAttachedStages())
+    {
+        const auto& owner = entry.second;
+    std::lock_guard<carb::tasking::MutexWrapper> lock(owner->eventMutex);
+    for (StepEventMap* subscriptions : { &owner->preStepSubscriptions, &owner->postStepSubscriptions })
+    {
+        for (auto it = subscriptions->begin(); it != subscriptions->end(); ++it)
+        {
+            if (it->first.second == id)
+            {
+                subscriptions->erase(it);
+                break;
+            }
+        }
+    }
+    }
+}
+
+SubscriptionId OmniPhysX::addStatusEventSubscription(AttachHandle attach, std::function<void(SimulationStatusEvent, void*)> onEvent,
+                                                    void* userData)
+{
+    auto owner = UsdLoad::getUsdLoad()->acquireAttachment(attach);
+    if (!owner)
+        return kInvalidSubscriptionId;
+
+    if (!onEvent)
+        return kInvalidSubscriptionId;
+    const SubscriptionId id = nextRuntimeEventId();
+    if (id != kInvalidSubscriptionId)
+    {
+        std::lock_guard<carb::tasking::MutexWrapper> lock(owner->eventMutex);
+        owner->simulationSubscriptions.emplace(id, SimulationEventSub{ attach, onEvent, userData });
+    }
+    return id;
+}
+
+void OmniPhysX::removeStatusEventSubscription(SubscriptionId id)
+{
+    for (const auto& entry : UsdLoad::getUsdLoad()->getAttachedStages())
+    {
+        const auto& owner = entry.second;
+    std::lock_guard<carb::tasking::MutexWrapper> lock(owner->eventMutex);
+    owner->simulationSubscriptions.erase(id);
+    }
+}
+
+void OmniPhysX::fireStatusEventSubscriptions(AttachHandle attach, SimulationStatusEvent eventStatus) const
+{
+    auto owner = UsdLoad::getUsdLoad()->acquireAttachment(attach);
+    if (!owner)
+        return ;
+
+    RuntimeCallbackScope callbackScope;
+    SimulationEventMap snapshot;
+    {
+        std::lock_guard<carb::tasking::MutexWrapper> lock(owner->eventMutex);
+        snapshot = owner->simulationSubscriptions;
+    }
+    for (const SimulationEventMap::value_type& entry : snapshot)
+    {
+        if (entry.second.attach != attach)
+            continue;
+        {
+            std::lock_guard<carb::tasking::MutexWrapper> lock(owner->eventMutex);
+            if (owner->simulationSubscriptions.find(entry.first) == owner->simulationSubscriptions.end())
+                continue;
+        }
+        try { entry.second.eventFn(eventStatus, entry.second.userData); }
+        catch (const std::exception& e) { CARB_LOG_ERROR("Physics status callback threw: %s", e.what()); }
+        catch (...) { CARB_LOG_ERROR("Physics status callback threw an unknown exception"); }
+    }
+}
+
+void OmniPhysX::retireEventSubscriptions(usdparser::AttachedStage& attachedStage)
+{
+    auto* owner = &attachedStage;
+    const auto attach = owner->getAttachHandle();
+
+    getTriggerManager()->retireSubscriptions(attach);
+    std::lock_guard<carb::tasking::MutexWrapper> lock(owner->eventMutex);
+    for (StepEventMap* subscriptions : { &owner->preStepSubscriptions, &owner->postStepSubscriptions })
+    {
+        for (auto it = subscriptions->begin(); it != subscriptions->end();)
+            it = it->second.attach == attach ? subscriptions->erase(it) : std::next(it);
+    }
+    for (auto it = owner->simulationSubscriptions.begin(); it != owner->simulationSubscriptions.end();)
+        it = it->second.attach == attach ? owner->simulationSubscriptions.erase(it) : std::next(it);
+}
+
+SubscriptionId OmniPhysX::addProfileStatsSubscription(ProfileStatsNotificationFn onEvent, void* userData)
+{
+    if (!onEvent)
+        return kInvalidSubscriptionId;
+    const SubscriptionId id = nextRuntimeEventId();
+    if (id != kInvalidSubscriptionId)
+    {
+        std::lock_guard<carb::tasking::MutexWrapper> lock(mEventSubscriptionsMutex);
+        mProfileStatsSubscriptions.emplace(id, std::make_pair(onEvent, userData));
+    }
+    return id;
+}
+
+void OmniPhysX::removeProfileStatsSubscription(SubscriptionId id)
+{
+    std::lock_guard<carb::tasking::MutexWrapper> lock(mEventSubscriptionsMutex);
+    mProfileStatsSubscriptions.erase(id);
+}
+
+void OmniPhysX::fireProfileStatsSubscription()
+{
+    if (!mEnableProfile)
+        return;
+    RuntimeCallbackScope callbackScope;
+    ProfileEventMap snapshot;
+    {
+        std::lock_guard<carb::tasking::MutexWrapper> lock(mEventSubscriptionsMutex);
+        snapshot = mProfileStatsSubscriptions;
+    }
+    if (snapshot.empty())
+        return;
+    ProfileStatsVector stats;
+    {
+        std::lock_guard<carb::tasking::MutexWrapper> lock(profileMutex);
+        stats.swap(mProfileStats);
+    }
+    if (stats.empty())
+        return;
+    for (const ProfileEventMap::value_type& entry : snapshot)
+    {
+        {
+            std::lock_guard<carb::tasking::MutexWrapper> lock(mEventSubscriptionsMutex);
+            if (mProfileStatsSubscriptions.find(entry.first) == mProfileStatsSubscriptions.end())
+                continue;
+        }
+        try { entry.second.first(stats, entry.second.second); }
+        catch (const std::exception& e) { CARB_LOG_ERROR("Physics profile callback threw: %s", e.what()); }
+        catch (...) { CARB_LOG_ERROR("Physics profile callback threw an unknown exception"); }
+    }
+}
+
 void OmniPhysX::onStartup()
 {
     gOmniPhysXInstance = this;
@@ -266,6 +383,7 @@ void OmniPhysX::onStartup()
     mIDictionary = carb::getCachedInterface<carb::dictionary::IDictionary>();
 
     mITasking = carb::getCachedInterface<carb::tasking::ITasking>();
+    mUsdPhysicsInterface = std::make_shared<PhysXUsdPhysicsInterface>();
 
     mISettings = carb::getCachedInterface<carb::settings::ISettings>();
     PhysXSettings::getInstance().setDefaults();
@@ -278,7 +396,6 @@ void OmniPhysX::onStartup()
     mCustomJointManager = new PhysXCustomJointManager();
     mCustomGeometryManager = new PhysXCustomGeometryManager();
     mPropertyQueryManager = new PhysXPropertyQueryManager();
-    mRaycastManager = new RaycastManager();
 
     // Skip loading the CUDA driver library on CPU-only machines so isCudaLibPresent()
     // correctly returns false when the foundation's device probe forced CPU mode.
@@ -299,63 +416,61 @@ void OmniPhysX::onStartup()
     mPhysXSetup.createPhysics();
     getPhysXUsdPhysicsInterface().setExposePrimNames(mISettings->getAsBool(kSettingExposePrimPathNames));
 
-    // Registers custom tokens with the parse-lib's process-wide registry
-    // (`omni::physics::usd::register*Token`) so they're visible to every
-    // subsequent `scanStage` call.
-    static const TfToken oldConvexPrim("ConvexMesh");
-    static const TfToken planePrim("Plane");
-    static const TfToken gearJointPrim("PhysxPhysicsGearJoint");
-    static const TfToken rackJointPrim("PhysxPhysicsRackAndPinionJoint");
-    static const TfToken physicsJointInstancerPrim("PhysxPhysicsJointInstancer");
-    static const TfToken meshMergingCollisionAPI("PhysxMeshMergeCollisionAPI");
-    omni::physics::usd::registerCustomShapeToken(oldConvexPrim);
-    omni::physics::usd::registerCustomShapeToken(planePrim);
-    omni::physics::usd::registerCustomShapeToken(meshMergingCollisionAPI);
-    omni::physics::usd::registerCustomJointToken(gearJointPrim);
-    omni::physics::usd::registerCustomJointToken(rackJointPrim);
-    omni::physics::usd::registerCustomPhysicsInstancerToken(physicsJointInstancerPrim);
-
-    auto uniqueSubscriptionIdGenerator = []() -> omni::physx::SubscriptionId {
-        static omni::physx::SubscriptionId nextId = 0;
-        return nextId++;
-    };
-    // Having a shared id generator for both pre-step and post-step simulation event registries allows us to
-    // simplify the API so the user can unsubscribe(id) instead of having to specify unsubscribe(id, pre_map)
-    mPreStepSubscriptions.setIdGenerator(uniqueSubscriptionIdGenerator);
-    mPostStepSubscriptions.setIdGenerator(uniqueSubscriptionIdGenerator);
+    // Registers custom tokens with the parse-lib's process-wide, source-agnostic registry
+    // (omni/physics/parse/CustomTokens.h) so they are visible to every subsequent scan.
+    // These six are also pre-seeded by the registry's own constructor, making this an
+    // idempotent no-op -- kept as the runtime's own public registration surface.
+    using omni::physics::parse::CustomTokenKind;
+    omni::physics::parse::registerCustomToken(CustomTokenKind::eShape, "ConvexMesh");
+    omni::physics::parse::registerCustomToken(CustomTokenKind::eShape, "Plane");
+    omni::physics::parse::registerCustomToken(CustomTokenKind::eShape, "PhysxMeshMergeCollisionAPI");
+    omni::physics::parse::registerCustomToken(CustomTokenKind::eJoint, "PhysxPhysicsGearJoint");
+    omni::physics::parse::registerCustomToken(CustomTokenKind::eJoint, "PhysxPhysicsRackAndPinionJoint");
+    omni::physics::parse::registerCustomToken(CustomTokenKind::ePhysicsInstancer, "PhysxPhysicsJointInstancer");
 
     enableLogChannel(kRoboticsLogChannel, mISettings->getAsBool(kSettingLogRobotics));
     enableLogChannel(kSceneMultiGPULogChannel, mISettings->getAsBool(kSettingLogSceneMultiGPU));
     subscribeToSettingsChangeEvents();
+    mPhysXSetup.subscribeToSettingsChangeEvents();
 
-    createInternalPhysXDatabase();
     mWasStarted = true;
 
-    createInternalPhysXDatabase();
+}
+
+namespace omni::physx::ovx
+{
+// Defined in OvxPhysicsRead.cpp. Drains the read-column pool before CUDA/foundation teardown.
+void ovxDrainColumnPools();
 }
 
 void OmniPhysX::onShutdown()
 {
     mWasStarted = false;
     unsubscribeFromSettingsChangeEvents();
-    if (UsdLoad::getUsdLoad()->getActiveAttachedStage())
+    // This object is not destroyed by shutdown (only unregistered as the instance below), so
+    // ~PhysXSetup() never releases these. carb.settings would keep dispatching to the retired setup
+    // after a restart, or into unloaded code once the hosting module is gone (OMPE-112612).
+    mPhysXSetup.unsubscribeFromSettingsChangeEvents();
+    while (!UsdLoad::getUsdLoad()->getAttachedStages().empty())
     {
-        CARB_LOG_WARN("USD stage detach not called, holding a loose ptr to a stage!");
-        physXDetach();
+        const AttachHandle attach = UsdLoad::getUsdLoad()->getAttachedStages().begin()->first;
+        if (!physXDetach(attach))
+            throw std::runtime_error("Could not retire attachment during runtime shutdown");
     }
-
     releasePhysXScenes();
 
-    clearDebugVisualizationData();
     releaseMeshCache();
+
+    // Free the read-column pool's device/pinned buffers and drop its manager references while the CUDA
+    // context managers are still alive -- releasePhysics() below destroys them. Without this the pool's
+    // only drain is the next read's stale sweep, so a detach + shutdown with no later read leaks them
+    // across CUDA teardown.
+    ovx::ovxDrainColumnPools();
 
     mPhysXSetup.releasePhysics();
 
     getTriggerManager()->release();
 
-    mPostStepSubscriptions.clear();
-    mPreStepSubscriptions.clear();
-    mSimulationSubscriptions.clear();
 
     UsdLoad::releaseUsdLoad();
 
@@ -363,13 +478,13 @@ void OmniPhysX::onShutdown()
     delete mCustomJointManager;
     delete mCustomGeometryManager;
     delete mPropertyQueryManager;
-    delete mRaycastManager;
 
     mReplicatorMap.clear();
 
     mSimulationEventStreamV2 = nullptr;
     mErrorEventStream = nullptr;
 
+    mUsdPhysicsInterface.reset();
     mIDictionary = nullptr;
     mITasking = nullptr;
     mISettings = nullptr;
@@ -445,7 +560,6 @@ void OmniPhysX::subscribeToSettingsChangeEvents()
             // is NOT re-applied here so an explicit 0 is distinguishable from an absent setting.
             const float gizmoScaleSetting = dict->getAsFloat(changedItem);
             omniPhysX.mCachedSettings.viewportGizmoScale = gizmoScaleSetting;
-            omniPhysX.setDebugVisualizationDirty(true);
         },
         nullptr);
     // Default an UNSET viewport gizmo scale to 1.0 so debug-viz eSCALE (= viewportGizmoScale *
@@ -525,6 +639,45 @@ void OmniPhysX::subscribeToSettingsChangeEvents()
     mSubscribedSettings.push_back(subID);
 
     subID = mISettings->subscribeToNodeChangeEvents(
+        kSettingOverrideGPU,
+        [](const carb::dictionary::Item* changedItem, carb::dictionary::ChangeEventType, void*) {
+            carb::dictionary::IDictionary* dict = carb::getCachedInterface<carb::dictionary::IDictionary>();
+            OmniPhysX::getInstance().getCachedSettings().gpuPipelineOverride = dict->getAsInt(changedItem);
+        },
+        nullptr);
+    mCachedSettings.gpuPipelineOverride = mISettings->getAsInt(kSettingOverrideGPU);
+    mSubscribedSettings.push_back(subID);
+    subID = mISettings->subscribeToNodeChangeEvents(
+        kSettingSuppressReadback,
+        [](const carb::dictionary::Item* changedItem, carb::dictionary::ChangeEventType, void*) {
+            carb::dictionary::IDictionary* dict = carb::getCachedInterface<carb::dictionary::IDictionary>();
+            OmniPhysX::getInstance().getCachedSettings().suppressReadback = dict->getAsBool(changedItem);
+        },
+        nullptr);
+    mCachedSettings.suppressReadback = mISettings->getAsBool(kSettingSuppressReadback);
+    mSubscribedSettings.push_back(subID);
+
+    subID = mISettings->subscribeToNodeChangeEvents(
+        kSettingReplicatorEnvIdsOnAttach,
+        [](const carb::dictionary::Item* changedItem, carb::dictionary::ChangeEventType, void*) {
+            carb::dictionary::IDictionary* dict = carb::getCachedInterface<carb::dictionary::IDictionary>();
+            OmniPhysX::getInstance().getCachedSettings().replicatorEnvIdsOnAttach = dict->getAsBool(changedItem);
+        },
+        nullptr);
+    mCachedSettings.replicatorEnvIdsOnAttach = mISettings->getAsBool(kSettingReplicatorEnvIdsOnAttach);
+    mSubscribedSettings.push_back(subID);
+
+    subID = mISettings->subscribeToNodeChangeEvents(
+        kSettingResetOnStop,
+        [](const carb::dictionary::Item* changedItem, carb::dictionary::ChangeEventType eventType, void*) {
+            carb::dictionary::IDictionary* dict = carb::getCachedInterface<carb::dictionary::IDictionary>();
+            OmniPhysX::getInstance().getCachedSettings().resetOnStop = dict->getAsBool(changedItem);
+        },
+        nullptr);
+    mCachedSettings.resetOnStop = mISettings->getAsBool(kSettingResetOnStop);
+    mSubscribedSettings.push_back(subID);
+
+    subID = mISettings->subscribeToNodeChangeEvents(
         kSettingMinFrameRate,
         [](const carb::dictionary::Item* changedItem, carb::dictionary::ChangeEventType eventType, void* userData) {
             OmniPhysX& omniPhysX = OmniPhysX::getInstance();
@@ -581,18 +734,6 @@ void OmniPhysX::subscribeToSettingsChangeEvents()
     mSubscribedSettings.push_back(subID);
 
     subID = mISettings->subscribeToNodeChangeEvents(
-        kSettingDefaultSimulator,
-        [](const carb::dictionary::Item* changedItem, carb::dictionary::ChangeEventType eventType, void* userData) {
-            OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-            carb::dictionary::IDictionary* dict = carb::getCachedInterface<carb::dictionary::IDictionary>();
-            omniPhysX.mCachedSettings.defaultSimulator = dict->get<std::string>(changedItem);
-            UsdLoad::getUsdLoad()->changeDefaultSimulator(omniPhysX.mCachedSettings.defaultSimulator);
-        },
-        nullptr);
-    mCachedSettings.defaultSimulator = mISettings->getStringBuffer(kSettingDefaultSimulator);
-    mSubscribedSettings.push_back(subID);
-
-    subID = mISettings->subscribeToNodeChangeEvents(
         kSettingEnableExtendedJointAngles,
         [](const carb::dictionary::Item* changedItem, carb::dictionary::ChangeEventType eventType, void* userData) {
             OmniPhysX& omniPhysX = OmniPhysX::getInstance();
@@ -636,39 +777,30 @@ void OmniPhysX::unsubscribeFromSettingsChangeEvents()
     mSubscribedSettings.clear();
 }
 
-bool OmniPhysX::registerReplicator(uint64_t id, const IReplicatorCallback& callback)
+std::shared_ptr<PhysXReplicator> OmniPhysX::getReplicator(AttachHandle attachHandle)
 {
-    AttachedStage* stage = UsdLoad::getUsdLoad()->getAttachedStage(id);
-    if (stage)
-    {
-        stage->setReplicatorStage(true);
-    }
+    std::lock_guard<carb::tasking::MutexWrapper> lock(mReplicatorMutex);
+    auto fit = mReplicatorMap.find(attachHandle);
+    return fit != mReplicatorMap.end() ? fit->second : nullptr;
+}
 
-    // insert_or_assign, not insert: the latest registrant's callbacks must win. A plain
-    // insert is a silent no-op when the stage is already registered, so a caller's
-    // callbacks would be dropped while the call still reported success. Safe to replace:
-    // PhysXReplicator holds no PhysX state between register and replicate.
-    const bool inserted = mReplicatorMap.insert_or_assign(id, PhysXReplicator(callback)).second;
-    if (!inserted)
-    {
-        CARB_LOG_INFO("registerReplicator: replaced existing replicator registration for stage %llu",
-                      static_cast<unsigned long long>(id));
-    }
+bool OmniPhysX::registerReplicator(AttachHandle attachHandle, const IReplicatorCallback& callback)
+{
+    AttachedStage* stage = UsdLoad::getUsdLoad()->getAttachedStageByHandle(attachHandle);
+    if (!stage)
+        return false;
+    std::lock_guard<carb::tasking::MutexWrapper> lock(mReplicatorMutex);
+    mReplicatorMap.insert_or_assign(attachHandle, std::make_shared<PhysXReplicator>(callback));
     return true;
 }
 
-void OmniPhysX::unregisterReplicator(uint64_t id)
+void OmniPhysX::unregisterReplicator(AttachHandle attachHandle)
 {
-    ReplicatorMap::iterator fit = mReplicatorMap.find(id);
-    if (fit != mReplicatorMap.end())
+    ReplicatorMap::node_type retired;
     {
-        fit->second.clear();
-        mReplicatorMap.erase(fit);
-
-        AttachedStage* stage = UsdLoad::getUsdLoad()->getAttachedStage(id);
-        if (stage)
-        {
-            stage->setReplicatorStage(false);
-        }
+        std::lock_guard<carb::tasking::MutexWrapper> lock(mReplicatorMutex);
+        retired = mReplicatorMap.extract(attachHandle);
+        if (!retired.empty())
+            retired.mapped()->cancel();
     }
 }

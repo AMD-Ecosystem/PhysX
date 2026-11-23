@@ -1,11 +1,11 @@
 :: SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 :: SPDX-License-Identifier: Apache-2.0
-:: pad [xxxx]
+:: pad [x]
 @call :ECHO_AND_RESET_ERROR
 
-set PM_PACKMAN_VERSION=8.5.0
-set PM_PYTHON_VERSION=3.12.13-nv6-windows-x86_64
-set PM_PACKMAN_COMMON_SHA256=be14504cef37be569fea949fe7c778963841b63fdf459d9b25d8a99a0570caf3
+set PM_PACKMAN_VERSION=8.7.0
+set PM_PYTHON_VERSION=3.12.15-nv1-pf-windows-x86_64
+set PM_PACKMAN_COMMON_SHA256=d6c75a6112b9c341b6f024bef3e141ac24287f20746956860365df103b9a3faa
 
 :: Optional configuration for local dev
 call :CONFIGURE

@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
 """Pytest configuration for PhysX tests.
 
@@ -7,7 +7,7 @@ Provides a session-scoped shared PhysX GPU instance for test isolation.
 Carbonite and the embedded Python interpreter cannot be cleanly finalized and
 re-initialized in the same process (DLL/SO init routines fail on reload), so a
 single long-lived instance is created once per pytest session and reused across
-all tests.  Simulation state is reset between tests via ``PhysX.reset_stage()`` +
+all tests.  Simulation state is reset between tests via ``PhysX.detach_ovstage()`` +
 ``PhysX.wait_all()`` to provide per-test isolation without the costly
 destroy/recreate cycle.
 
@@ -24,6 +24,112 @@ from collections import defaultdict
 from datetime import datetime
 
 import pytest
+
+# Re-arms the hung-test watchdog after a failure (REQ-PACKAGING-TESTHANG-001 AC-4).
+pytest_plugins = ("_watchdog_rearm",)
+
+# Exercise the application-side schema recipe, including fresh subprocesses.
+_schema_samples = os.path.join(os.path.dirname(__file__), "..", "python_samples")
+sys.path.insert(0, _schema_samples)
+os.environ["PYTHONPATH"] = _schema_samples + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+
+# Tensor-binding deprecation (REQ-CAPI-WRITE-001 AC-11): the compat window keeps the deprecated API
+# working, and pyproject's filterwarnings turns its DeprecationWarning into an ERROR so any NEW test
+# reaching for the deprecated binding API fails loudly instead of being swept under a suite-wide
+# ignore. These files are the known inventory of callers that still exercise it on purpose; each is
+# re-granted a local `ignore` below. Drop a file when it migrates to the session read/write API.
+# An empty set means the migration is complete.
+_TENSOR_BINDING_COMPAT_FILES = frozenset(
+    {
+        "test_api_surface.py",
+        "test_clone_prebinding_gpu.py",
+        "test_cross_device_staging_gpu.py",
+        "test_deformable_tensor_bindings_gpu.py",
+        "test_dlpack_cache_shutdown.py",
+        "test_embedded_nul_paths.py",
+        "test_gpu_cache_staleness.py",
+        "test_gpu_lifecycle_advanced.py",
+        "test_lifecycle.py",
+        "test_pattern_component_length.py",
+        "test_rigid_body_tensors_gpu.py",
+        "test_shape_tensor_bindings.py",
+        "test_tensor_binding_cache.py",
+        "test_tensor_binding_deprecation.py",
+        "test_tensor_binding_handle_isolation.py",
+        "test_tensor_binding_mask.py",
+        "test_tensor_binding_prim_paths.py",
+        "test_tensor_bindings.py",
+        "test_tensor_bindings_api.py",
+        "test_tensor_bindings_api_gpu.py",
+        "test_tensor_type_rw_semantics.py",
+        "test_tensor_warp_smoke.py",
+        "test_tensor_warp_smoke_gpu.py",
+    }
+)
+
+
+_SCENE_QUERY_COMPAT_FILES = frozenset(
+    {
+        "test_scene_query.py",
+        "test_scene_query_advanced.py",
+        "test_scene_query_gpu.py",
+        "test_embedded_nul_paths.py",
+        "test_pattern_component_length.py",
+    }
+)
+_CONTACT_BINDING_COMPAT_FILES = frozenset(
+    {
+        "test_tensor_bindings_api.py",
+        "test_tensor_bindings_api_gpu.py",
+        "test_contact_binding_advanced.py",
+        "test_pattern_component_length.py",
+        "test_embedded_nul_paths.py",
+        "test_clone_prebinding_gpu.py",
+        "test_gpu_lifecycle_advanced.py",
+        "test_lifecycle.py",
+        "test_deformable_tensor_bindings_gpu.py",
+        "test_tensor_warp_smoke_gpu.py",
+    }
+)
+_SDF_VIEW_COMPAT_FILES = frozenset(
+    {
+        "test_sdf_view_lifecycle_gpu.py",
+        "test_sdf_view_handle_isolation.py",
+        "test_pattern_component_length.py",
+        "test_gpu_lifecycle_advanced.py",
+        "test_lifecycle.py",
+    }
+)
+_OBJECT_TYPE_COMPAT_FILES = frozenset(
+    {
+        "test_object_type_joint.py",
+        "test_embedded_nul_paths.py",
+        "test_tensor_bindings_api.py",
+        "test_tensor_bindings_api_gpu.py",
+        "test_api_surface.py",
+    }
+)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Ignore known-compat DeprecationWarnings only for inventory callers.
+
+    pyproject turns those warnings into errors. A per-item filterwarnings marker
+    takes precedence over the ini filter.
+    """
+    markers = (
+        (_TENSOR_BINDING_COMPAT_FILES, "ignore:ovphysx tensor bindings are deprecated:DeprecationWarning"),
+        (_SCENE_QUERY_COMPAT_FILES, "ignore:ovphysx scene queries are deprecated:DeprecationWarning"),
+        (_CONTACT_BINDING_COMPAT_FILES, "ignore:ovphysx contact bindings are deprecated:DeprecationWarning"),
+        (_SDF_VIEW_COMPAT_FILES, "ignore:ovphysx SDF views are deprecated:DeprecationWarning"),
+        (_OBJECT_TYPE_COMPAT_FILES, "ignore:ovphysx object-type lookup is deprecated:DeprecationWarning"),
+    )
+    for item in items:
+        name = os.path.basename(str(getattr(item, "path", None) or item.fspath))
+        for files, expr in markers:
+            if name in files:
+                item.add_marker(pytest.mark.filterwarnings(expr))
 
 
 def _get_pkg_dir():
@@ -130,6 +236,11 @@ def pytest_configure(config):
 
 DETAILED_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "detailed_log.txt")
 
+
+def _lifecycle_subprocess_mode():
+    """Lifecycle tests run one file per subprocess, often concurrently."""
+    return os.environ.get("OVPHYSX_LIFECYCLE_SUBPROCESS") == "1"
+
 ERROR_MARKERS = (
     # "[Error]",
     # "Runtime Error:",
@@ -140,10 +251,12 @@ ERROR_MARKERS = (
 )
 
 # ---------------------------------------------------------------------------
-# Native log capture: route Carbonite CARB_LOG_* messages into a list so that
-# ERROR_MARKERS can detect warnings/errors from the C++ runtime.
-# A raw C-level callback is registered at session start; the makereport hook
-# checks the collected records after each test.
+# Native log capture: retain Carbonite WARNING/ERROR messages so that
+# ERROR_MARKERS can detect warnings/errors from the C++ runtime. The autouse
+# fixture below uses the sole raw callback slot while it remains available and
+# a test-only logging handler while enable_python_logging() owns that slot.
+# Tests that install another raw callback must wrap it with
+# native_log_callback_factory so marker forwarding cannot be omitted.
 # ---------------------------------------------------------------------------
 _native_log_records: list = []
 
@@ -164,6 +277,8 @@ def _first_error_marker(output: str):
 
 
 def _append_detailed_log(lines):
+    if _lifecycle_subprocess_mode():
+        return
     with open(DETAILED_LOG_PATH, "a", encoding="utf-8") as log_file:
         for line in lines:
             log_file.write(f"{line}\n")
@@ -174,11 +289,11 @@ def pytest_sessionstart(session):
     _session_start_time = datetime.now()
     _test_results = {}
 
-    if os.path.exists(DETAILED_LOG_PATH):
+    if not _lifecycle_subprocess_mode() and os.path.exists(DETAILED_LOG_PATH):
         os.remove(DETAILED_LOG_PATH)
 
-    # Native log callback registration is deferred to the _register_native_log_callback
-    # fixture (below) because Carbonite must be initialized first (requires a PhysX instance).
+    # Per-test native marker capture is installed by the autouse
+    # _capture_native_log_markers fixture below.
 
 
 def pytest_runtest_logstart(nodeid, location):
@@ -234,7 +349,9 @@ def pytest_runtest_makereport(item, call):
         combined_output += report.capstdout
     if report.capstderr:
         combined_output += report.capstderr
-    # Include native Carbonite log messages captured via enable_python_logging()
+    if getattr(report, "caplog", ""):
+        combined_output += report.caplog
+    # Include native Carbonite messages captured through either callback path.
     if _native_log_records:
         combined_output += "\n".join(_native_log_records)
 
@@ -538,39 +655,102 @@ def pytest_sessionfinish(session, exitstatus):
     _append_detailed_log(summary_lines)
 
 
-_native_log_cb_registered = False
-_conftest_native_log_cb = None  # prevent GC of the ctypes callback
-
-
 @pytest.fixture(autouse=True)
-def _register_native_log_callback():
-    """Register Carbonite log callback once Carbonite is initialized.
+def _capture_native_log_markers():
+    """Provide best-effort native WARNING/ERROR capture for each test.
 
-    This autouse fixture ensures that native CARB_LOG_* messages are captured
-    into _native_log_records for ERROR_MARKERS detection.  Registration is
-    deferred to test time (not session start) because Carbonite must be
-    initialized first — which only happens when a PhysX instance is created.
+    The raw callback covers tests that leave the sole native slot alone. Tests
+    using enable_python_logging() replace that callback, so a logging handler
+    on the ``ovphysx`` hierarchy forwards those native bridge records instead.
+    Import-only environments may not have a loadable native library, and tests
+    installing arbitrary raw callbacks must use native_log_callback_factory.
 
-    Uses ovphysx_register_log_callback directly (not enable_python_logging)
+    Uses ovphysx_set_log_callback directly (not enable_python_logging)
     to avoid interfering with tests that assert on the Python bridge state.
     """
-    global _native_log_cb_registered, _conftest_native_log_cb
-    if _native_log_cb_registered:
-        return
-    try:
-        from ovphysx._bindings import _lib, ovphysx_log_fn
+    class NativeBridgeMarkerHandler(logging.Handler):
+        def emit(self, record):
+            if not hasattr(record, "ovphysx_channel") or not hasattr(record, "ovphysx_timestamp"):
+                return
+            _native_log_records.append(record.getMessage())
 
-        @ovphysx_log_fn
-        def _cb(level, message, user_data):
-            text = message.decode("utf-8", errors="replace") if message else ""
-            if level >= 2:  # WARNING or above
+    bridge_handler = NativeBridgeMarkerHandler(level=logging.WARNING)
+    bridge_logger = logging.getLogger("ovphysx")
+    bridge_logger.addHandler(bridge_handler)
+    callback = None
+    try:
+        import ctypes
+        from ovphysx._bindings import _lib, ovphysx_log_callback_t
+        from ovphysx.types import LogLevel
+
+        @ovphysx_log_callback_t
+        def _cb(level, message, channel, timestamp, user_data):
+            text = ctypes.string_at(message.ptr, message.length).decode("utf-8", errors="replace")
+            if level >= LogLevel.WARNING:
                 _native_log_records.append(text)
 
-        _conftest_native_log_cb = _cb
-        _lib.ovphysx_register_log_callback(_cb, None)
-        _native_log_cb_registered = True
+        callback = _cb
+        _lib.ovphysx_set_log_callback(LogLevel.VERBOSE, None, ctypes.cast(_cb, ctypes.c_void_p), None)
     except Exception:
         pass
+    yield
+    if callback is not None:
+        try:
+            _lib.ovphysx_set_log_callback(LogLevel.DEFAULT, None, None, None)
+        except Exception:
+            pass
+    bridge_logger.removeHandler(bridge_handler)
+
+
+@pytest.fixture
+def native_log_callback_factory():
+    """Wrap a raw callback so native warning/error marker capture stays active."""
+    import ctypes
+
+    from ovphysx._bindings import ovphysx_log_callback_t
+    from ovphysx.types import LogLevel
+
+    live_callbacks = []
+
+    def wrap(callback):
+        @ovphysx_log_callback_t
+        def forwarding_callback(level, message, channel, timestamp, user_data):
+            text = ctypes.string_at(message.ptr, message.length).decode("utf-8", errors="replace")
+            if level >= LogLevel.WARNING:
+                _native_log_records.append(text)
+            callback(level, message, channel, timestamp, user_data)
+
+        live_callbacks.append(forwarding_callback)
+        return forwarding_callback
+
+    return wrap
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _test_execution_mode():
+    """Apply OVPHYSX_TEST_EXECUTION ("queue" or "noworker") before this process creates an instance.
+
+    The library reads no environment for it. "queue" reaches its private test hook here, so a
+    run covers the queued path of short calls the tests make on an idle instance; "noworker"
+    creates every instance without a worker thread (``GlobalConfigKey.ASYNC_EXECUTION``).
+    """
+    mode = os.environ.get("OVPHYSX_TEST_EXECUTION")
+    if not mode:
+        return
+    if mode == "noworker":
+        from ovphysx import GlobalConfigKey, set_global_config
+
+        set_global_config(GlobalConfigKey.ASYNC_EXECUTION, False)
+        return
+    import ctypes
+
+    from ovphysx import _bindings
+
+    hook = _bindings._lib["ovphysx_set_test_execution_for_test_internal"]
+    hook.argtypes = [ctypes.c_int]
+    hook.restype = ctypes.c_bool
+    if not hook({"queue": 1}.get(mode, -1)):
+        pytest.exit(f"OVPHYSX_TEST_EXECUTION must be queue or noworker, got {mode}", returncode=1)
 
 
 @pytest.fixture(scope="session")
@@ -581,15 +761,15 @@ def _gpu_session_instance():
     re-initialized after destroy, so one long-lived instance avoids the
     problematic destroy/recreate cycle.
 
-    We intentionally do NOT call release() at session end — Carbonite
+    destroy() is intentionally NOT called at session end. Carbonite
     shutdown can hang when plugins fail to re-initialize during
     teardown.  The OS reclaims all resources when the process exits.
 
     The GPU tensor-binding tests rely on GPU-resident state, so this
     session opts into DirectGPU (PxSceneFlag::eENABLE_DIRECT_GPU_API).
-    Since 0.4.x ovphysx no longer auto-enables /physics/suppressReadback;
-    DirectGPU is workflow-specific (Isaac-Lab-style tensor pipelines)
-    and must be opted into explicitly via Carbonite settings.
+    ovphysx does not auto-enable /physics/suppressReadback. DirectGPU is
+    workflow-specific (Isaac-Lab-style tensor pipelines) and must be
+    opted into explicitly via Carbonite settings.
     """
     from ovphysx import PhysX, PhysXConfig
 
@@ -608,11 +788,11 @@ def _gpu_session_instance():
     except Exception:
         pass
     try:
-        physx.reset_stage()
+        physx.detach_ovstage()
         physx.wait_all()
     except RuntimeError:
         logging.getLogger(__name__).warning(
-            "physx session teardown: reset_stage() failed; process shutdown will reclaim remaining resources"
+            "physx session teardown: detach_ovstage() failed; process shutdown will reclaim remaining resources"
         )
 
 
@@ -624,30 +804,11 @@ def physx_sdk(_gpu_session_instance):
     (USD stages, bindings) after each test for isolation.
 
     Teardown is deliberately resilient: if a test leaves the instance
-    with failed pending operations (e.g. error-path tests), we drain
-    and reset on a best-effort basis to prevent cascading failures.
+    with failed pending operations (e.g. error-path tests), the teardown
+    drains and resets on a best-effort basis to prevent cascading failures.
+    A task failure the test left uncollected is reported once the instance is reset.
     """
+    from test_utils import reset_shared_instance
+
     yield _gpu_session_instance
-    try:
-        _gpu_session_instance.wait_all()
-    except RuntimeError:
-        pass
-    try:
-        from test_utils import destroy_ovstage_test_attachments
-
-        destroy_ovstage_test_attachments(_gpu_session_instance)
-    except Exception:
-        pass
-    try:
-        _gpu_session_instance.reset_stage()
-        _gpu_session_instance.wait_all()
-    except RuntimeError:
-        logging.getLogger(__name__).warning(
-            "physx_sdk teardown: reset_stage() failed — instance may be degraded for subsequent tests"
-        )
-    try:
-        from test_utils import destroy_ovstage_test_attachments
-
-        destroy_ovstage_test_attachments(_gpu_session_instance)
-    except Exception:
-        pass
+    reset_shared_instance(_gpu_session_instance)

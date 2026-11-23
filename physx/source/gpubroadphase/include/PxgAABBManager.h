@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef PXG_AABBMANAGER_H
 #define PXG_AABBMANAGER_H
@@ -100,13 +77,14 @@ namespace physx
 		virtual			bool				addBounds(Bp::BoundsIndex index, PxReal contactDistance, Bp::FilterGroup::Enum group, void* userData, Bp::AggregateHandle aggregateHandle, Bp::ElementType::Enum volumeType, PxU32 envID)	PX_OVERRIDE;
 		virtual			bool				removeBounds(Bp::BoundsIndex index)	PX_OVERRIDE;
 		virtual			void				updateBPFirstPass(PxU32 numCpuTasks, Cm::FlushPool& flushPool, bool hasContactDistanceUpdated, PxBaseTask* continuation)	PX_OVERRIDE;
-		virtual			void				updateBPSecondPass(PxcScratchAllocator* scratchAllocator, PxBaseTask* continuation)	PX_OVERRIDE;
+		virtual			void				updateBPSecondPass(PxU32 numCpuTasks, Cm::FlushPool& flushPool, PxcScratchAllocator* scratchAllocator, PxBaseTask* continuation)	PX_OVERRIDE;
 		virtual			void				postBroadPhase(PxBaseTask*, Cm::FlushPool& flushPool)	PX_OVERRIDE;
 		virtual			void				reallocateChangedAABBMgActorHandleMap(const PxU32 size)	PX_OVERRIDE;
 		virtual			void				visualize(PxRenderOutput& out)	PX_OVERRIDE;
 		virtual			void				releaseDeferredAggregateIds()	PX_OVERRIDE;
 		virtual			void				setGPUStateChanged()			PX_OVERRIDE	{ mGPUStateChanged = true;			}
 		virtual			void				setPersistentStateChanged()		PX_OVERRIDE	{ mPersistentStateChanged = true;	}
+		virtual			bool				isGPUManager()		const		PX_OVERRIDE	{ return true;						}
 		//~AABBManagerBase
 
 						void				markAggregateBoundsBitmap();
@@ -119,6 +97,7 @@ namespace physx
 		PX_FORCE_INLINE	CUdeviceptr			getRemovedHandles()					{ return mRemovedHandleBuf.getDevicePtr(); }
 		PX_FORCE_INLINE	CUdeviceptr			getChangedAABBMgrHandles()			{ return mChangedAABBMgrHandlesBuf.getDevicePtr(); }
 		PX_FORCE_INLINE	PxU32				getChangedAABBMgrHandlesWordCount()	{ return mChangedHandleMap.getWordCount(); }
+		PX_FORCE_INLINE	PxU32				getChangedAABBMgrHandlesDeviceWordCount()	{ return PxU32(mChangedAABBMgrHandlesBuf.getSize() / sizeof(PxU32)); }
 		PX_FORCE_INLINE CUdeviceptr			getVolumeData()						{ return mVolumeDataBuf.getDevicePtr(); }
 
 	private:
@@ -259,17 +238,29 @@ namespace physx
 			mChangesMapped.clear();
 		}
 
-		virtual void updateBounds(const PxTransform& transform, const PxGeometry& geom, PxU32 index, PxU32 indexFrom) PX_OVERRIDE PX_FINAL 
+		// Called at the insertion and re-insertion of an element, also when a re-insertion keeps the element ID. Changes of an inserted
+		// element, such as a local pose change, are marked with markForUpdate() instead.
+		// PxgSimulationController::mergeBoundsAndTransformsChanges() applies the marks at the start of the next simulation step.
+		// - isNew: the actor of the element is new, it has not been uploaded to the GPU yet, so the GPU has no pose of it. The bounds
+		//   are computed here from transform and geom and copied to the GPU together with the transform.
+		// - isDynamicRigidShape: the element is a shape of a rigid dynamic or an articulation link. If it is not new, its bounds and
+		//   transform are computed on the GPU from the pose of its actor there, as for markForUpdate(), because the CPU pose of a dynamic
+		//   rigid is not updated from the GPU. This way a shape attached or re-inserted after the actor moved on the GPU is placed there.
+		// Any other element is copied from the CPU.
+		virtual void updateBounds(const PxTransform& transform, const PxGeometry& geom, PxU32 index, bool isNew, bool isDynamicRigidShape) PX_OVERRIDE PX_FINAL
 		{
 			if(mAllocFailed)
 				return;
 
-			const bool isNew = indexFrom == index;
-
-			if(isNew) // new, needs to be copied from CPU
+			if(!isNew && isDynamicRigidShape)
+			{
+				updateChanges(index, PxgBoundTransformUpdate::eCOMPUTE_FROM_GPU_POSE);
+			}
+			else
+			{
 				Gu::computeBounds(mBounds[index], geom, transform, 0.0f, 1.0f);
-
-			updateChanges(index, indexFrom, isNew);
+				updateChanges(index, PxgBoundTransformUpdate::eCOPY_FROM_CPU);
+			}
 		}
  
 		virtual void setBounds(const PxBounds3& bounds, PxU32 index) PX_OVERRIDE PX_FINAL
@@ -278,7 +269,25 @@ namespace physx
 				return;
 
 			mBounds[index] = bounds;
-			updateChanges(index, index, true);
+			updateChanges(index, PxgBoundTransformUpdate::eCOPY_FROM_CPU);
+		}
+
+		// The copy is on the GPU. The shape of a dynamic rigid is computed there from the GPU pose of its actor, because the CPU
+		// pose of a dynamic rigid is not updated from the GPU.
+		virtual void markForUpdate(PxU32 index, bool isDynamicRigidShape) PX_OVERRIDE PX_FINAL
+		{
+			if(mAllocFailed)
+			{
+				return;
+			}
+
+			// An element added or re-inserted in this step already takes its current bounds and transform.
+			if(mChangeMap.find(index))
+			{
+				return;
+			}
+
+			updateChanges(index, isDynamicRigidShape ? PxgBoundTransformUpdate::eCOMPUTE_FROM_GPU_POSE : PxgBoundTransformUpdate::eCOPY_FROM_CPU);
 		}
 
 		PX_FORCE_INLINE PxU32 getNumberOfChanges() const
@@ -297,7 +306,7 @@ namespace physx
 			mChangeMap.clear();
 		}
 
-		PX_FORCE_INLINE bool isChangeTrackingEnabled() const
+		virtual bool isChangeTrackingEnabled() const PX_OVERRIDE PX_FINAL
 		{ 
 			return mEnableChangeTracking;
 		} 
@@ -339,22 +348,16 @@ namespace physx
 			return false;
 		}
 
-		PX_FORCE_INLINE void updateChanges(PxU32 indexTo, PxU32 indexFrom, bool isNew)
+		PX_FORCE_INLINE void updateChanges(PxU32 index, PxgBoundTransformUpdate::Kind kind)
 		{
 			PX_ASSERT(!mAllocFailed);
 			if(mEnableChangeTracking)
 			{
 				PxgBoundTransformUpdate update;
-				update.indexTo = indexTo;
-				update.indexFrom = indexFrom & 0x7FFFFFFF; 
-				if(isNew)
-				{
-					update.indexFrom |= (1U << 31);
-				}
+				update.index = (index & PxgBoundTransformUpdate::eINDEX_MASK) | kind;
 
-				//Uniquify indexTo changes, last one wins. We don't need to worry about chaining,
-				//because indices (elementIDs) are delay released, and are therefore unique during one update.
-				const PxHashMap<PxU32, PxU32>::Entry* e = mChangeMap.find(indexTo);
+				//Uniquify changes, last one wins.
+				const PxHashMap<PxU32, PxU32>::Entry* e = mChangeMap.find(index);
 				if(e)
 				{
 					PxgBoundTransformUpdate& oldUpdate = mChangesMapped[e->second];
@@ -362,9 +365,9 @@ namespace physx
 				}
 				else
 				{
-					// indexTo elementIDs definitely fit in mChanges, which is resized with bounds array
+					// elementIDs definitely fit in mChanges, which is resized with bounds array
 					PX_ASSERT(mChangesMapped.capacity() > mChangesMapped.size());
-					mChangeMap.insert(indexTo, mChangesMapped.size());
+					mChangeMap.insert(index, mChangesMapped.size());
 					mChangesMapped.pushBack(update);
 				}
 			}

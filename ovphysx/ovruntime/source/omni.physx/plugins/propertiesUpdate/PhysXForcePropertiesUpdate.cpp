@@ -1,22 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
-
-#include "UsdPCH.h"
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PhysXPropertiesUpdate.h"
+
+#include <omni/physics/parse/KnownTokens.h>
 
 #include <PhysXTools.h>
 #include <Setup.h>
 #include <OmniPhysX.h>
 #include <Raycast.h>
 #include <PhysXScene.h>
-#include <ContactReport.h>
 #include <usdInterface/UsdInterface.h>
 
 
 #include <usdLoad/LoadTools.h>
 #include <usdLoad/LoadUsd.h>
-#include <usdLoad/PhysicsBody.h>
 
 #include <carb/logging/Log.h>
 
@@ -27,7 +25,6 @@
 
 using namespace ::physx;
 using namespace carb;
-using namespace PXR_NS;
 using namespace omni::physx;
 using namespace omni::physx::usdparser;
 using namespace omni::physx::internal;
@@ -35,10 +32,9 @@ using namespace omni::physx::internal;
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 // force
 
-bool omni::physx::updatePhysxForceEnabled(AttachedStage& attachedStage, ObjectId objectId, const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+bool omni::physx::updatePhysxForceEnabled(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -57,10 +53,9 @@ bool omni::physx::updatePhysxForceEnabled(AttachedStage& attachedStage, ObjectId
     return true;
 }
 
-bool omni::physx::updatePhysxForceWorldFrameEnabled(AttachedStage& attachedStage, ObjectId objectId, const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+bool omni::physx::updatePhysxForceWorldFrameEnabled(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -79,10 +74,9 @@ bool omni::physx::updatePhysxForceWorldFrameEnabled(AttachedStage& attachedStage
     return true;
 }
 
-bool omni::physx::updatePhysxForce(AttachedStage& attachedStage, ObjectId objectId, const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+bool omni::physx::updatePhysxForce(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -91,8 +85,8 @@ bool omni::physx::updatePhysxForce(AttachedStage& attachedStage, ObjectId object
 
     if (objectRecord->mType == ePTForce)
     {
-        GfVec3f data;
-        if (!getValue<GfVec3f>(attachedStage, objectRecord->mKey, property, timeCode, data))
+        carb::Float3 data;
+        if (!getValue<carb::Float3>(attachedStage, objectRecord->mKey, property, timeCode, data))
             return true;
 
         InternalForce* force = reinterpret_cast<InternalForce*>(objectRecord->mInternalPtr);
@@ -101,10 +95,9 @@ bool omni::physx::updatePhysxForce(AttachedStage& attachedStage, ObjectId object
     return true;
 }
 
-bool omni::physx::updatePhysxTorque(AttachedStage& attachedStage, ObjectId objectId, const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+bool omni::physx::updatePhysxTorque(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -113,8 +106,8 @@ bool omni::physx::updatePhysxTorque(AttachedStage& attachedStage, ObjectId objec
 
     if (objectRecord->mType == ePTForce)
     {
-        GfVec3f data;
-        if (!getValue<GfVec3f>(attachedStage, objectRecord->mKey, property, timeCode, data))
+        carb::Float3 data;
+        if (!getValue<carb::Float3>(attachedStage, objectRecord->mKey, property, timeCode, data))
             return true;
 
         InternalForce* force = reinterpret_cast<InternalForce*>(objectRecord->mInternalPtr);
@@ -123,10 +116,9 @@ bool omni::physx::updatePhysxTorque(AttachedStage& attachedStage, ObjectId objec
     return true;
 }
 
-bool omni::physx::updatePhysxForceMode(AttachedStage& attachedStage, ObjectId objectId, const PXR_NS::TfToken& property, const PXR_NS::UsdTimeCode& timeCode)
+bool omni::physx::updatePhysxForceMode(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -135,12 +127,19 @@ bool omni::physx::updatePhysxForceMode(AttachedStage& attachedStage, ObjectId ob
 
     if (objectRecord->mType == ePTForce)
     {
-        TfToken data;
-        if (!getValue<TfToken>(attachedStage, objectRecord->mKey, property, timeCode, data))
+        const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+        if (!source)
             return true;
 
+        omni::physics::parse::TokenId data;
+        if (!source->getAttribute(objectRecord->mKey, property, data))
+            return true;
+
+        omni::physics::parse::KnownTokens tok;
+        tok.intern(*source);
+
         InternalForce* force = reinterpret_cast<InternalForce*>(objectRecord->mInternalPtr);
-        force->mAccelerationMode = data == PhysxSchemaTokens->acceleration ? true : false;
+        force->mAccelerationMode = (data == tok.acceleration);
     }
     return true;
 }

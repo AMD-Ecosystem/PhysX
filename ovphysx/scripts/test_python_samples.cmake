@@ -1,21 +1,39 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
-# ovphysx Python Sample Tests
+# ovphysx Python sample tests.
 # Runs all Python sample applications against the installed wheel.
 # Usage: cmake -P scripts/test_python_samples.cmake
 #
 # For wheel smoke tests (python -m ovphysx), see test_python_wheel.cmake.
 
-# Set up project paths
 get_filename_component(SCRIPT_DIR "${CMAKE_CURRENT_LIST_FILE}" DIRECTORY)
 get_filename_component(PROJECT_ROOT "${SCRIPT_DIR}/.." ABSOLUTE)
 include("${SCRIPT_DIR}/build_common.cmake")
+include("${SCRIPT_DIR}/dev_schema_provider.cmake")
+
+# The required workflow consumes the separate inspector installed by the build
+# job. A public standalone tree can explicitly supply its SDK installation.
+if(DEFINED ENV{OVPHYSX_OVD_INSPECTOR} AND NOT "$ENV{OVPHYSX_OVD_INSPECTOR}" STREQUAL "")
+    get_filename_component(OVD_INSPECTOR "$ENV{OVPHYSX_OVD_INSPECTOR}" ABSOLUTE
+        BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    if(NOT EXISTS "${OVD_INSPECTOR}")
+        message(FATAL_ERROR "OVPHYSX_OVD_INSPECTOR names a missing executable: ${OVD_INSPECTOR}. Set it to an installed SDK executable, or unset it to use the build's inspector.")
+    endif()
+else()
+    set(OVD_INSPECTOR "${BUILD_PATH}/ovd-inspector-install/bin/ovd-inspect")
+    if(WIN32)
+        string(APPEND OVD_INSPECTOR ".exe")
+    endif()
+endif()
+if(NOT EXISTS "${OVD_INSPECTOR}")
+    message(FATAL_ERROR "Required installed inspector missing: ${OVD_INSPECTOR}. Run cmake -DBUILD_DIR=\"${BUILD_PATH}\" -P scripts/build_ovd_inspector.cmake, or set OVPHYSX_OVD_INSPECTOR to an installed SDK executable.")
+endif()
 
 message(STATUS "")
 message(STATUS "=== Python Sample Applications ===")
 
-# Verify uv is available (required for venv creation and dependency management)
+# uv creates the venvs and manages the sample dependencies.
 execute_process(
     COMMAND "${OVPHYSX_UV_COMMAND}" --version
     OUTPUT_VARIABLE UV_VERSION
@@ -28,26 +46,26 @@ endif()
 string(STRIP "${UV_VERSION}" UV_VERSION)
 message(STATUS "Found uv: ${UV_VERSION}")
 
-set(UV_CACHE_DIR_PATH "${PROJECT_ROOT}/_build/.uv_cache")
+set(UV_CACHE_DIR_PATH "${BUILD_PATH}/.uv_cache")
+ovphysx_require_build_path("${UV_CACHE_DIR_PATH}")
+ovphysx_require_build_path("${BUILD_PATH}/pycache")
 file(MAKE_DIRECTORY "${UV_CACHE_DIR_PATH}")
-set(OVSTAGE_WHEEL_DIR "${PROJECT_ROOT}/_build/target-deps/ovstage_wheel")
-file(GLOB OVSTAGE_WHEELS "${OVSTAGE_WHEEL_DIR}/ovstage-*.whl")
-if(NOT OVSTAGE_WHEELS)
-    message(FATAL_ERROR "ovstage wheel not found in ${OVSTAGE_WHEEL_DIR}. Run the ovphysx build first.")
-endif()
+# ovstage is installed from its index (ADR-0033), not from a build-staged wheel dir.
+include("${CMAKE_CURRENT_LIST_DIR}/ovstage_index.cmake")
+ovphysx_ovstage_index_env(OVSTAGE_INDEX_ENV PACKAGE_ONLY)
 set(UV_ENV
     "UV_CACHE_DIR=${UV_CACHE_DIR_PATH}"
+    "PYTHONPYCACHEPREFIX=${BUILD_PATH}/pycache"
     "UV_NO_CONFIG=1"
-    "UV_FIND_LINKS=${OVSTAGE_WHEEL_DIR}"
+    ${OVSTAGE_INDEX_ENV}
     "UV_HTTP_TIMEOUT=300"
     "UV_SKIP_WHEEL_FILENAME_CHECK=1"
 )
 
-# Clean environment - samples should be self-contained with wheel
+# The samples must be self-contained with the wheel, so runtime hints from the environment are dropped.
 unset(ENV{LD_LIBRARY_PATH})
-unset(ENV{VIRTUAL_ENV}) # on windows CI, sometimes a system-wide venv is active
+unset(ENV{VIRTUAL_ENV}) # Windows CI sometimes has a system-wide venv active.
 
-# Check if SDK wheel exists
 file(GLOB WHEEL_FILES "${PROJECT_ROOT}/_dist/ovphysx-*.whl")
 if(NOT WHEEL_FILES)
     message(FATAL_ERROR "SDK wheel not found in ${PROJECT_ROOT}/_dist/. Run build_wheel.cmake first.")
@@ -66,9 +84,9 @@ set(PYTHON_VERSIONS
     "3.11"
     "3.12"
     "3.13"
-    # Python 3.14 is intentionally not in this matrix. It's a bleeding-edge alpha and
-    # third-party wheels (notably NumPy) may not be ABI-compatible yet, which would
-    # prevent meaningful end-to-end validation of the tensor samples on CI.
+    # Python 3.14 is intentionally not in this matrix. Third-party wheels (notably
+    # NumPy) may not be ABI-compatible with it yet, which would prevent meaningful
+    # end-to-end validation of the tensor samples on CI.
 )
 
 # ==============================================================================
@@ -76,10 +94,13 @@ set(PYTHON_VERSIONS
 # ==============================================================================
 
 # setup_sample_venv(<samples_dir> <py_ver>)
-# Creates a fresh venv, syncs pyproject.toml deps, installs the local wheel.
+# Creates a fresh venv, syncs the pyproject.toml deps, and installs the local wheel.
 # Requires UV_PYTHON_PATH to be set by the caller (via ensure_uv_managed_python).
 macro(setup_sample_venv SAMPLES_DIR PY_VER)
-    set(_VENV_DIR "${${SAMPLES_DIR}}/.venv")
+    file(RELATIVE_PATH _SAMPLE_RELATIVE_DIR "${PROJECT_ROOT}" "${${SAMPLES_DIR}}")
+    set(_VENV_DIR "${BUILD_PATH}/venv/${_SAMPLE_RELATIVE_DIR}/python-${${PY_VER}}")
+    ovphysx_require_build_path("${_VENV_DIR}")
+    set(_SAMPLE_UV_ENV ${UV_ENV} "UV_PROJECT_ENVIRONMENT=${_VENV_DIR}")
     message(STATUS "Creating fresh venv at ${_VENV_DIR} (Python ${${PY_VER}}: ${UV_PYTHON_PATH})...")
     file(REMOVE_RECURSE "${_VENV_DIR}")
     execute_process(
@@ -97,7 +118,7 @@ macro(setup_sample_venv SAMPLES_DIR PY_VER)
 
     message(STATUS "Syncing sample dependencies (pyproject.toml)")
     execute_process(
-        COMMAND ${CMAKE_COMMAND} -E env ${UV_ENV} "${OVPHYSX_UV_COMMAND}" sync --python ${_VENV_DIR} --no-install-project --no-install-package ovphysx
+        COMMAND ${CMAKE_COMMAND} -E env ${_SAMPLE_UV_ENV} "${OVPHYSX_UV_COMMAND}" sync --python ${_VENV_DIR} --no-install-project --no-install-package ovphysx
         WORKING_DIRECTORY "${${SAMPLES_DIR}}"
         RESULT_VARIABLE _SYNC_RESULT
     )
@@ -107,7 +128,7 @@ macro(setup_sample_venv SAMPLES_DIR PY_VER)
 
     message(STATUS "Installing locally built ovphysx wheel: ${SDK_WHEEL_PATH}")
     execute_process(
-        COMMAND ${CMAKE_COMMAND} -E env ${UV_ENV} "${OVPHYSX_UV_COMMAND}" pip install --reinstall --python ${_VENV_DIR} ${SDK_WHEEL_PATH}
+        COMMAND ${CMAKE_COMMAND} -E env ${_SAMPLE_UV_ENV} "${OVPHYSX_UV_COMMAND}" pip install --reinstall --python ${_VENV_DIR} ${SDK_WHEEL_PATH}
         WORKING_DIRECTORY "${${SAMPLES_DIR}}"
         RESULT_VARIABLE _INSTALL_RESULT
     )
@@ -119,13 +140,12 @@ endmacro()
 # run_python_samples(<samples_dir> <sample_list> <label>)
 # Runs each sample in the list.
 macro(run_python_samples SAMPLES_DIR SAMPLE_LIST LABEL)
-    set(_VENV_DIR "${${SAMPLES_DIR}}/.venv")
     foreach(_SAMPLE_NAME ${${SAMPLE_LIST}})
         set(_SAMPLE_PATH "${${SAMPLES_DIR}}/${_SAMPLE_NAME}")
         message(STATUS "  Running ${${LABEL}}${_SAMPLE_NAME}...")
 
         execute_process(
-            COMMAND ${CMAKE_COMMAND} -E env ${UV_ENV} PYTHONUNBUFFERED=1 "${OVPHYSX_UV_COMMAND}" run --python ${_VENV_DIR} --no-sync -- python ${_SAMPLE_PATH}
+            COMMAND ${CMAKE_COMMAND} -E env ${_SAMPLE_UV_ENV} PYTHONUNBUFFERED=1 "${OVPHYSX_UV_COMMAND}" run --python ${_VENV_DIR} --no-sync -- python ${_SAMPLE_PATH}
             WORKING_DIRECTORY "${${SAMPLES_DIR}}"
             RESULT_VARIABLE _SAMPLE_RESULT
             OUTPUT_VARIABLE _SAMPLE_OUTPUT
@@ -159,16 +179,23 @@ message(STATUS "--- Running External Python Samples ---")
 set(BASE_SAMPLES
     "hello_world.py"
     "contact_binding.py"
+    "kinematic_support.py"
     "tensor_bindings.py"
     "clone.py"
     "omnipvd_recording.py"
+    "profiling.py"              # writes a chrome trace to a temp dir; needs no external tool
     "tensor_bindings_views.py"  # TensorBindingsAPI-only (pure ctypes), cross-minor
     "output_read.py"            # closed-loop ovstage control-in / output-read (ADR-0007)
+    "vehicle_read_write.py"     # whole vehicle, chassis and wheel queries
+    "session_write.py"          # PhysX.write() session API (ADR-0012), mirrors output_read.py
+    "rl_step_capture.py"        # read -> Warp policy -> write replayed from one CUDA graph (ADR-0055)
 )
 
 file(GLOB EXTERNAL_SAMPLE_FILES RELATIVE "${PYTHON_SAMPLES_DIR}" "${PYTHON_SAMPLES_DIR}/*.py")
 list(SORT EXTERNAL_SAMPLE_FILES)
-set(EXPECTED_EXTERNAL_SAMPLE_FILES ${BASE_SAMPLES})
+# Import-only helpers are exercised by their workflow tests rather than this
+# script runner.
+set(EXPECTED_EXTERNAL_SAMPLE_FILES ${BASE_SAMPLES} "population_update.py" "omnipvd_inspection.py")
 list(SORT EXPECTED_EXTERNAL_SAMPLE_FILES)
 if(NOT EXTERNAL_SAMPLE_FILES STREQUAL EXPECTED_EXTERNAL_SAMPLE_FILES)
     message(FATAL_ERROR
@@ -183,10 +210,10 @@ foreach(PY_VER ${PYTHON_VERSIONS})
     message(STATUS "")
     message(STATUS "--- Running Python Samples (Python ${PY_VER}) ---")
 
-    # Always use uv-managed Python for repeatable tests
+    # uv-managed Python keeps the tests repeatable across machines.
     ensure_uv_managed_python(${PY_VER} UV_PYTHON_PATH)
 
-    # Resolve Python lib directory for libpython (needed by tensor bindings)
+    # Resolve the Python lib directory for libpython, which the tensor bindings need.
     execute_process(
         COMMAND ${UV_PYTHON_PATH} -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR') or '')"
         OUTPUT_VARIABLE PY_LIBDIR
@@ -203,6 +230,40 @@ foreach(PY_VER ${PYTHON_VERSIONS})
     setup_sample_venv(PYTHON_SAMPLES_DIR PY_VER)
 
     run_python_samples(PYTHON_SAMPLES_DIR BASE_SAMPLES EXTERNAL_LABEL)
+
+    if(PY_VER STREQUAL "3.12")
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} -E env ${_SAMPLE_UV_ENV} "${OVPHYSX_UV_COMMAND}" run
+                --python "${_VENV_DIR}" --no-sync -- python -c
+                "from pathlib import Path; import ovphysx; print(Path(ovphysx.__file__).resolve().parent / 'samples/python_samples/omnipvd_inspection.py')"
+            WORKING_DIRECTORY "${PYTHON_SAMPLES_DIR}"
+            OUTPUT_VARIABLE _installed_sample OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _resolve_result)
+        if(NOT "${_resolve_result}" STREQUAL "0" OR NOT EXISTS "${_installed_sample}")
+            message(FATAL_ERROR "Installed capture/inspection sample is missing: ${_installed_sample}")
+        endif()
+        # Explicit CMake selection overrides the inherited environment, including OFF.
+        if(NOT DEFINED OVPHYSX_SKIP_GPU_PASSES AND DEFINED ENV{OVPHYSX_SKIP_GPU_PASSES})
+            set(OVPHYSX_SKIP_GPU_PASSES "$ENV{OVPHYSX_SKIP_GPU_PASSES}")
+        endif()
+        set(_gpu_arg)
+        if(OVPHYSX_SKIP_GPU_PASSES)
+            set(_gpu_arg --cpu-only)
+        elseif(DEFINED ENV{OVPHYSX_TEST_REQUIRE_CUDA} AND "$ENV{OVPHYSX_TEST_REQUIRE_CUDA}" STREQUAL "1")
+            set(_gpu_arg --require-gpu)
+        endif()
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} -E env ${_SAMPLE_UV_ENV} "${OVPHYSX_UV_COMMAND}" run
+                --python "${_VENV_DIR}" --no-sync -- python
+                "${PROJECT_ROOT}/tests/ovd_workflow/test_workflow.py"
+                --inspector "${OVD_INSPECTOR}" --sample "${_installed_sample}"
+                --output-root "${BUILD_PATH}/test_results/ovd-workflow" ${_gpu_arg}
+            WORKING_DIRECTORY "${PYTHON_SAMPLES_DIR}"
+            RESULT_VARIABLE _workflow_result)
+        if(NOT "${_workflow_result}" STREQUAL "0")
+            message(FATAL_ERROR "Installed capture/inspection workflow failed: ${_workflow_result}")
+        endif()
+    endif()
 endforeach()
 
 # ==============================================================================
@@ -261,15 +322,14 @@ if(EXISTS "${EXTRA_SAMPLES_DIR}")
         ensure_uv_managed_python(${EXTRA_PY_VER} UV_PYTHON_PATH)
         setup_sample_venv(_SUBDIR_PATH EXTRA_PY_VER)
 
-        # Discover and run all .py files
         file(GLOB _EXTRA_SCRIPTS "${_SUBDIR_PATH}/*.py")
-        set(_EXTRA_VENV "${_SUBDIR_PATH}/.venv")
+        set(_EXTRA_VENV "${_VENV_DIR}")
         foreach(_SCRIPT ${_EXTRA_SCRIPTS})
             get_filename_component(_SCRIPT_NAME "${_SCRIPT}" NAME)
             message(STATUS "  Running extra/${_SUBDIR}/${_SCRIPT_NAME}...")
 
             execute_process(
-                COMMAND ${CMAKE_COMMAND} -E env ${UV_ENV} PYTHONUNBUFFERED=1
+                COMMAND ${CMAKE_COMMAND} -E env ${_SAMPLE_UV_ENV} PYTHONUNBUFFERED=1
                     "${OVPHYSX_UV_COMMAND}" run --python ${_EXTRA_VENV} --no-sync -- python ${_SCRIPT}
                 WORKING_DIRECTORY "${_SUBDIR_PATH}"
                 RESULT_VARIABLE _EXTRA_RESULT

@@ -23,19 +23,27 @@ An update range is closed and does not skip intervening ordinals. For example,
 - Author every change intended to affect physics at a sealed control ordinal
   that `update_from_ovstage()` / `ovphysx_update_from_ovstage()` will cover.
 - Do not mix a physics input into an output ordinal. Excluding that ordinal
-  would hide the input; including it would also re-ingest physics output.
+  would hide the input; including it can re-ingest output written to input
+  attributes, such as point-instancer `positions` and `orientations`.
 - Output ordinals are excluded only from ovphysx input ranges. They remain
   available to downstream readers and other participants.
 - With more participants, assign explicit lanes per producer or purpose and
   define which lanes each consumer drains. Do not extend the odd/even convention
   as if parity were part of the ovstage protocol.
 
+World-matrix-only edits (`omni:fabric:worldMatrix`) do not trigger physics
+transform updates. Author local transforms through `omni:xform` and the
+appropriate `omni:resetXformStack`. Update any existing resolved world matrices
+to match the local edits at the same control ordinal, including matrices seeded
+by population and affected descendants. See [Transform Inputs](../../../docs/ovstage_integration.md#transform-inputs)
+for the DirectGPU and kinematic-motion restrictions.
+
 For each frame:
 
 1. Author control attributes at the next control ordinal.
 2. Advance the ovstage write floor to seal that ordinal.
 3. Pass only a sealed, control-only ordinal range to
-   `update_from_ovstage()` / `ovphysx_update_from_ovstage()`.
+   `update_from_ovstage()` / `ovphysx_update_from_ovstage()` and wait for its task.
 4. Complete the simulation step.
 5. Read physics output and write it at the next output ordinal.
 6. Seal the output ordinal for downstream readers.
@@ -45,14 +53,35 @@ For each frame:
 ## Preserve ovstage Identity
 
 Use the group's interned prim list rather than rebuilding paths. Use the emitted
-attribute token rather than assuming it equals the requested semantic name.
-Forward `semantic` and `is_array`; tensor count and shape do not determine
-whether the attribute is an array.
+attribute token rather than assuming it equals the requested semantic name. Both are
+interned handles (`ovstage.PrimPathList` and `ovstage.Token`); resolve them through `ovstage.PathDictionary(stage)` —
+`get_path_strings(group.prim_list)` for the prim paths and `token_to_string(group.attribute)`
+for the emitted name (see `references/python.md`). Forward `semantic` and `is_array`;
+tensor count and shape do not determine whether the attribute is an array. An
+`ARTICULATION_JOINT` group is the exception: it has one row per DOF and repeats a joint's
+path once per axis, so regroup it per joint before an ovstage write
+(`ovphysx_create_joint_arrays_from_read_group` in C, `ovphysx.utils.split_joint_group` in Python).
 
 In C, the group's DLPack tensors are borrowed and can feed the ovstage write
 payload without repacking. Wait for the write to finish before releasing the
-group. In Python, the numeric tensors are NumPy copies, while `prim_list`,
-`attribute`, and the shared dictionary remain context-bound.
+group. In Python, every non-empty numeric column is a borrowed `warp.array` on
+its native CPU or CUDA device. `prim_list`, `attribute`, and
+`result.dictionary` remain bound to the open result and its live attachment. Detach
+retires that identity metadata. If a Python ovstage write path needs DLPack
+lanes rather than Warp's trailing component dimension, perform that
+conversion while the source array and result context are live.
+
+A device column is handed over before its producing work has necessarily
+completed. Feeding one straight back into a write is safe only if the write is
+ordered after that work: native C callers wait on `cuda_sync.wait_event` for
+their destination stream, while the Python frontend has already ordered the
+event onto the Warp stream that was current when the group's arrays were built
+(inside `read_sync()`, or at the first `wait()` / `result` access of a
+`fetch_next()` operation). If Python work later moves to another stream,
+establish an explicit Warp stream dependency first.
+DirectGPU rigid bodies, articulation links, whole articulations, and joint DOFs
+need at least one completed step before they emit groups. Other types have their
+own availability rules; inspect the optional read summary when readiness matters.
 
 Point-instancer `position` and `orientation` requests emit `positions` and
 `orientations` in instancer-local space.

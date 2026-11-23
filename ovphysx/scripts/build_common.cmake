@@ -1,11 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
-# Common build configuration
+# @implements REQ-PACKAGING-BUILDNUM-001
+# @covers AC-4
 
-# Get script directory and project root
+# Common build configuration shared by the script-mode entry points.
+
 get_filename_component(SCRIPT_DIR "${CMAKE_CURRENT_LIST_FILE}" DIRECTORY)
 get_filename_component(PROJECT_ROOT "${SCRIPT_DIR}/.." ABSOLUTE)
+
+# Every script-mode entry point includes this file, so the Windows CMake floor is
+# enforced here for all of them (`cmake -P` never reads CMakeLists.txt).
+include("${PROJECT_ROOT}/cmake/RequireCMakeVersion.cmake")
+ovphysx_require_cmake_version()
+
 include("${SCRIPT_DIR}/crossplatform_helpers.cmake")
 include("${SCRIPT_DIR}/host_toolchain.cmake")
 
@@ -44,18 +52,18 @@ if(BUILD_TYPE_LOWER STREQUAL "debug" AND NOT OVPHYSX_USE_RELEASE_RUNTIME_DEPS)
 endif()
 unset(_OVPHYSX_RELEASE_RUNTIME_DEPS_VALUE)
 
-set(BUILD_PATH "${PROJECT_ROOT}/_build")
+include("${SCRIPT_DIR}/build_directory.cmake")
 
 # Compute a safe parallel-build job count, shared by every script that invokes
-# a compile (main build + the sample-test source builds). Building the
-# ovruntime/PhysX stack is RAM-bound, not core-bound: USD/PhysX/boost template
-# TUs hold ~1-2 GiB resident per cc1plus, so an unbounded `make -j` (e.g.
+# a compile (main build and the sample-test source builds). Building the
+# ovruntime/PhysX stack is RAM-bound, not core-bound. USD/PhysX/boost template
+# TUs hold 1-2 GiB resident per cc1plus, so an unbounded `make -j` (e.g.
 # `cmake --build --parallel` with no count) spawns enough workers to exhaust
-# RAM and thrash the machine into swap. Bound by BOTH cores and RAM.
+# RAM. The count is bounded by BOTH cores and RAM.
 #
-# -DJOBS=N overrides. CI/containers run under a cgroup CPU quota -- trust it
-# (capped at 16 for linker OOM). Bare-metal/dev: half the cores AND ~4 GiB of
-# RAM budget per job, whichever is smaller.
+# -DJOBS=N overrides. CI/containers run under a cgroup CPU quota, which is
+# trusted, capped at 16 for linker OOM. Bare-metal/dev uses half the cores or
+# 4 GiB of RAM budget per job, whichever is smaller.
 function(ovphysx_compute_build_jobs _out_var)
     if(DEFINED JOBS AND NOT "${JOBS}" STREQUAL "")
         set(${_out_var} "${JOBS}" PARENT_SCOPE)
@@ -93,7 +101,7 @@ function(ovphysx_compute_build_jobs _out_var)
     endif()
 
     if(_cgroup)
-        # Also clamp by the cgroup memory limit (4 GiB/job): a high CPU quota on
+        # Also clamp by the cgroup memory limit (4 GiB/job). A high CPU quota on
         # a memory-constrained runner would otherwise pick too many jobs and OOM.
         set(_cgroup_ram_jobs 0)
         if(EXISTS "/sys/fs/cgroup/memory.max")
@@ -122,7 +130,7 @@ function(ovphysx_compute_build_jobs _out_var)
         return()
     endif()
 
-    # Bare-metal / dev: min(cores/2, RAM_GiB/4).
+    # Bare-metal / dev uses min(cores/2, RAM_GiB/4).
     include(ProcessorCount)
     ProcessorCount(_ncores)
     if(_ncores LESS 1)
@@ -135,7 +143,7 @@ function(ovphysx_compute_build_jobs _out_var)
         file(STRINGS "/proc/meminfo" _memtotal_line REGEX "^MemTotal:")
         string(REGEX MATCH "[0-9]+" _mem_kb "${_memtotal_line}")
         if(_mem_kb)
-            # KiB / (4 GiB in KiB) == RAM_GiB / 4
+            # KiB divided by 4 GiB in KiB equals RAM_GiB / 4.
             math(EXPR _by_ram "${_mem_kb} / 4194304")
         endif()
     endif()
@@ -150,9 +158,9 @@ function(ovphysx_compute_build_jobs _out_var)
     set(${_out_var} ${_result} PARENT_SCOPE)
 endfunction()
 
-# Resolve uv executable once for all scripts.
+# Resolve the uv executable once for all scripts.
 # MSBuild/CTest environments on Windows may not inherit the same PATH as an
-# interactive shell, so we include common installation locations as hints.
+# interactive shell, so common installation locations are passed as hints.
 if(NOT DEFINED OVPHYSX_UV_COMMAND OR OVPHYSX_UV_COMMAND STREQUAL "")
     set(_UV_HINTS
         "$ENV{ProgramData}/chocolatey/bin"
@@ -175,7 +183,7 @@ if(NOT DEFINED OVPHYSX_UV_COMMAND OR OVPHYSX_UV_COMMAND STREQUAL "")
     endif()
 endif()
 
-# Standardized output directory: _build/<platform>/<config>/
+# Standardized output directory: _build/<platform>/<config>/.
 set(STANDARD_OUTPUT_DIR "${BUILD_PATH}/${PLATFORM_NAME}/${BUILD_TYPE_LOWER}")
 
 # Resolve the external ovstage package used by SDK tests.
@@ -216,22 +224,22 @@ function(ovphysx_resolve_ovstage_paths)
     set(OVPHYSX_OVSTAGE_PYTHON_DIR "${_python_dir}" PARENT_SCOPE)
 endfunction()
 
-# Generate Python _version.py from VERSION file into a specified directory.
-# Only used by the wheel staging step; editable installs resolve version from
-# the repo VERSION file via __init__.py fallback chain.
-# Uses PEP440 format for Python compatibility (X.Y.Z-suffix -> X.Y.Z.suffix).
+# Generate the Python _version.py from the VERSION file into OUTPUT_DIR.
+# Only the wheel staging step uses it. Editable installs resolve the version from
+# the repo VERSION file via the __init__.py fallback chain.
+# The version is written in PEP 440 format (X.Y.Z-suffix -> X.Y.Z.suffix).
 function(generate_python_version_file OUTPUT_DIR)
     set(_VERSION_PY_PATH "${OUTPUT_DIR}/_version.py")
     file(READ "${PROJECT_ROOT}/VERSION" _VERSION_CONTENT)
     string(STRIP "${_VERSION_CONTENT}" _VERSION_CONTENT)
-    # Convert to PEP 440 format for Python compatibility
     semver_to_pep440("${_VERSION_CONTENT}")
+    apply_build_number("${PEP440_VERSION}" PEP440_VERSION)
     append_branch_local_version("${PEP440_VERSION}" "${PROJECT_ROOT}" PEP440_WITH_LOCAL)
-    file(WRITE "${_VERSION_PY_PATH}" "# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n# SPDX-License-Identifier: BSD-3-Clause\n#\n# Auto-generated by cmake from VERSION file\n__version__ = \"${PEP440_WITH_LOCAL}\"\n")
+    file(WRITE "${_VERSION_PY_PATH}" "# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n# SPDX-License-Identifier: Apache-2.0\n#\n# Auto-generated by cmake from VERSION file\n__version__ = \"${PEP440_WITH_LOCAL}\"\n")
     message(STATUS "Generated ${_VERSION_PY_PATH} with version ${PEP440_WITH_LOCAL}")
 endfunction()
 
-# Ensure uv-managed Python is available and return its path.
+# Ensure a uv-managed Python is available and return its path.
 # Usage: ensure_uv_managed_python(<version> <out_var>)
 function(ensure_uv_managed_python PY_VER OUT_VAR)
     execute_process(
@@ -345,11 +353,15 @@ function(copy_filtered_extensions SOURCE_EXTS_DIR TARGET_EXT_CACHE DEPS_MANIFEST
     endforeach()
 endfunction()
 
-# Strip unstripped ELF binaries under a root directory.
+# Strip ELF symbols and compiler comments under a root directory.
 # Usage:
 #   strip_unstripped_elf_binaries(<root_dir> <label>)
 # - root_dir: directory tree to scan for *.so* files
 # - label: short text used in status/error messages
+#
+# readelf identifies ELF files, unstripped symbols (SYMTAB), and .comment. The
+# latter can contain private compiler build URLs even in stripped dependencies.
+# The pinned builder image has binutils and does not have the libmagic `file` tool.
 function(strip_unstripped_elf_binaries ROOT_DIR LABEL)
     if(WIN32)
         message(STATUS "Skipping ELF stripping for ${LABEL} on Windows")
@@ -357,20 +369,18 @@ function(strip_unstripped_elf_binaries ROOT_DIR LABEL)
     endif()
 
     execute_process(
-        COMMAND file --version
+        COMMAND readelf --version
         OUTPUT_QUIET
         ERROR_QUIET
-        RESULT_VARIABLE FILE_TOOL_RESULT
+        RESULT_VARIABLE READELF_TOOL_RESULT
     )
-    if(NOT FILE_TOOL_RESULT EQUAL 0)
+    if(NOT READELF_TOOL_RESULT EQUAL 0)
         message(FATAL_ERROR
-            "'file' not found -- required to detect unstripped ELF binaries in ${LABEL}.\n"
-            "It is the OS file-type utility (libmagic), not CMake's file() command, "
-            "and is absent from minimal container images.\n"
-            "Install it: apt-get install file  (RPM distros: dnf install file)")
+            "readelf not found -- required to detect unstripped ELF binaries in ${LABEL}.\n"
+            "Install binutils: apt-get install binutils")
     endif()
 
-    # Probed here rather than at first use: a missing strip only surfaces as an
+    # Probed here rather than at first use. A missing strip only surfaces as an
     # empty per-file error further down, which says nothing about binutils.
     execute_process(
         COMMAND strip --version
@@ -384,7 +394,7 @@ function(strip_unstripped_elf_binaries ROOT_DIR LABEL)
             "Install binutils: apt-get install binutils")
     endif()
 
-    message(STATUS "Stripping symbols from unstripped libraries in ${LABEL}...")
+    message(STATUS "Stripping symbols and compiler comments from libraries in ${LABEL}...")
     file(GLOB_RECURSE ELF_CANDIDATES "${ROOT_DIR}/*.so*")
     set(FILES_TO_STRIP "")
     set(FILE_INSPECTION_FAILURES "")
@@ -395,25 +405,32 @@ function(strip_unstripped_elf_binaries ROOT_DIR LABEL)
             continue()
         endif()
 
+        # One readelf call checks the ELF header, SYMTAB, and .comment sections.
+        # .dynsym (DYNSYM) stays after strip --strip-unneeded and is not a match.
         execute_process(
-            COMMAND file -b "${FILE_PATH}"
-            OUTPUT_VARIABLE FILE_DESC
+            COMMAND readelf -h -S -W "${FILE_PATH}"
+            OUTPUT_VARIABLE READELF_OUT
             OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_VARIABLE FILE_DESC_ERROR
-            RESULT_VARIABLE FILE_DESC_RESULT
+            ERROR_VARIABLE READELF_ERR
+            RESULT_VARIABLE READELF_RESULT
         )
-        if(NOT FILE_DESC_RESULT EQUAL 0)
-            string(STRIP "${FILE_DESC_ERROR}" FILE_DESC_ERROR_STRIPPED)
-            if(FILE_DESC_ERROR_STRIPPED STREQUAL "")
-                set(FILE_DESC_ERROR_STRIPPED "<no stderr output>")
+        if(NOT READELF_RESULT EQUAL 0)
+            # Non-ELF *.so* names are not strip candidates. Other readelf
+            # failures still stop the strip step.
+            if(READELF_ERR MATCHES "Not an ELF file|Failed to read file")
+                continue()
             endif()
-            list(APPEND FILE_INSPECTION_FAILURES "${FILE_PATH}: ${FILE_DESC_ERROR_STRIPPED}")
+            string(STRIP "${READELF_ERR}" READELF_ERR_STRIPPED)
+            if(READELF_ERR_STRIPPED STREQUAL "")
+                set(READELF_ERR_STRIPPED "<no stderr output>")
+            endif()
+            list(APPEND FILE_INSPECTION_FAILURES "${FILE_PATH}: ${READELF_ERR_STRIPPED}")
             continue()
         endif()
 
-        if(FILE_DESC MATCHES "ELF")
+        if(READELF_OUT MATCHES "ELF Header")
             math(EXPR ELF_FILES_COUNT "${ELF_FILES_COUNT} + 1")
-            if(FILE_DESC MATCHES "not stripped")
+            if(READELF_OUT MATCHES " SYMTAB " OR READELF_OUT MATCHES "[ ]\\.comment[ ]")
                 list(APPEND FILES_TO_STRIP "${FILE_PATH}")
             endif()
         endif()
@@ -421,11 +438,11 @@ function(strip_unstripped_elf_binaries ROOT_DIR LABEL)
 
     list(LENGTH FILE_INSPECTION_FAILURES FILE_INSPECTION_FAILURE_COUNT)
     if(FILE_INSPECTION_FAILURE_COUNT GREATER 0)
-        message(STATUS "Failed to inspect ${FILE_INSPECTION_FAILURE_COUNT} files with 'file -b' in ${LABEL}:")
+        message(STATUS "Failed to inspect ${FILE_INSPECTION_FAILURE_COUNT} files with readelf in ${LABEL}:")
         foreach(FAILED_INSPECTION ${FILE_INSPECTION_FAILURES})
             message(STATUS "  - ${FAILED_INSPECTION}")
         endforeach()
-        message(FATAL_ERROR "Cannot continue stripping in ${LABEL}: file inspection failed")
+        message(FATAL_ERROR "Cannot continue stripping in ${LABEL}: readelf inspection failed")
     endif()
 
     list(LENGTH FILES_TO_STRIP STRIP_COUNT)
@@ -434,7 +451,7 @@ function(strip_unstripped_elf_binaries ROOT_DIR LABEL)
         set(STRIP_FAILURES "")
         foreach(SO_FILE ${FILES_TO_STRIP})
             execute_process(
-                COMMAND strip --strip-unneeded "${SO_FILE}"
+                COMMAND strip --strip-unneeded --remove-section=.comment "${SO_FILE}"
                 OUTPUT_QUIET
                 ERROR_VARIABLE STRIP_ERROR
                 RESULT_VARIABLE STRIP_RESULT
@@ -464,13 +481,13 @@ endfunction()
 # ============================================================================
 # ABI baseline enforcement for shipped binaries (Linux only).
 # ============================================================================
-# We target Ubuntu 22.04 LTS (glibc 2.35, GCC 11 / GLIBCXX_3.4.30) as the
-# minimum supported platform.  This is the oldest Ubuntu LTS still in standard
-# support, and matches the CI Docker images used by both ovphysx and PhysX SDK.
-# Pinning to this baseline means the SDK tarball and wheel work out-of-the-box
-# on Ubuntu 22.04+ and any distro with glibc >= 2.35 (RHEL 9, Debian 12, etc.)
+# Ubuntu 22.04 LTS (glibc 2.35, GCC 11 / GLIBCXX_3.4.30) is the minimum
+# supported platform. It is the oldest Ubuntu LTS still in standard support and
+# matches the CI Docker images used by both ovphysx and the PhysX SDK. Pinning
+# to this baseline means the SDK tarball and wheel work out of the box on
+# Ubuntu 22.04+ and any distro with glibc >= 2.35 (RHEL 9, Debian 12, etc.)
 # without requiring users to upgrade system libraries.
-# All .so files in release artifacts must not require newer versions.
+# No .so file in a release artifact may require newer versions.
 set(GLIBC_BASELINE   "2.35")
 set(GLIBCXX_BASELINE "3.4.30")
 
@@ -478,15 +495,15 @@ set(GLIBCXX_BASELINE "3.4.30")
 # version above the configured baseline.
 #
 # Uses readelf --version-info to inspect the .gnu.version_r (required)
-# section.  Ignores the .gnu.version_d (defined/provided) section and
+# section. Ignores the .gnu.version_d (defined/provided) section and
 # GLIBC_PRIVATE entries.
 #
 # Usage:
 #   verify_glibc_baseline(<root_dir> <label>)
 #
 # Controlled by:
-#   SKIP_GLIBC_CHECK  -- set to ON to skip (useful for local dev on newer OS).
-#   May be passed as a -D variable or as an environment variable; the env-var
+#   SKIP_GLIBC_CHECK  Set to ON to skip (useful for local dev on a newer OS).
+#   May be passed as a -D variable or as an environment variable. The env-var
 #   form is what lets validate_all.cmake forward the flag through its
 #   subprocess chain (cmake -P build.cmake -> cmake --build --target
 #   validate_all -> install_sdk -> cmake -P install.cmake), since the inner
@@ -502,12 +519,11 @@ function(verify_glibc_baseline ROOT_DIR LABEL)
         return()
     elseif(DEFINED ENV{SKIP_GLIBC_CHECK} AND "$ENV{SKIP_GLIBC_CHECK}")
         # Distinct message so a stale shell env (e.g. left over from a previous
-        # debug session) doesn't silently skip the check on a direct cmake -P run.
+        # debug session) does not silently skip the check on a direct cmake -P run.
         message(STATUS "Skipping glibc baseline check for ${LABEL} (SKIP_GLIBC_CHECK from environment)")
         return()
     endif()
 
-    # Verify readelf is available (binutils)
     execute_process(
         COMMAND readelf --version
         OUTPUT_QUIET
@@ -530,9 +546,9 @@ function(verify_glibc_baseline ROOT_DIR LABEL)
             continue()
         endif()
 
-        # Use readelf -h as a quick ELF check: non-ELF files (e.g. text stubs)
-        # cause readelf to exit non-zero, so we skip them.  This also avoids a
-        # dependency on the 'file' command for the ELF-detection step.
+        # readelf -h is a quick ELF check. Non-ELF files (e.g. text stubs) make
+        # readelf exit non-zero and are skipped. This also avoids a dependency
+        # on the 'file' command for the ELF-detection step.
         execute_process(
             COMMAND readelf -h "${_FILE}"
             OUTPUT_QUIET
@@ -545,10 +561,9 @@ function(verify_glibc_baseline ROOT_DIR LABEL)
 
         math(EXPR _CHECKED "${_CHECKED} + 1")
 
-        # Extract required version tags from .gnu.version_r section.
         # readelf --version-info prints both .gnu.version_d (defined) and
-        # .gnu.version_r (required).  We only want the required section.
-        # Force LC_ALL=C so section headers are always in English.
+        # .gnu.version_r (required). Only the required section matters here.
+        # LC_ALL=C keeps the section headers in English.
         set(ENV{LC_ALL} "C")
         execute_process(
             COMMAND readelf --version-info "${_FILE}"
@@ -560,7 +575,7 @@ function(verify_glibc_baseline ROOT_DIR LABEL)
             continue()
         endif()
 
-        # Parse only the "Version needs" (required) section, not
+        # Only the "Version needs" (required) section is parsed, not
         # "Version definition" (provided) or "Version symbols".
         set(_IN_NEEDS FALSE)
         string(REPLACE "\n" ";" _VI_LINES "${_VI_OUTPUT}")

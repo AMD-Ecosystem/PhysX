@@ -1,5 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
+
+# @implements REQ-PYTHON-BINDING-SYNC-001
+# @covers AC-1 AC-2 AC-3
 
 """
 DLPack utility functions for tensor interoperability.
@@ -35,10 +38,9 @@ def _validate_c_contiguous_layout(dl_tensor: DLTensor) -> None:
     if not dl_tensor.strides:
         return
 
-    # Any zero-sized dim makes the tensor empty; contiguity is trivially
-    # satisfied (no data to lay out). NumPy reports stride 0 for the dims
-    # outside a zero-sized one, which would otherwise fail the per-dim
-    # stride check below.
+    # Any zero-sized dim makes the tensor empty, so contiguity holds trivially.
+    # NumPy reports stride 0 for the dims outside a zero-sized one, which would
+    # otherwise fail the per-dim stride check below.
     if any(dl_tensor.shape[i] == 0 for i in range(ndim)):
         return
 
@@ -74,15 +76,60 @@ def copy_dltensor(dl_tensor: DLTensor) -> DLTensor:
     return copied
 
 
-def acquire_dltensor(obj) -> tuple[DLTensor, object | None]:
+def synchronize_tensor_producer(obj) -> object | None:
+    """Wait for producer work and return any capsule acquired for stream handoff."""
+    is_warp = type(obj).__module__.partition(".")[0] == "warp"
+    if is_warp:
+        if not getattr(getattr(obj, "device", None), "is_cuda", False):
+            return None
+        device = obj.device
+    else:
+        if not hasattr(obj, "__dlpack__") or not hasattr(obj, "__dlpack_device__"):
+            return None
+        device_type, device_id = obj.__dlpack_device__()
+        if device_type not in (DLDeviceType.kDLCUDA, DLDeviceType.kDLCUDAManaged):
+            return None
+        device = f"cuda:{device_id}"
+    import warp as wp
+
+    # PhysX may use another CUDA context. Finish the producer's handoff on
+    # Warp's stream before native access; retain the original capsule metadata.
+    stream = wp.get_stream(device)
+    capsule = None
+    try:
+        with wp.ScopedDevice(stream.device):
+            if not is_warp:
+                capsule = obj.__dlpack__(stream=int(stream.cuda_stream or 1))
+            ready = stream.record_event()
+            wp.synchronize_event(ready)
+            # Check this handoff, not work another caller enqueues after it.
+            # Warp logs CUDA wait errors, so require completion before proceeding.
+            if not ready.is_complete:
+                raise RuntimeError(f"CUDA producer work on {stream.device} did not complete")
+        return capsule
+    finally:
+        del capsule
+
+
+def _dlpack_on_cuda(obj) -> bool:
+    """Whether a __dlpack__ exporter's tensor lives in CUDA device or managed memory."""
+    device = getattr(obj, "__dlpack_device__", None)
+    return device is not None and device()[0] in (DLDeviceType.kDLCUDA, DLDeviceType.kDLCUDAManaged)
+
+
+def acquire_dltensor(obj, *, synchronize: bool = True) -> tuple[DLTensor, object | None]:
     """Extract DLTensor and a keepalive reference (if needed).
 
     For objects implementing __dlpack__(), the returned DLTensor points into a
-    DLManagedTensor owned by a Python capsule. We must keep the capsule alive
+    DLManagedTensor owned by a Python capsule. The capsule must stay alive
     until the native call completes.
 
     Args:
         obj: DLTensor, object with __dlpack__(), or numpy-like array
+        synchronize: Wait on the host for the producer first, as
+            ``synchronize_tensor_producer`` does. Pass False when the native call is itself
+            ordered after the stream that produced ``obj``: then a CUDA tensor is exported
+            with DLPack's no-synchronization stream, -1, and nothing is waited for.
 
     Returns:
         Tuple of (DLTensor, keepalive_object). The keepalive_object must be
@@ -91,9 +138,13 @@ def acquire_dltensor(obj) -> tuple[DLTensor, object | None]:
     if isinstance(obj, DLTensor):
         return obj, None
 
+    capsule = synchronize_tensor_producer(obj) if synchronize else None
+
     # __dlpack__ protocol (NumPy >= 1.22, PyTorch, etc.)
     if hasattr(obj, "__dlpack__"):
-        capsule = obj.__dlpack__()
+        if capsule is None:
+            unordered = not synchronize and _dlpack_on_cuda(obj)
+            capsule = obj.__dlpack__(stream=-1) if unordered else obj.__dlpack__()
         try:
             if PyCapsule_IsValid(capsule, b"dltensor") != 1:
                 raise TypeError("__dlpack__() did not return a valid 'dltensor' capsule")
@@ -142,20 +193,18 @@ def numpy_to_dltensor(arr) -> DLTensor:
     dl_tensor.data = arr.ctypes.data_as(c_void_p)
     dl_tensor.ndim = arr.ndim
 
-    # Set up shape - must be kept alive for duration of C call
+    # The shape array must stay alive for the duration of the C call.
     shape_array = (c_int64 * arr.ndim)(*arr.shape)
     dl_tensor.shape = ctypes.cast(shape_array, POINTER(c_int64))
 
-    # Strides (in bytes -> elements) - must be kept alive for duration of C call
+    # Strides converted from bytes to elements. The array must stay alive for the duration of the C call.
     strides_array = (c_int64 * arr.ndim)(*[s // arr.itemsize for s in arr.strides])
     dl_tensor.strides = ctypes.cast(strides_array, POINTER(c_int64))
 
-    # Device
     dl_tensor.device = DLDevice()
     dl_tensor.device.device_type = DLDeviceType.kDLCPU
     dl_tensor.device.device_id = 0
 
-    # Data type
     dl_tensor.dtype = DLDataType()
     if arr.dtype == np.float32:
         dl_tensor.dtype.code = DLDataTypeCode.kDLFloat
@@ -172,6 +221,15 @@ def numpy_to_dltensor(arr) -> DLTensor:
     elif arr.dtype == np.uint8:
         dl_tensor.dtype.code = DLDataTypeCode.kDLUInt
         dl_tensor.dtype.bits = 8
+    elif arr.dtype == np.int64:
+        dl_tensor.dtype.code = DLDataTypeCode.kDLInt
+        dl_tensor.dtype.bits = 64
+    elif arr.dtype == np.uint64:
+        dl_tensor.dtype.code = DLDataTypeCode.kDLUInt
+        dl_tensor.dtype.bits = 64
+    elif arr.dtype == np.uint32:
+        dl_tensor.dtype.code = DLDataTypeCode.kDLUInt
+        dl_tensor.dtype.bits = 32
     else:
         raise ValueError(f"Unsupported dtype: {arr.dtype}")
     dl_tensor.dtype.lanes = 1

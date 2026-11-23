@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
 set -e
 
@@ -17,8 +17,6 @@ set -e
 #   cmake -P scripts/install.cmake                     # just assemble _install/ (for manual testing)
 # Advanced (same validation as validate_all.cmake after a full build; run build.cmake first if needed):
 #   cmake --build _build --target validate_all         # install + wheel + all tests
-#
-# Entry point for building ovphysx from source.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -48,13 +46,10 @@ for arg in "${EXTRA_ARGS[@]}"; do
             echo ""
             echo "Project-specific flags:"
             echo "  --devphysx         Build PhysX SDK from source"
-            echo "  --devschema        Use locally-built physics schema"
+            echo "  --devschema        Build and select a local schema provider wheel"
             echo "  --benchmarks       Build the opt-in benchmark suite (tests/benchmarks/)"
             echo ""
-            echo "Changing --devphysx or --devschema needs a clean rebuild:"
-            echo "the flag combination selects a build flavor, and incremental"
-            echo "builds across a flavor change are not supported. Add --rebuild"
-            echo "whenever the flags differ from the previous build."
+            echo "Add --rebuild when changing --devphysx."
             echo ""
             echo "Any -D<VAR>=<VALUE> flags are passed through to cmake."
             exit 1

@@ -1,12 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1
+
+/**
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-15
+ */
 
 #pragma once
 
+#include <omni/physics/AttachHandle.h>
+
 #include <carb/Types.h>
 
+#include <omni/physics/parse/Handles.h>
 #include <omni/physx/IPhysxCooking.h>
-#include <private/omni/physx/IPhysxCookingPrivate.h>
 
 namespace omni
 {
@@ -15,24 +25,20 @@ namespace physx
 
 // IPhysxCooking
 
-uint32_t getNbConvexMeshData(const PXR_NS::SdfPath& path);
-void getConvexMeshData(const PXR_NS::SdfPath& path, uint32_t convexIndex, ConvexMeshData& meshData);
-bool createConvexMesh(const PXR_NS::SdfPath& path, uint32_t vertexLimit, ConvexMeshData& meshData);
+uint32_t getNbConvexMeshData(omni::physics::AttachHandle attach, omni::physics::parse::ObjectKey key);
+void getConvexMeshData(omni::physics::AttachHandle attach, omni::physics::parse::ObjectKey key, uint32_t convexIndex, ConvexMeshData& meshData);
+bool createConvexMesh(omni::physics::AttachHandle attach, omni::physics::parse::ObjectKey key, uint32_t vertexLimit, ConvexMeshData& meshData);
 
 uint32_t getNumCollisionTasks(void);
 uint32_t cancelCollisionTasks(void);
 void releaseLocalMeshCache();
 uint32_t getTotalFinishedCollisionTasks(void);
 
-bool cookAutoDeformableBody(const PXR_NS::SdfPath& deformableBodyPath);
+bool cookAutoDeformableBody(omni::physics::AttachHandle attach, omni::physics::parse::ObjectKey deformableBodyKey);
 
-void addPrimToCookingRefreshSet(const PXR_NS::SdfPath& path);
 
 //~IPhysxCooking
 
-// IPhysxCookingPrivate
-PhysxCookingStatistics getCookingStatistics();
-// ~IPhysxCookingPrivate
 
 
 } // namespace physx

@@ -1,8 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2021-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
+/**
+ * @implements REQ-OMNIPVD-LATE-001
+ * @covers AC-1 AC-2
+ *
+ * @implements REQ-READ-POOL-001
+ * @covers AC-2
+ */
 
-#include "UsdPCH.h"
 #include "PhysXSettings.h"
 #include "SceneMultiGPUMode.h"
 #include <carb/settings/ISettings.h>
@@ -45,8 +51,7 @@ static PhysXSettings gPhysXSettings = PhysXSettings(
         { kSettingSuppressReadback, false },
         { kSettingExposeProfilerData, true },
         { kSettingExposePrimPathNames, true },
-        { kOmniPvdOutputEnabled, false },
-        { kOmniPvdIsOVDStage, false },
+        { kOmniPvdRecordingCapable, false },
         { kOmniPvdIsRecording, false },
         { kSettingPhysxDispatcher, false },
         { kSettingDisplayColliderNormals, false },
@@ -89,6 +94,7 @@ static PhysXSettings gPhysXSettings = PhysXSettings(
         { kSettingAddMenuSubtreeLimit, 100000 },
         { kSettingUjitsoCookingMaxProcessCount, 16 },
         { kSettingSceneMultiGPUMode, int(SceneMultiGPUMode::eDisabled)},
+        { kSettingOvstageReadPoolMaxMB, 256 }, // per-context pool budget in MiB; <= 0 disables the pool; see IPhysxSettings.h
     },
     // int64
     {
@@ -107,10 +113,8 @@ static PhysXSettings gPhysXSettings = PhysXSettings(
         { kSettingPVDIPAddress, "127.0.0.1" },
         { kSettingPVDOutputDirectory, "" },
         { kSettingTestRunnerFilter, "" },
-        { kOmniPvdOvdRecordingDirectory, "" },
         { kSettingDemoAssetsPath, "" },
-        { kSettingTestsAssetsPath, "" },
-        { kSettingDefaultSimulator, "PhysX" }
+        { kSettingTestsAssetsPath, "" }
     },
     // string array
     {
@@ -226,7 +230,6 @@ void PhysXSettings::resetSettingsInPreferences()
     resetSettingAtPath(kSettingUjitsoCookingMaxProcessCount);
 
     resetSettingAtPath(kSettingPhysxDispatcher);
-    resetSettingAtPath(kSettingDefaultSimulator);
 
     resetSettingAtPath(kSettingDebugVisSimplifyAtDistance);
     resetSettingAtPath(kSettingDebugVisQueryUsdrtForTraversal);

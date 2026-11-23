@@ -1,15 +1,33 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+// @implements REQ-ATTACH-IO-001
+// @covers AC-2
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1 AC-2
+
+/**
+ * @implements REQ-SIM-ACTIVEACTOR-001
+ * @covers AC-1
+ *
+ * @implements REQ-SIM-SCENEQUERY-001
+ * @covers AC-1 AC-2
+ *
+ * @implements REQ-LOAD-DEFORMABLE-001
+ * @covers AC-7
+ */
 
 #include "Raycast.h"
+#include "RuntimeExecution.h"
 #include <omni/physx/IPhysxSettings.h>
 #include <PhysXTools.h>
 #include <usdLoad/LoadUsd.h>
 #include <omni/physics/parse/IPhysicsSource.h>
+#include <omni/physics/parse/KnownTokens.h>
 
 #include <common/utilities/MemoryMacros.h>
+
+#include <atomic>
 
 #if USE_PHYSX_GPU
 #include "extensions/PxParticleExt.h"
@@ -38,23 +56,47 @@ const float kDeformableTargetShapeRadius = 10.0f;
 
 namespace
 {
-bool isInvisible(const usdparser::AttachedStage* attachedStage, omni::physics::parse::ObjectKey key)
+// `tok` must already be interned against `source` -- this runs once per
+// broad-phase candidate shape (preFilter) or once per deformable body
+// (raycastSingle's loops below), so it must not re-intern the KnownTokens
+// batch itself. Callers intern once, up front, and pass the same batch in.
+bool isInvisible(const omni::physics::parse::IPhysicsSource* source,
+                 const omni::physics::parse::KnownTokens& tok,
+                 omni::physics::parse::ObjectKey key)
 {
-    const omni::physics::parse::IPhysicsSource* source = attachedStage ? attachedStage->getSource() : nullptr;
     if (!source || !key.valid())
         return false;
 
-    const omni::physics::parse::TokenId visibilityTok = source->internToken(PXR_NS::UsdGeomTokens->visibility.GetString());
-    const std::string_view invisible = PXR_NS::UsdGeomTokens->invisible.GetString();
     for (omni::physics::parse::ObjectKey cur = key; cur.valid(); cur = source->getParent(cur))
     {
         omni::physics::parse::TokenId value;
-        if (source->getAttribute(cur, visibilityTok, value) && source->tokenToString(value) == invisible)
+        if (source->getAttribute(cur, tok.visibility, value) && value == tok.invisible)
             return true;
     }
     return false;
 }
+
+// Backing counters for Raycast.h's test-only accessors (REQ-SIM-SCENEQUERY-001). Atomic since
+// scene queries can run off the main thread; relaxed ordering is enough for a call count.
+std::atomic<uint32_t> gPreFilterCallCount{ 0 };
+std::atomic<uint32_t> gRaycastQueryInternCount{ 0 };
 } // namespace
+
+void omni::physx::resetRaycastQueryTestCounters()
+{
+    gPreFilterCallCount.store(0, std::memory_order_relaxed);
+    gRaycastQueryInternCount.store(0, std::memory_order_relaxed);
+}
+
+uint32_t omni::physx::getRaycastPreFilterCallCount()
+{
+    return gPreFilterCallCount.load(std::memory_order_relaxed);
+}
+
+uint32_t omni::physx::getRaycastQueryInternCount()
+{
+    return gRaycastQueryInternCount.load(std::memory_order_relaxed);
+}
 
 static bool intersectRayTriangle(const PxVec3& orig,
                                  const PxVec3& dir,
@@ -106,7 +148,7 @@ static bool intersectRayTriangle(const PxVec3& orig,
     return true;
 }
 
-RaycastManager::RaycastManager()
+RaycastManager::RaycastManager(const usdparser::AttachedStage& owner) : mOwner(owner)
 {
     picker = Picker();
 }
@@ -118,6 +160,10 @@ RaycastManager::~RaycastManager()
 void RaycastManager::clearCommandBuffer()
 {
     mManipCmdBuffer.clear();
+    grabInProgress = false;
+    pushInProgress = false;
+    lastInput = false;
+    lastEvent = PhysicsInteractionEvent::eNone;
 }
 
 
@@ -126,21 +172,22 @@ void RaycastManager::clearCommandBuffer()
                                                          const ::physx::PxRigidActor* actor,
                                                          ::physx::PxHitFlags& flag)
 {
-    const internal::InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    gPreFilterCallCount.fetch_add(1, std::memory_order_relaxed);
+
+    const internal::InternalPhysXDatabase& db = mDatabase;
     const usdparser::ObjectId shapeIndex = (usdparser::ObjectId)shape->userData;
 
     PhysXType type;
     const internal::InternalDatabase::Record* objectRecord = db.getFullRecord(type, shapeIndex);
 
-    const usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getActiveAttachedStage();
-    if (objectRecord && (type == ePTShape || type == ePTCompoundShape) && isInvisible(attachedStage, objectRecord->mKey))
+    if (objectRecord && (type == ePTShape || type == ePTCompoundShape) && isInvisible(mSource, mTokens, objectRecord->mKey))
     {
         return PxQueryHitType::eNONE;
     }
     return PxQueryHitType::eBLOCK;
 }
 
-static bool raycastSingle(const PxVec3& orig,
+static bool raycastSingle(const usdparser::AttachedStage& owner, const PxVec3& orig,
                           const PxVec3& dir,
                           const PxReal distance,
                           PickType::Enum& outType,
@@ -148,7 +195,8 @@ static bool raycastSingle(const PxVec3& orig,
                           PxVec3& outPosition,
                           PxReal& outDistance,
                           DeformableId& outDeformableId,
-                          PhysXScene*& outPhysXScene)
+                          PhysXScene*& outPhysXScene,
+                          bool ignoreInvisible)
 {
     PxRaycastHit hit;
 
@@ -159,14 +207,21 @@ static bool raycastSingle(const PxVec3& orig,
     PhysXScene* physXScene = nullptr;
     DeformableId deformableId;
 
-    const PhysXScenesMap& physXScenes = OmniPhysX::getInstance().getPhysXSetup().getPhysXScenes();
-    PXR_NS::UsdStageWeakPtr stage = usdparser::UsdLoad::getUsdLoad()->getActiveStage();
-    const usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getActiveAttachedStage();
-    const internal::InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
-    const omni::physx::raycastFilterExcludeInvisible filter = raycastFilterExcludeInvisible(stage);
-    carb::settings::ISettings* settings = carb::getCachedInterface<carb::settings::ISettings>();
-
-    for (PhysXScenesMap::const_reference ref : physXScenes)
+    const usdparser::AttachedStage::SceneMap& physXScenes = owner.getPhysXScenes();
+    const usdparser::AttachedStage* attachedStage = &owner;
+    const internal::InternalPhysXDatabase& db = owner.getInternalPhysXDatabase();
+    // Interned once for the whole query, not per candidate shape / deformable
+    // body -- shared by the prefilter callback below and the deformable-body
+    // isInvisible() checks further down.
+    const omni::physics::parse::IPhysicsSource* source = attachedStage ? attachedStage->getSource() : nullptr;
+    omni::physics::parse::KnownTokens tok;
+    if (source)
+    {
+        tok.intern(*source);
+        gRaycastQueryInternCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    const omni::physx::raycastFilterExcludeInvisible filter = raycastFilterExcludeInvisible(db, source, tok);
+    for (usdparser::AttachedStage::SceneMap::const_reference ref : physXScenes)
     {
         PxScene* scene = ref.second->getScene();
         if (!scene)
@@ -177,7 +232,7 @@ static bool raycastSingle(const PxVec3& orig,
         if (PxSceneQueryExt::raycastSingle(
                 *scene, orig, dir, dist, PxSceneQueryFlag::ePOSITION, hit,
                 PxSceneQueryFilterData(PxQueryFlag::eDYNAMIC | PxQueryFlag::eSTATIC | PxQueryFlag::ePREFILTER),
-                (settings->getAsBool(kSettingMouseGrabIgnoreInvisible) ? (PxQueryFilterCallback*)&filter : NULL)))
+                (ignoreInvisible ? (PxQueryFilterCallback*)&filter : NULL)))
         {
             hitType = PickType::eRIGID;
             dist = hit.distance;
@@ -199,7 +254,8 @@ static bool raycastSingle(const PxVec3& orig,
         {
             internal::InternalVolumeDeformableBody* body = intScene->mVolumeDeformableBodies[i];
 
-            if (isInvisible(attachedStage, body->mBodyKey))
+            // a disabled body is registered without an actor or keys, so it is skipped before its key is read
+            if (!body->mDeformableVolume || isInvisible(source, tok, body->mBodyKey))
                 continue;
 
             const PxBounds3 bounds = body->mDeformableVolume->getWorldBounds();
@@ -244,7 +300,7 @@ static bool raycastSingle(const PxVec3& orig,
         {
             internal::InternalSurfaceDeformableBody* body = intScene->mSurfaceDeformableBodies[i];
 
-            if (isInvisible(attachedStage, body->mBodyKey))
+            if (!body->mDeformableSurface || isInvisible(source, tok, body->mBodyKey))
                 continue;
 
             const PxBounds3 bounds = body->mDeformableSurface->getWorldBounds();
@@ -316,27 +372,27 @@ static int findOverlappingParticles(const PxVec3& orig,
 }
 
 
-static void drawGrabbedPointVisualization(PxVec3 grabbedPosition, PxVec3 grabTargetPosition)
+static void drawGrabbedPointVisualization(AttachHandle attach, PxVec3 grabbedPosition, PxVec3 grabTargetPosition)
 {
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
     carb::events::IEventPtr eventPtr = omniPhysX.createSimulationEventV2(
-        ePointGrabbed, std::make_pair("grabbed_position", (const carb::Float3&)grabbedPosition),
+        ePointGrabbed, std::make_pair("attachHandle", static_cast<int64_t>(attach)), std::make_pair("grabbed_position", (const carb::Float3&)grabbedPosition),
         std::make_pair("grab_target_position", (const carb::Float3&)grabTargetPosition));
     omniPhysX.getSimulationEventStreamV2()->push(eventPtr.get());
 }
 
-static void removePointVisualization()
+static void removePointVisualization(AttachHandle attach)
 {
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    carb::events::IEventPtr eventPtr = omniPhysX.createSimulationEventV2(ePointReleased);
+    carb::events::IEventPtr eventPtr = omniPhysX.createSimulationEventV2(ePointReleased, std::make_pair("attachHandle", static_cast<int64_t>(attach)));
     omniPhysX.getSimulationEventStreamV2()->push(eventPtr.get());
 }
 
-static void drawPushedPointVisualization(PxVec3 pushedPosition)
+static void drawPushedPointVisualization(AttachHandle attach, PxVec3 pushedPosition)
 {
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
     carb::events::IEventPtr eventPtr = omniPhysX.createSimulationEventV2(
-        ePointPushed, std::make_pair("pushed_position", (const carb::Float3&)pushedPosition));
+        ePointPushed, std::make_pair("attachHandle", static_cast<int64_t>(attach)), std::make_pair("pushed_position", (const carb::Float3&)pushedPosition));
     omniPhysX.getSimulationEventStreamV2()->push(eventPtr.get());
 }
 
@@ -397,14 +453,13 @@ static bool getDeformableElementPosition(PxVec3& elementPos, const internal::Int
     return false;
 }
 
-static void startPickingDeformable(const PickType::Enum type, const DeformableId& deformableId, const PxReal distance, const PxVec3& hitPoint)
+void RaycastManager::startPickingDeformable(const PickType::Enum type, const DeformableId& deformableId, const PxReal distance, const PxVec3& hitPoint)
 {
     if (type == PickType::eNONE || type == PickType::eRIGID)
         return;
 
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
     PxPhysics* physics = omniPhysX.getPhysXSetup().getPhysics();
-    Picker& picker = omniPhysX.getRaycastManager().getPicker();
     internal::InternalScene* intScene = picker.physXScene ? picker.physXScene->getInternalScene() : nullptr;
     if (!intScene)
         return;
@@ -477,9 +532,8 @@ static void startPickingDeformable(const PickType::Enum type, const DeformableId
     }
 }
 
-static void updatePickingDeformable(const PxVec3& target)
+void RaycastManager::updatePickingDeformable(const PxVec3& target)
 {
-    Picker& picker = OmniPhysX::getInstance().getRaycastManager().getPicker();
     picker.targetActor->setKinematicTarget(PxTransform(target));
 
     const DeformableId& id = picker.hitDeformableId;
@@ -493,12 +547,11 @@ static void updatePickingDeformable(const PxVec3& target)
         currentPos = target;
     }
 
-    drawGrabbedPointVisualization(currentPos, target);
+    drawGrabbedPointVisualization(mOwner.getAttachHandle(), currentPos, target);
 }
 
-static void releasePickingDeformable()
+void RaycastManager::releasePickingDeformable()
 {
-    Picker& picker = OmniPhysX::getInstance().getRaycastManager().getPicker();
     if (picker.type == PickType::eNONE || picker.type == PickType::eRIGID)
         return;
 
@@ -521,24 +574,17 @@ static void releasePickingDeformable()
     {
         if (intScene->getScene())
         {
+            intScene->trackReleasedActiveActor(picker.targetActor);
             intScene->getScene()->removeActor(*picker.targetActor);
         }
         SAFE_RELEASE(picker.targetActor);
     }
 
-    removePointVisualization();
+    removePointVisualization(mOwner.getAttachHandle());
 }
 
-static void applyManipCmd(const ManipCmd& cmd, float delta_time)
+void RaycastManager::applyManipCmd(const ManipCmd& cmd, float delta_time)
 {
-    static float manipDist = 0.0f;
-
-    static PxVec3 grabbingLocalPoint = PxVec3(0.0f);
-    static float grabbingDistance;
-    static float grabbingSavedAngularDamping;
-
-    Picker& picker = OmniPhysX::getInstance().getRaycastManager().getPicker();
-
     PickType::Enum type = PickType::eNONE;
     PxVec3 position;
     PxReal distance = 0.0f;
@@ -551,7 +597,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
     case ManipCmd::ePush:
         if(cmd.state==ManipCmd::eStartOrUpdate)
         {
-            isRaycastSingle = raycastSingle(cmd.orig, cmd.dir, kPickDistance, type, rigidActor, position, distance, deformableId, physXScene);
+            isRaycastSingle = raycastSingle(mOwner, cmd.orig, cmd.dir, kPickDistance, type, rigidActor, position, distance, deformableId, physXScene, cmd.ignoreInvisible);
             if (isRaycastSingle)
             {
                 if (type == PickType::eRIGID)
@@ -563,14 +609,14 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                         const PxVec3 impulse = cmd.dir * cmd.acceleration * rb->getMass() * delta_time;
                         PxRigidBodyExt::addForceAtPos(*rb, impulse, position, PxForceMode::eIMPULSE);
 
-                        drawPushedPointVisualization(position);
+                        drawPushedPointVisualization(mOwner.getAttachHandle(), position);
                     }
                 }
             }
         }
         else if(cmd.state==ManipCmd::eRelease)
         {
-            removePointVisualization();
+            removePointVisualization(mOwner.getAttachHandle());
         }
         break;
     case ManipCmd::eGrabWithForce:
@@ -582,11 +628,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                 const PxVec3 newWorldPt = worldTransform.transform(grabbingLocalPoint);
                 const PxVec3 dragPoint = cmd.orig + cmd.dir * grabbingDistance;
 
-                float grabbingForce = kMouseGrabForceMultiplier;
-                {
-                    carb::settings::ISettings* settings = carb::getCachedInterface<carb::settings::ISettings>();
-                    grabbingForce *= settings->getAsFloat(kSettingMousePickingForce);
-                }
+                const float grabbingForce = kMouseGrabForceMultiplier * cmd.pickingForce;
 
                 PxVec3 action = (dragPoint - newWorldPt);
 
@@ -613,13 +655,13 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                         picker.hitRigidActor->addForce(gravityCompensation * delta_time, PxForceMode::eVELOCITY_CHANGE);
                     }
                 }
-                drawGrabbedPointVisualization(newWorldPt, dragPoint);
+                drawGrabbedPointVisualization(mOwner.getAttachHandle(), newWorldPt, dragPoint);
             }
             else
             {
                 if (picker.type == PickType::eNONE)
                 {
-                    if (raycastSingle(cmd.orig, cmd.dir, kPickDistance, type, rigidActor, position, distance, deformableId, physXScene))
+                    if (raycastSingle(mOwner, cmd.orig, cmd.dir, kPickDistance, type, rigidActor, position, distance, deformableId, physXScene, cmd.ignoreInvisible))
                     {
                         picker.physXScene = physXScene;
                         if (type == PickType::eRIGID)
@@ -630,18 +672,14 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                                 picker.type = PickType::eRIGID;
                                 const PxTransform worldTransform = picker.hitRigidActor->getGlobalPose();
 
-                                float grabbingForce = kMouseGrabForceMultiplier;
-                                {
-                                    carb::settings::ISettings* settings = carb::getCachedInterface<carb::settings::ISettings>();
-                                    grabbingForce *= settings->getAsFloat(kSettingMousePickingForce);
-                                }
+                                const float grabbingForce = kMouseGrabForceMultiplier * cmd.pickingForce;
 
                                 grabbingDistance = distance;
                                 grabbingLocalPoint = worldTransform.transformInv(position);
                                 grabbingSavedAngularDamping = picker.hitRigidActor->getAngularDamping();
 
                                 picker.hitRigidActor->setAngularDamping(fmaxf(kMouseGrabForceAngularDamping * grabbingForce, grabbingSavedAngularDamping));
-                                drawGrabbedPointVisualization(position, position);
+                                drawGrabbedPointVisualization(mOwner.getAttachHandle(), position, position);
                             }
                         }
                         else
@@ -653,7 +691,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                             {
                                 const PxTransform worldTransform = picker.targetActor->getGlobalPose();
                                 grabbingLocalPoint = worldTransform.transformInv(position);
-                                drawGrabbedPointVisualization(position, position);
+                                drawGrabbedPointVisualization(mOwner.getAttachHandle(), position, position);
                             }
                         }
                     }
@@ -668,7 +706,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                             const PxTransform worldTransform = picker.hitRigidActor->getGlobalPose();
                             const PxVec3 newWorldPt = worldTransform.transform(grabbingLocalPoint);
                             const PxVec3 dragPoint = cmd.orig + cmd.dir * grabbingDistance;
-                            drawGrabbedPointVisualization(newWorldPt, dragPoint);
+                            drawGrabbedPointVisualization(mOwner.getAttachHandle(), newWorldPt, dragPoint);
                         }
                     }
                     else if (picker.type != PickType::eNONE)
@@ -700,7 +738,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
             }
             picker.physXScene = nullptr;
             picker.type = PickType::eNONE;
-            removePointVisualization();
+            removePointVisualization(mOwner.getAttachHandle());
         }
         break;
 
@@ -710,8 +748,8 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
         case ManipCmd::eStartOrUpdate:
             if (picker.type == PickType::eNONE && picker.targetActor == nullptr)
             {
-                isRaycastSingle = raycastSingle(cmd.orig, cmd.dir, kPickDistance, type, rigidActor, position, distance,
-                                                deformableId, physXScene);
+                isRaycastSingle = raycastSingle(mOwner, cmd.orig, cmd.dir, kPickDistance, type, rigidActor, position, distance,
+                                                deformableId, physXScene, cmd.ignoreInvisible);
                 if (isRaycastSingle)
                 {
                     picker.physXScene = physXScene;
@@ -737,7 +775,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                                 {
                                     scene->addActor(*rd);
 
-                                    const PxMaterial* material = OmniPhysX::getInstance().getPhysXSetup().getPhysXScene((size_t)scene->userData)->getDefaultMaterial();
+                                    const PxMaterial* material = OmniPhysX::getInstance().getPhysXSetup().findPhysXScene(scene)->getDefaultMaterial();
                                     PxSphereGeometry geo = PxSphereGeometry(1.0f);
                                     CARB_ASSERT(geo.isValid());
                                     PxShape* shape = physics->createShape(geo, *material, true, PxShapeFlag::eVISUALIZATION);
@@ -747,12 +785,12 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                                     rd->setMass(0.f);
                                     rd->setMassSpaceInertiaTensor(PxVec3(0.f));
                                     rd->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, true);
-                                    rd->setRigidDynamicLockFlag(physx::PxRigidDynamicLockFlag::eLOCK_LINEAR_X, false);
-                                    rd->setRigidDynamicLockFlag(physx::PxRigidDynamicLockFlag::eLOCK_LINEAR_Y, false);
-                                    rd->setRigidDynamicLockFlag(physx::PxRigidDynamicLockFlag::eLOCK_LINEAR_Z, false);
-                                    rd->setRigidDynamicLockFlag(physx::PxRigidDynamicLockFlag::eLOCK_ANGULAR_X, false);
-                                    rd->setRigidDynamicLockFlag(physx::PxRigidDynamicLockFlag::eLOCK_ANGULAR_Y, false);
-                                    rd->setRigidDynamicLockFlag(physx::PxRigidDynamicLockFlag::eLOCK_ANGULAR_Z, false);
+                                    rd->setRigidDynamicLockFlag(::physx::PxRigidDynamicLockFlag::eLOCK_LINEAR_X, false);
+                                    rd->setRigidDynamicLockFlag(::physx::PxRigidDynamicLockFlag::eLOCK_LINEAR_Y, false);
+                                    rd->setRigidDynamicLockFlag(::physx::PxRigidDynamicLockFlag::eLOCK_LINEAR_Z, false);
+                                    rd->setRigidDynamicLockFlag(::physx::PxRigidDynamicLockFlag::eLOCK_ANGULAR_X, false);
+                                    rd->setRigidDynamicLockFlag(::physx::PxRigidDynamicLockFlag::eLOCK_ANGULAR_Y, false);
+                                    rd->setRigidDynamicLockFlag(::physx::PxRigidDynamicLockFlag::eLOCK_ANGULAR_Z, false);
 
                                     picker.targetActor = rd;
 
@@ -777,7 +815,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                                     const float kJointed = nbConstraints > 1 ? kMouseGrabJointMaxForceJointedMultiplier : 1.0f;
                                     float maxForce = kJointed * m * kMouseGrabJointMaxLinearAcceleration;
 
-                                    ::physx::PxD6JointDrive linearDrive = physx::PxD6JointDrive(stiffness, damping, maxForce);
+                                    ::physx::PxD6JointDrive linearDrive = ::physx::PxD6JointDrive(stiffness, damping, maxForce);
                                     d6->setDrive(::physx::PxD6Drive::eX, linearDrive);
                                     d6->setDrive(::physx::PxD6Drive::eY, linearDrive);
                                     d6->setDrive(::physx::PxD6Drive::eZ, linearDrive);
@@ -787,7 +825,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                                     //max force
                                     maxForce = kJointed * inertia * kMouseGrabJointMaxAngularAcceleration;
 
-                                    physx::PxD6JointDrive angularDrive = physx::PxD6JointDrive(stiffness, damping, maxForce);
+                                    ::physx::PxD6JointDrive angularDrive = ::physx::PxD6JointDrive(stiffness, damping, maxForce);
                                     d6->setDrive(::physx::PxD6Drive::eTWIST, angularDrive);
                                     d6->setDrive(::physx::PxD6Drive::eSWING1, angularDrive);
                                     d6->setDrive(::physx::PxD6Drive::eSWING2, angularDrive);
@@ -796,7 +834,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                                 }
 
                             }
-                            drawGrabbedPointVisualization(position, position);
+                            drawGrabbedPointVisualization(mOwner.getAttachHandle(), position, position);
                         }
                     }
                     else
@@ -805,7 +843,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                         manipDist = distance; 
                         if (picker.targetActor != nullptr)
                         {
-                            drawGrabbedPointVisualization(position, position);
+                            drawGrabbedPointVisualization(mOwner.getAttachHandle(), position, position);
                         }
                     }
                 }
@@ -825,7 +863,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
 
                     const PxTransform worldTransform = picker.hitRigidActor->getGlobalPose();
                     const PxVec3 newWorldPt = worldTransform.transform(grabbingLocalPoint);
-                    drawGrabbedPointVisualization(newWorldPt, target);
+                    drawGrabbedPointVisualization(mOwner.getAttachHandle(), newWorldPt, target);
                 }
                 else if (picker.type != PickType::eNONE)
                 {
@@ -849,6 +887,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                 if (picker.targetActor != nullptr)
                 {
                     CARB_ASSERT(picker.physXScene->getScene());
+                    picker.physXScene->getInternalScene()->trackReleasedActiveActor(picker.targetActor);
                     picker.physXScene->getScene()->removeActor(*picker.targetActor);
                     SAFE_RELEASE(picker.targetActor);
                 }
@@ -859,7 +898,7 @@ static void applyManipCmd(const ManipCmd& cmd, float delta_time)
                 releasePickingDeformable();
             }
             picker.type = PickType::eNONE;
-            removePointVisualization();
+            removePointVisualization(mOwner.getAttachHandle());
             break;
         }
         break;
@@ -890,17 +929,19 @@ void RaycastManager::clearPickerForScene(const ::physx::PxScene* scene)
     }
 }
 
-void RaycastManager::onUpdateRaycasts(float delta_time) const
+void RaycastManager::onUpdateRaycasts(float delta_time)
 {
-    // Lock buffer and apply forces
+    // Lock buffer and apply forces with this owner captured explicitly.
+    struct Context { RaycastManager* manager; float dt; } context{ this, delta_time };
     mManipCmdBuffer.read(
         [](const ManipCmd* cmd, size_t size, void* userData) {
             for (const ManipCmd* stop = cmd + size; cmd < stop; ++cmd)
             {
-                applyManipCmd(*cmd, *(static_cast<float*>(userData)));
+                Context& context = *static_cast<Context*>(userData);
+                context.manager->applyManipCmd(*cmd, context.dt);
             }
         },
-        &delta_time);
+        &context);
 
     // Remove any relevant commands from the command buffer depending on execution type.
     mManipCmdBuffer.access([](std::vector<ManipCmd>& list, void* userData) {
@@ -934,7 +975,8 @@ void RaycastManager::push(const float* orig, const float* dir, float acceleratio
     ManipCmd cmd;
     carb::settings::ISettings* settings = carb::getCachedInterface<carb::settings::ISettings>();
     cmd.type = ManipCmd::ePush;
-    cmd.acceleration = settings->getAsFloat(kSettingMousePush);
+    cmd.acceleration = acceleration;
+    cmd.ignoreInvisible = settings->getAsBool(kSettingMouseGrabIgnoreInvisible);
     if (orig && dir)
     {
         cmd.orig = PxVec3(orig[0], orig[1], orig[2]);
@@ -956,6 +998,8 @@ void RaycastManager::grab(const float* orig, const float* dir)
     carb::settings::ISettings* settings = carb::getCachedInterface<carb::settings::ISettings>();
     cmd.type = settings->getAsBool(kSettingMouseGrabWithForce) ? ManipCmd::eGrabWithForce : ManipCmd::eGrabWithJoint;
     cmd.acceleration = 0.0f; // Unused
+    cmd.pickingForce = settings->getAsFloat(kSettingMousePickingForce);
+    cmd.ignoreInvisible = settings->getAsBool(kSettingMouseGrabIgnoreInvisible);
     if (orig && dir)
     {
         cmd.orig = PxVec3(orig[0], orig[1], orig[2]);
@@ -997,9 +1041,6 @@ void RaycastManager::handleInteractionEvent(const float* orig, const float* dir,
             }
         }}, nullptr );
 
-    static bool grabInProgress = false;
-    static bool pushInProgress = false;
-    static PhysicsInteractionEvent lastEvent = PhysicsInteractionEvent::eNone;
 
     switch(interactionEvent)
     {
@@ -1060,9 +1101,8 @@ void RaycastManager::handleInteractionEvent(const float* orig, const float* dir,
     lastEvent = interactionEvent;
 }
 
-void omni::physx::handleRaycast(const float* orig, const float* dir, bool input)
+void RaycastManager::handleRaycastInput(const float* orig, const float* dir, bool input)
 {
-    static bool lastInput = false;
     const bool mouseClicked = input && !lastInput;
 
     PhysicsInteractionEvent interactionEvent;
@@ -1078,7 +1118,7 @@ void omni::physx::handleRaycast(const float* orig, const float* dir, bool input)
     {
         interactionEvent = PhysicsInteractionEvent::eMouseDragEnded;
     }
-    OmniPhysX::getInstance().getRaycastManager().handleInteractionEvent(orig, dir, interactionEvent);
+    handleInteractionEvent(orig, dir, interactionEvent);
     lastInput = input;
 }
 
@@ -1090,7 +1130,8 @@ bool RaycastManager::interactiveActorRaycast(const carb::Float3* origin, const c
     PxRigidActor* rigidActor = nullptr;
     PhysXScene* physXScene = nullptr;
     PickType::Enum type;
-    bool hit = raycastSingle(toPhysX(*origin), toPhysX(*direction), kPickDistance, type, rigidActor, position, distance, deformableId, physXScene);
+    bool hit = raycastSingle(mOwner, toPhysX(*origin), toPhysX(*direction), kPickDistance, type, rigidActor, position, distance, deformableId, physXScene,
+        carb::getCachedInterface<carb::settings::ISettings>()->getAsBool(kSettingMouseGrabIgnoreInvisible));
 
     if (hit)
     {
@@ -1112,4 +1153,13 @@ bool RaycastManager::interactiveActorRaycast(const carb::Float3* origin, const c
         return hitRigidBodyOrLink || hitDeformable;
     }
     return false;
+}
+
+void omni::physx::handleRaycast(AttachHandle attach, const float* orig, const float* dir, bool input)
+{
+    RuntimeExecutionScope operation(attach);
+    if (!operation)
+        return;
+    if (usdparser::AttachedStage* owner = usdparser::UsdLoad::getUsdLoad()->getAttachedStageByHandle(attach))
+        owner->getRaycastManager().handleRaycastInput(orig, dir, input);
 }

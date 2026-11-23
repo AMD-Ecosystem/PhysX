@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef PXG_NARROWPHASE_CORE_H
 #define PXG_NARROWPHASE_CORE_H
@@ -54,8 +31,7 @@ namespace physx
 	class PxgCudaKernelWranglerManager;
 	class PxgNphaseImplementationContext;
 	class PxgGpuContext;
-	struct PxgFemFemContactInfo;
-	struct PxgFemOtherContactInfo;
+	struct PxgDeformablePairInfo;
 	struct PxgPersistentContactManifold;
 	class PxgParticleSystemCore;
 
@@ -75,7 +51,7 @@ namespace physx
 		struct ConvexHullData;
 		class TriangleMesh;
 		class DeformableVolumeMesh;
-		class BVTetrahedronMesh;
+		class TetrahedronMesh;
 		struct HeightFieldData;
 		class PersistentContactManifold;
 	}
@@ -547,6 +523,10 @@ namespace physx
 		void releaseContext();
 
 		CUstream getStream();
+#if PX_SUPPORT_OMNI_PVD
+		CUdeviceptr getOmniPvdContactStream() const { return mContactStream; }
+		CUdeviceptr getOmniPvdPatchStream() const { return mPatchStream; }
+#endif
 
 		void registerContactManager(PxsContactManager* cm, const Sc::ShapeInteraction* shapeInteraction, PxsContactManagerOutput& output, const PxU32 bucketId);
 		void unregisterContactManager(PxsContactManager* manager, const PxU32 bucketId);
@@ -566,7 +546,7 @@ namespace physx
 
 		bool isClothMeshGPUCompatible(const PxTriangleMeshGeometryLL& meshData); // skipping material counts
 
-		bool isTetMeshGPUCompatible(const Gu::BVTetrahedronMesh* meshData);
+		bool isTetMeshGPUCompatible(const Gu::TetrahedronMesh* meshData);
 
 		void computeRigidsToShapes();
 
@@ -623,6 +603,8 @@ namespace physx
 		void updateShapeMaterial(const PxsShapeCore& shapeCore);
 		PxU32 getShapeIndex(const PxsShapeCore& shapeCore);
 		void unregisterShape(const PxsShapeCore& shapeCore, const PxU32 transformCacheID, const bool isFemCloth);
+		// Drops one reference to a registered geometry, removing it once the count reaches zero.
+		void releaseGeometryReference(size_t geometryKey);
 
 	
 		void registerAggregate(const PxU32 transformCacheID);
@@ -663,16 +645,17 @@ namespace physx
 		void softbodyOtherContactApplyCollisionToSimMeshMapping(
 			PxgDevicePointer<float4> contactsd,
 			PxgDevicePointer<float4> barycentricsd,
-			PxgDevicePointer<PxgFemOtherContactInfo> contactInfosd,
+			PxgDevicePointer<PxgDeformablePairInfo> contactInfosd,
 			PxgDevicePointer<PxU32> totalNumCountsd,
 			PxgDevicePointer<PxU32> prevNumCountsd);
 
 	public:
 
 		void softbodyFemContactApplyCollisionToSimMeshMapping(
+			PxgDevicePointer<float4> contactsd,
 			PxgDevicePointer<float4> barycentrics0d,
 			PxgDevicePointer<float4> barycentrics1d,
-			PxgDevicePointer<PxgFemFemContactInfo> contactInfosd,
+			PxgDevicePointer<PxgDeformablePairInfo> contactInfosd,
 			PxgDevicePointer<PxU32> totalNumCountsd,
 			PxgDevicePointer<PxU32> prevNumCountsd, bool isSelfCollision, bool isCloth);
 
@@ -688,9 +671,13 @@ namespace physx
 
 		void registerContactManagerInternal(PxsContactManager* cm, const Sc::ShapeInteraction* shapeInteraction, PxgContactManagerInput* input, PxsContactManagerOutput& output, PxgNewContactManagers& newContactManagers);
 
-		void unregisterContactManagerInternal(PxsContactManager* cm, Cm::PinnableArray<PxU32>& removedIndices, PxgNewContactManagers& newContactManagers);
+		//PT: nbShapeInteractions is the number of live entries in the bucket's main pair list, needed to
+		//bounds-check the decoded id (NvBug 6163965) - same parameter as refreshContactManagerInternal below.
+		void unregisterContactManagerInternal(PxsContactManager* cm, PxU32 nbShapeInteractions, Cm::PinnableArray<PxU32>& removedIndices, PxgNewContactManagers& newContactManagers);
 	
-		void refreshContactManagerInternal(PxsContactManager* cm, PxsContactManagerOutput* cmOutputs, const Sc::ShapeInteraction** shapeInteractions, PxgContactManagerInput& input, PxgNewContactManagers& newContactManagers,
+		//PT: nbShapeInteractions is the number of live entries in cmOutputs/shapeInteractions - they are parallel
+		//arrays indexed by the same decoded id, and the count is needed to bounds-check it (NvBug 6163965).
+		void refreshContactManagerInternal(PxsContactManager* cm, PxsContactManagerOutput* cmOutputs, const Sc::ShapeInteraction** shapeInteractions, PxU32 nbShapeInteractions, PxgContactManagerInput& input, PxgNewContactManagers& newContactManagers,
 			Cm::PinnableArray<PxU32>& removedIndices);
 
 		template <typename Manifold> 
@@ -724,6 +711,22 @@ namespace physx
 	
 		void updateContactDistance(const PxReal* contactDistances, const PxU32 numContactDistance);
 	};
+
+	template <>
+	PX_FORCE_INLINE void PxgGpuNarrowphaseCore::mapMaterialIndices<PxsDeformableSurfaceMaterialData>(PxU16* gpuMaterialIndices,
+		const PxU16* materialIndices, PxU32 numMaterialIndices)
+	{
+		for(PxU32 i = 0; i < numMaterialIndices; ++i)
+			gpuMaterialIndices[i] = mapMaterialIndex<PxsDeformableSurfaceMaterialData>(materialIndices[i], mFEMClothMaterialsMap, mGpuFEMClothMaterialManager);
+	}
+
+	template <>
+	PX_FORCE_INLINE void PxgGpuNarrowphaseCore::mapMaterialIndices<PxsDeformableVolumeMaterialData>(PxU16* gpuMaterialIndices,
+		const PxU16* materialIndices, PxU32 numMaterialIndices)
+	{
+		for(PxU32 i = 0; i < numMaterialIndices; ++i)
+			gpuMaterialIndices[i] = mapMaterialIndex<PxsDeformableVolumeMaterialData>(materialIndices[i], mFEMMaterialsMap, mGpuFEMMaterialManager);
+	}
 
 	template <>
 	PX_FORCE_INLINE void PxgGpuNarrowphaseCore::mapMaterialIndices<PxsPBDMaterialData>(PxU16* gpuMaterialIndices,

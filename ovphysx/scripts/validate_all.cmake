@@ -1,18 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
-# ovphysx Full Validation Pipeline
-# Single-command entry point: build, install, wheel, and test everything.
+# @implements REQ-PACKAGING-CLOSURE-001
+# @covers AC-4
+
+# ovphysx full validation pipeline.
+# Single-command entry point that builds, installs, packages the wheel, and runs every test.
 #   cmake -P scripts/validate_all.cmake
 #
 # Options (passed via -D flags):
 #   -DBUILD_TYPE=Debug|Release    Build type (default: Release)
 #   -DDEV_PHYSX=ON|OFF            Build PhysX SDK from source (default: OFF)
+#   -DDEV_SCHEMA=ON|OFF           Build and test against a separate local schema provider
 #   -DSKIP_GLIBC_CHECK=ON         Skip the GLIBC/libstdc++ baseline check
 #                                 (forwarded to all nested install/build_wheel
 #                                 invocations via env var; useful when running
 #                                 on a host with newer glibc than the baseline)
 #   -DSKIP_LOCK_CHECK=ON          Skip packaging-lock checks in install/wheel
+#   -DOVPHYSX_SKIP_GPU_PASSES=ON  After the build, install and wheel, run only
+#                                 the tests that pass with no CUDA driver.
+#                                 scripts/validate_cpu.cmake sets this.
 #
 # Pipeline stages (all automatic):
 #   1. Build C++ libraries        (delegates to build.cmake, incremental)
@@ -20,11 +27,11 @@
 #   3. Build Python wheel         (validate_all -> build_wheel target)
 #   4. Run all tests              (C++, Python runtime, wheel smoke, samples)
 #
-# Same install + wheel + test phases as this script, after a full build (build.sh or
-# build.cmake), via the CMake target graph:
+# The same install + wheel + test phases are available after a full build (build.sh or
+# build.cmake) through the CMake target graph:
 #   cmake --build _build --target validate_all      # install + wheel + all tests
-# This file simply runs build.cmake first (Step 1), then that target—one command for
-# configure/build + validation. Scoped targets:
+# This script runs build.cmake first (Step 1) and then that target, so one command covers
+# configure/build and validation. Scoped targets:
 #   cmake --build _build --target validate_runtime  # runtime tests only
 #   cmake --build _build --target validate_wheel    # wheel tests only
 #
@@ -40,32 +47,51 @@ cmake_minimum_required(VERSION 3.16)
 get_filename_component(SCRIPT_DIR "${CMAKE_CURRENT_LIST_FILE}" DIRECTORY)
 get_filename_component(PROJECT_ROOT "${SCRIPT_DIR}/.." ABSOLUTE)
 
-set(BUILD_PATH "${PROJECT_ROOT}/_build")
+# Checked directly because this script delegates rather than including
+# build_common.cmake, so the failure would otherwise surface stages deep.
+include("${PROJECT_ROOT}/cmake/RequireCMakeVersion.cmake")
+ovphysx_require_cmake_version()
+
+include("${SCRIPT_DIR}/build_directory.cmake")
 
 message(STATUS "")
 message(STATUS "========================================")
-message(STATUS "ovphysx Full Validation Pipeline")
+if(OVPHYSX_SKIP_GPU_PASSES)
+    message(STATUS "ovphysx No-CUDA Validation Pipeline")
+else()
+    message(STATUS "ovphysx Full Validation Pipeline")
+endif()
 message(STATUS "========================================")
 message(STATUS "Project root: ${PROJECT_ROOT}")
 message(STATUS "")
-message(STATUS "This will run the full pipeline:")
+if(OVPHYSX_SKIP_GPU_PASSES)
+    message(STATUS "This will build, then run the tests that pass with no CUDA driver:")
+else()
+    message(STATUS "This will run the full pipeline:")
+endif()
 message(STATUS "  1. Build C++ libraries (incremental)")
+message(STATUS "  1b. Python type stubs (pyright)")
 message(STATUS "  2. Install SDK into _install/")
 message(STATUS "  3. Build Python wheel into _dist/")
-message(STATUS "  4. C++ unit tests (GPU + CPU)")
-message(STATUS "  5. C++ sample applications")
-message(STATUS "  6. Python runtime tests (pytest)")
-message(STATUS "  7. Python wheel smoke tests (python -m ovphysx, 4 Python versions)")
-message(STATUS "  8. Python sample applications (4 Python versions)")
+if(OVPHYSX_SKIP_GPU_PASSES)
+    message(STATUS "  4. Tests that pass with no CUDA driver")
+    message(STATUS "     GPU passes are not run")
+else()
+    message(STATUS "  4. C++ unit tests (GPU + CPU)")
+    message(STATUS "  5. C++ sample applications")
+    message(STATUS "  6. Python runtime tests (pytest)")
+    message(STATUS "  7. Python wheel smoke tests (python -m ovphysx, 4 Python versions)")
+    message(STATUS "  8. Python sample applications (4 Python versions)")
+endif()
 message(STATUS "")
 
-# --- Preflight: uv must be discoverable before the (long) build starts ---
-# Every Python stage (wheel, runtime tests, samples) needs uv (Astral). Resolve
-# it here, in the user's shell, so a missing uv fails in seconds with an
-# actionable message instead of ~10+ minutes later inside a nested install/test
-# step. Hints mirror build_common.cmake's resolver so the nested steps -- which
-# may run under an MSBuild/CTest env that does not inherit the interactive PATH
-# -- find the same uv this preflight does.
+# --- Preflight: uv must be discoverable before the long build starts ---
+# Every Python stage (wheel, runtime tests, samples) needs uv. Resolving it here,
+# in the user's shell, makes a missing uv fail in seconds with an actionable
+# message instead of much later inside a nested install/test step. The hints
+# mirror build_common.cmake's resolver so the nested steps, which may run under
+# an MSBuild/CTest environment that does not inherit the interactive PATH, find
+# the same uv this preflight does.
 set(_UV_HINTS
     "$ENV{ProgramData}/chocolatey/bin"
     "$ENV{USERPROFILE}/.local/bin"
@@ -86,16 +112,16 @@ endif()
 message(STATUS "Preflight: found uv at ${_VALIDATE_UV}")
 message(STATUS "")
 
-# Forward known SKIP_* flags to nested subprocesses via the environment.  The
+# Forward known SKIP_* flags to nested subprocesses via the environment. The
 # Step 2-8 hop runs `cmake --build _build --target validate_all`, whose inner
 # install_sdk / build_wheel custom targets invoke `cmake -P` with hardcoded
-# argument lists -- they cannot pick up extra -D flags from this script.  An
-# env var passes through every layer.  Each script-mode tool (install.cmake,
+# argument lists and cannot pick up extra -D flags from this script. An env var
+# passes through every layer, and each script-mode tool (install.cmake,
 # build_wheel.cmake, build_common.cmake) reads these as either -D or ENV{}.
 #
-# Value is forwarded as-is; CMake if() handles ON/OFF/TRUE/FALSE at the
-# consumer.  This means -DSKIP_GLIBC_CHECK=OFF forwards the literal string
-# "OFF", which the receiving if() correctly evaluates as falsy.
+# The value is forwarded as-is. The consumer's if() handles ON/OFF/TRUE/FALSE,
+# so -DSKIP_GLIBC_CHECK=OFF forwards the literal string "OFF", which the
+# receiving if() evaluates as false.
 foreach(_OVPHYSX_FORWARD_FLAG SKIP_GLIBC_CHECK SKIP_LOCK_CHECK OVPHYSX_USE_RELEASE_RUNTIME_DEPS)
     if(DEFINED ${_OVPHYSX_FORWARD_FLAG} AND NOT "${${_OVPHYSX_FORWARD_FLAG}}" STREQUAL "")
         set(ENV{${_OVPHYSX_FORWARD_FLAG}} "${${_OVPHYSX_FORWARD_FLAG}}")
@@ -104,15 +130,14 @@ endforeach()
 
 # --- Generator default for the aggregate flow (Windows host only) ---
 # build.cmake auto-detects the Visual Studio generator on Windows when VS is
-# installed. That is fine for interactive build.sh/build.bat (devs get a .sln),
-# but this aggregate runs install_sdk/build_wheel as MSBuild custom targets
-# whose environment does not inherit the interactive shell PATH, so nested
-# `cmake -P` scripts fail to find tools (uv, powershell). Ninja has no such
-# custom-target env isolation. Default this entry point to Ninja on Windows
-# unless the caller set GENERATOR explicitly. If a build tree already exists,
-# match its cached generator instead, to avoid build.cmake's generator-mismatch
-# fatal. Linux is untouched: build.cmake's generator logic is WIN32-only and
-# ignores GENERATOR elsewhere.
+# installed. That suits interactive build.sh/build.bat, but this aggregate runs
+# install_sdk/build_wheel as MSBuild custom targets whose environment does not
+# inherit the interactive shell PATH, so nested `cmake -P` scripts fail to find
+# tools (uv, powershell). Ninja has no such custom-target env isolation, so this
+# entry point defaults to Ninja on Windows unless the caller set GENERATOR
+# explicitly. An existing build tree keeps its cached generator instead, which
+# avoids build.cmake's generator-mismatch fatal. Linux is unaffected because
+# build.cmake's generator logic is WIN32-only and ignores GENERATOR elsewhere.
 if(CMAKE_HOST_WIN32 AND (NOT DEFINED ENV{GENERATOR} OR "$ENV{GENERATOR}" STREQUAL ""))
     if(EXISTS "${BUILD_PATH}/CMakeCache.txt")
         file(STRINGS "${BUILD_PATH}/CMakeCache.txt" _CACHED_GEN_LINE
@@ -136,16 +161,38 @@ if(CMAKE_HOST_WIN32 AND (NOT DEFINED ENV{GENERATOR} OR "$ENV{GENERATOR}" STREQUA
 endif()
 
 # --- Step 1: Build (always runs, incremental) ---
-set(_BUILD_CMD_ARGS -P "${SCRIPT_DIR}/build.cmake")
+# Append in the order given. list(INSERT 0) would reverse repeated -D flags,
+# and the last definition is the one cmake keeps.
+set(_BUILD_CMD_ARGS)
+list(APPEND _BUILD_CMD_ARGS "-DBUILD_DIR=${BUILD_PATH}")
 if(DEFINED BUILD_TYPE AND NOT BUILD_TYPE STREQUAL "")
-    list(INSERT _BUILD_CMD_ARGS 0 "-DBUILD_TYPE=${BUILD_TYPE}")
+    list(APPEND _BUILD_CMD_ARGS "-DBUILD_TYPE=${BUILD_TYPE}")
 endif()
 if(DEFINED DEV_PHYSX)
-    list(INSERT _BUILD_CMD_ARGS 0 "-DDEV_PHYSX=${DEV_PHYSX}")
+    list(APPEND _BUILD_CMD_ARGS "-DDEV_PHYSX=${DEV_PHYSX}")
+endif()
+if(DEFINED DEV_SCHEMA)
+    list(APPEND _BUILD_CMD_ARGS "-DDEV_SCHEMA=${DEV_SCHEMA}")
 endif()
 if(DEFINED OVPHYSX_USE_RELEASE_RUNTIME_DEPS)
-    list(INSERT _BUILD_CMD_ARGS 0 "-DOVPHYSX_USE_RELEASE_RUNTIME_DEPS=${OVPHYSX_USE_RELEASE_RUNTIME_DEPS}")
+    list(APPEND _BUILD_CMD_ARGS "-DOVPHYSX_USE_RELEASE_RUNTIME_DEPS=${OVPHYSX_USE_RELEASE_RUNTIME_DEPS}")
 endif()
+if(DEFINED CLEAN_BUILD AND NOT CLEAN_BUILD STREQUAL "")
+    list(APPEND _BUILD_CMD_ARGS "-DCLEAN_BUILD=${CLEAN_BUILD}")
+endif()
+if(DEFINED CLEAN_ONLY AND NOT CLEAN_ONLY STREQUAL "")
+    list(APPEND _BUILD_CMD_ARGS "-DCLEAN_ONLY=${CLEAN_ONLY}")
+endif()
+if(DEFINED OVPHYSX_PASSTHROUGH_ARGS AND NOT OVPHYSX_PASSTHROUGH_ARGS STREQUAL "")
+    foreach(_OVPHYSX_PASS IN LISTS OVPHYSX_PASSTHROUGH_ARGS)
+        # foreach unescapes \; . Escape again so this argument stays one
+        # element when the command list is expanded, including a value that
+        # itself contains a semicolon.
+        string(REPLACE ";" "\\;" _OVPHYSX_PASS_ESCAPED "${_OVPHYSX_PASS}")
+        list(APPEND _BUILD_CMD_ARGS "${_OVPHYSX_PASS_ESCAPED}")
+    endforeach()
+endif()
+list(APPEND _BUILD_CMD_ARGS -P "${SCRIPT_DIR}/build.cmake")
 
 message(STATUS "Step 1: Building (cmake ${_BUILD_CMD_ARGS})")
 message(STATUS "")
@@ -158,11 +205,22 @@ if(NOT BUILD_RESULT EQUAL 0)
     message(FATAL_ERROR "Build failed (exit code: ${BUILD_RESULT})")
 endif()
 
+message(STATUS "")
+message(STATUS "Step 1b: Python type stubs (pyright)")
+execute_process(
+    COMMAND ${CMAKE_COMMAND} -P "${SCRIPT_DIR}/test_pyright.cmake"
+    WORKING_DIRECTORY "${PROJECT_ROOT}"
+    RESULT_VARIABLE PYRIGHT_RESULT
+)
+if(NOT PYRIGHT_RESULT EQUAL 0)
+    message(FATAL_ERROR "pyright failed (exit code: ${PYRIGHT_RESULT})")
+endif()
+
 # --- Steps 2-8: Install, wheel, and all tests via validate_all target ---
 
-# Resolve build configuration for multi-config generators.
-# On Visual Studio generators, omitting --config defaults to Debug and can
-# trigger an unintended full rebuild when the main build/install was Release.
+# Resolve the build configuration for multi-config generators. On Visual Studio
+# generators, omitting --config defaults to Debug and can trigger an unintended
+# full rebuild when the main build/install was Release.
 file(STRINGS "${BUILD_PATH}/CMakeCache.txt" _CACHE_CONFIG_TYPES_LINE
     REGEX "^CMAKE_CONFIGURATION_TYPES:.*=")
 if(NOT DEFINED BUILD_TYPE OR BUILD_TYPE STREQUAL "")
@@ -174,6 +232,71 @@ if(NOT DEFINED BUILD_TYPE OR BUILD_TYPE STREQUAL "")
 endif()
 if(NOT DEFINED BUILD_TYPE OR BUILD_TYPE STREQUAL "")
     set(BUILD_TYPE "Release")
+endif()
+
+# No-CUDA path: install and wheel, then the test scripts that pass with no
+# driver. The validate_all CTest target is not built, so its GPU passes never
+# start. A missing CUDA driver does not fail this path.
+if(OVPHYSX_SKIP_GPU_PASSES)
+    set(ENV{OVPHYSX_SKIP_GPU_PASSES} "ON")
+    set(ENV{OVPHYSX_DISABLE_GPU} "1")
+    set(_CPU_BUILD_ARGS --build "${BUILD_PATH}" --target build_wheel)
+    set(_CPU_BUILD_DESC "cmake --build _build --target build_wheel")
+    if(_CACHE_CONFIG_TYPES_LINE)
+        list(APPEND _CPU_BUILD_ARGS --config "${BUILD_TYPE}")
+        string(APPEND _CPU_BUILD_DESC " --config ${BUILD_TYPE}")
+    endif()
+
+    message(STATUS "")
+    message(STATUS "Steps 2-3: Installing and building the wheel (${_CPU_BUILD_DESC})")
+    message(STATUS "")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} ${_CPU_BUILD_ARGS}
+        WORKING_DIRECTORY "${PROJECT_ROOT}"
+        RESULT_VARIABLE _CPU_WHEEL_RESULT
+    )
+    if(NOT _CPU_WHEEL_RESULT EQUAL 0)
+        message(FATAL_ERROR "build_wheel failed (exit code: ${_CPU_WHEEL_RESULT})")
+    endif()
+
+    set(_CPU_TEST_SCRIPTS
+        test_cpp.cmake
+        test_cpp_samples.cmake
+        test_python_runtime.cmake
+        test_python_wheel.cmake
+        test_python_samples.cmake
+        test_source_link.cmake
+    )
+    foreach(_CPU_TEST_SCRIPT IN LISTS _CPU_TEST_SCRIPTS)
+        message(STATUS "")
+        message(STATUS "Running ${_CPU_TEST_SCRIPT} (no CUDA driver)")
+        message(STATUS "")
+        # Same -D context the CTest custom targets pass. A bare cmake -P
+        # defaults BUILD_TYPE to Release and drops the source-link toolchain.
+        set(_CPU_SCRIPT_ARGS "-DBUILD_TYPE=${BUILD_TYPE}" "-DBUILD_DIR=${BUILD_PATH}")
+        if(_CPU_TEST_SCRIPT STREQUAL "test_source_link.cmake")
+            if(DEV_PHYSX)
+                list(APPEND _CPU_SCRIPT_ARGS "-DOVPHYSX_DEV_PHYSX=ON")
+            else()
+                list(APPEND _CPU_SCRIPT_ARGS "-DOVPHYSX_DEV_PHYSX=OFF")
+            endif()
+            list(APPEND _CPU_SCRIPT_ARGS
+                "-DSOURCE_LINK_CONTEXT_FILE=${BUILD_PATH}/source_link_context.cmake")
+        endif()
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} ${_CPU_SCRIPT_ARGS} -P "${SCRIPT_DIR}/${_CPU_TEST_SCRIPT}"
+            WORKING_DIRECTORY "${PROJECT_ROOT}"
+            RESULT_VARIABLE _CPU_TEST_RESULT
+        )
+        if(NOT _CPU_TEST_RESULT EQUAL 0)
+            message(FATAL_ERROR "${_CPU_TEST_SCRIPT} failed (exit code: ${_CPU_TEST_RESULT})")
+        endif()
+    endforeach()
+
+    message(STATUS "")
+    message(STATUS "No-CUDA validation passed")
+    message(STATUS "========================================")
+    return()
 endif()
 
 set(_VALIDATE_ARGS --build "${BUILD_PATH}" --target validate_all)

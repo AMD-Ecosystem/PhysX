@@ -1,35 +1,41 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-// NOTE: This file is included verbatim in documentation via literalinclude.
-// Tutorial marker comments below define the included range.
+/**
+ * @implements REQ-BUILD-UNIBUILD-001
+ * @covers AC-7
+ */
+
+// NOTE: This file is included in the documentation via literalinclude.
+// The tutorial marker comments below define the included range.
 //
-// Closed-loop ovstage sample (ADR-0007): drive control into ovphysx through the
-// attached ovstage Stage, step, then read EVERY simulated object type's output
-// back and write each column straight into ovstage.
+// Closed-loop ovstage sample (ADR-0007). Control is driven into ovphysx through
+// the attached ovstage Stage. After a step, a representative set of simulated
+// object types is queried, including the whole-articulation type, and each
+// returned column is written straight back into ovstage. This scene has no
+// articulation, so that query is empty.
 //
-// The read is ovstage-native: ovphysx_fetch_read_next hands back ovstage's own
+// The read is ovstage-native. ovphysx_fetch_read_next hands back ovstage's own
 // ovstage_read_group_t, which carries the interned prims.list handle and the
-// borrowed ovstage column tensors, so the write-back reuses BOTH verbatim
-// (ovstage_query_from_path_list(group->prims.list) + group->data.tensors as the
-// write data) -- no path rebuild, no tensor repack. Each group is valid until
-// ovphysx_release_group.
+// borrowed ovstage column tensors. The write-back reuses both verbatim, with no
+// path rebuild and no tensor repack. The group struct and prim list stay valid
+// until ovphysx_release_group, and the numeric storage until ovphysx_release_read.
 //
-// The destination attribute name is also an interned token: this sample renames
-// the output to "sim:<name>", so it resolves+interns that token ONCE per attribute
-// (sim_token_cache_t) and reuses it -- no per-group, per-frame string round-trip.
-// The dictionary used for that is ovstage's own shared source dictionary (fetched
-// via ovphysx_query_shared_dictionary), the same one that minted the group handles
-// -- there is no separate ovphysx-owned dictionary.
+// The destination attribute name is also an interned token. The sample renames
+// the output to "sim:<name>" and resolves and interns that token once per
+// attribute (sim_token_cache_t) rather than once per group per frame. The
+// dictionary used for that is the attached Stage's own path dictionary, from its
+// get_path_dictionary slot. There is no separate ovphysx-owned dictionary.
 //
-// The invariant that keeps physics from re-ingesting its own output (see the
-// ovstage Integration guide): control edits flow through
-// ovphysx_update_from_ovstage; physics output is written at ordinals that
-// ovphysx_update_from_ovstage never covers. We interleave two ordinal lanes for
-// that -- an even "control" lane (drained) and an odd "output" lane (never
-// drained).
+// Physics must not re-ingest its own output (see the ovstage Integration guide).
+// Control edits flow through ovphysx_update_from_ovstage, and physics output is
+// written at ordinals that call never covers. The sample interleaves two ordinal
+// lanes for that: an even control lane that is drained and an odd output lane
+// that never is.
 
 #include <ovphysx/ovphysx.h>
+#include <ovphysx/ovphysx_attributes.h>
+#include <ovphysx/ovphysx_config.h>
 #include <ovphysx/ovphysx_types.h>
 
 #include "ovstage_sample.h"                       // pulls in ovstage.h (write API + DLTensor)
@@ -40,50 +46,59 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Compile-time check: fail compilation if a C++ compiler is used.
+// The sample exercises the plain C API, so a C++ compiler is rejected.
 #ifdef __cplusplus
 #error "This file must be compiled as C, not C++"
 #endif
 
 // [tutorial-start]
-// The output attributes each simulated type can produce (see the ovstage
-// Integration guide). ovphysx_read skips names a type does not emit, and a type
-// with no objects yields no groups -- so iterating the full matrix is safe on
-// any scene.
+// A representative output-attribute set (see the ovstage Integration guide).
+// ovphysx_read skips names a type does not emit, and a type with no objects
+// yields no groups, so iterating this table is safe on any scene. Joint state is
+// left out: a joint group has one row per DOF, not ovstage's one array per joint
+// prim, so it is not forwarded verbatim; ovphysx_create_joint_arrays_from_read_group
+// (<ovphysx/ovphysx_utils.h>) regroups it into one array per joint.
 typedef struct
 {
-    ovphysx_sim_object_type_t type;
+    ovphysx_query_target_t type;
     const char* attrs[4];
     size_t attr_count;
 } output_spec_t;
 
 static const output_spec_t OUTPUT_SPECS[] = {
-    { OVPHYSX_OBJECT_RIGID_BODY,
+    { OVPHYSX_QUERY_TARGET_RIGID_BODY,
       { OVPHYSX_ATTR_POSITION, OVPHYSX_ATTR_ORIENTATION, OVPHYSX_ATTR_LINEAR_VELOCITY, OVPHYSX_ATTR_ANGULAR_VELOCITY }, 4 },
-    { OVPHYSX_OBJECT_ARTICULATION_LINK,
+    { OVPHYSX_QUERY_TARGET_ARTICULATION_LINK,
       { OVPHYSX_ATTR_POSITION, OVPHYSX_ATTR_ORIENTATION, OVPHYSX_ATTR_LINEAR_VELOCITY, OVPHYSX_ATTR_ANGULAR_VELOCITY }, 4 },
-    { OVPHYSX_OBJECT_ARTICULATION_JOINT, { OVPHYSX_ATTR_JOINT_POSITION, OVPHYSX_ATTR_JOINT_VELOCITY }, 2 },
-    { OVPHYSX_OBJECT_VEHICLE_WHEEL, { OVPHYSX_ATTR_POSITION, OVPHYSX_ATTR_ORIENTATION }, 2 },
-    { OVPHYSX_OBJECT_DEFORMABLE_VOLUME, { OVPHYSX_ATTR_POINTS, OVPHYSX_ATTR_VELOCITIES }, 2 },
-    { OVPHYSX_OBJECT_DEFORMABLE_SURFACE, { OVPHYSX_ATTR_POINTS, OVPHYSX_ATTR_VELOCITIES }, 2 },
-    { OVPHYSX_OBJECT_PARTICLE_SET, { OVPHYSX_ATTR_POINTS, OVPHYSX_ATTR_VELOCITIES }, 2 },
+    { OVPHYSX_QUERY_TARGET_ARTICULATION,
+      { OVPHYSX_ATTR_ROOT_POSITION, OVPHYSX_ATTR_ROOT_ORIENTATION, OVPHYSX_ATTR_ROOT_LINEAR_VELOCITY,
+        OVPHYSX_ATTR_ROOT_ANGULAR_VELOCITY },
+      4 },
+    { OVPHYSX_QUERY_TARGET_VEHICLE_WHEEL, { OVPHYSX_ATTR_POSITION, OVPHYSX_ATTR_ORIENTATION }, 2 },
+    { OVPHYSX_QUERY_TARGET_DEFORMABLE_VOLUME, { OVPHYSX_ATTR_POINTS, OVPHYSX_ATTR_VELOCITIES }, 2 },
+    { OVPHYSX_QUERY_TARGET_DEFORMABLE_SURFACE, { OVPHYSX_ATTR_POINTS, OVPHYSX_ATTR_VELOCITIES }, 2 },
+    { OVPHYSX_QUERY_TARGET_PARTICLE_SET, { OVPHYSX_ATTR_POINTS, OVPHYSX_ATTR_VELOCITIES }, 2 },
 };
 enum { NUM_OUTPUT_SPECS = (int)(sizeof(OUTPUT_SPECS) / sizeof(OUTPUT_SPECS[0])) };
 
-// Block on an ovstage enqueue op (write / floor advance) and release it.
-static void ovstage_sample_wait(ovstage_instance_t* inst, ovstage_enqueue_result_t r)
+// Block on an ovstage enqueue op (write or floor advance) and release it.
+// Returns 1 on success, 0 on failure. The outcome is returned rather than only
+// printed, so a run whose writes all failed cannot exit 0.
+static int ovstage_sample_wait(ovstage_instance_t* inst, ovstage_enqueue_result_t r)
 {
     if (r.status != OVSTAGE_OK)
     {
         fprintf(stderr, "ovstage enqueue failed: %s\n", ovstage_get_error_string(inst, r.status));
-        return;
+        return 0;
     }
-    if (r.op_index != OVSTAGE_INVALID_OP_ID)
+    int ok = 1;
+    if (r.op_index.raw_id != 0)
     {
         ovstage_op_wait_result_t wait_result = { 0 };
         const ovstage_api_status_t status = ovstage_wait_op(inst, r.op_index, OVSTAGE_TIMEOUT_INFINITE, &wait_result);
         if (status != OVSTAGE_OK)
         {
+            ok = 0;
             fprintf(stderr, "ovstage operation failed: %s\n", ovstage_get_error_string(inst, status));
             for (size_t i = 0; i < wait_result.error_op_id_count; ++i)
             {
@@ -93,33 +108,34 @@ static void ovstage_sample_wait(ovstage_instance_t* inst, ovstage_enqueue_result
         }
         ovstage_release_op(inst, r.op_index);
     }
+    return ok;
 }
 
-static void advance_floor(ovstage_instance_t* inst, ovstage_ordinal_t ordinal)
+static int advance_floor(ovstage_instance_t* inst, ovstage_ordinal_t ordinal)
 {
     ovstage_write_floor_desc_t desc;
     memset(&desc, 0, sizeof(desc));
     desc.ordinal = ordinal;
     desc.scope = OVSTAGE_SCOPE_ALL;
-    ovstage_sample_wait(inst, ovstage_advance_write_floor(inst, &desc));
+    return ovstage_sample_wait(inst, ovstage_advance_write_floor(inst, &desc));
 }
 
-static ovx_string_or_token_t name_str(const char* s)
+static ovx_token_or_string_t name_str(const char* s)
 {
-    ovx_string_or_token_t n;
-    n.token = 0;
+    ovx_token_or_string_t n;
+    n.token = OVX_INVALID_TOKEN;
     n.string.ptr = s;
-    /* bounded length: callers pass short attribute/type identifiers */
+    /* Callers pass short attribute and type identifiers, so 256 bounds the scan. */
     n.string.length = strnlen(s, 256);
     return n;
 }
 
-// An attribute name given as an already-interned token (token != 0 selects the
-// token form; the string side is ignored). Reusing an interned token skips the
-// string round-trip ovstage would otherwise do to re-intern a name.
-static ovx_string_or_token_t name_tok(ovx_token_t tok)
+// An attribute name given as an already-interned token. A NULL string selects the
+// token form (a non-NULL string would take precedence). Reusing an interned token skips
+// the string round-trip ovstage would otherwise do to re-intern a name.
+static ovx_token_or_string_t name_tok(ovx_token_t tok)
 {
-    ovx_string_or_token_t n;
+    ovx_token_or_string_t n;
     n.token = tok;
     n.string.ptr = NULL;
     n.string.length = 0;
@@ -127,30 +143,29 @@ static ovx_string_or_token_t name_tok(ovx_token_t tok)
 }
 
 // Caches the interned "sim:<name>" token for each emitted attribute token, so the
-// token -> string -> "sim:" concat -> re-intern work happens at most ONCE per
-// attribute name for the whole run, not once per group per frame. After the first
-// sight the write-back passes a plain interned token (no malloc, no memcpy, no
-// string round-trip). The map keys on the emitted group->attribute token, which is
-// stable because every group is interned in the same shared source dictionary.
+// token -> string -> "sim:" concat -> re-intern work happens once per attribute
+// name for the whole run, not once per group per frame. The map keys on the
+// emitted group->attribute token, which is stable because every group is
+// interned in the same shared source dictionary.
 enum { SIM_TOKEN_CACHE_CAP = 16 };
 typedef struct
 {
     ovx_token_t emitted[SIM_TOKEN_CACHE_CAP]; // group->attribute as read back
-    ovx_token_t sim[SIM_TOKEN_CACHE_CAP];     // interned "sim:<name>" (0 == unresolved)
+    ovx_token_t sim[SIM_TOKEN_CACHE_CAP];     // interned "sim:<name>" (OVX_INVALID_TOKEN == unresolved)
     int count;
 } sim_token_cache_t;
 
 // Return the interned "sim:<name>" token for an emitted attribute token, interning
-// it on first sight. Returns 0 if the name cannot be resolved/interned (caller
-// falls back to a literal string name).
+// it on first sight. Returns OVX_INVALID_TOKEN if the name cannot be resolved or interned, and
+// the caller then falls back to a literal string name.
 static ovx_token_t sim_token_for(
     sim_token_cache_t* cache, path_dictionary_instance_t* dict, ovx_token_t emitted)
 {
     for (int i = 0; i < cache->count; ++i)
-        if (cache->emitted[i] == emitted)
+        if (ovx_token_equal(cache->emitted[i], emitted))
             return cache->sim[i];
 
-    ovx_token_t sim = 0;
+    ovx_token_t sim = OVX_INVALID_TOKEN;
     ovx_string_t name = { NULL, 0 };
     if (dict && path_dictionary_get_strings_from_tokens(dict, &emitted, 1, &name).status == OVX_API_SUCCESS
         && name.ptr)
@@ -161,9 +176,9 @@ static ovx_token_t sim_token_for(
         memcpy(buf + 4, name.ptr, n);
         buf[4 + n] = '\0';
         ovx_string_t s = { buf, strnlen(buf, sizeof buf) };
-        // Interning is idempotent: equal strings yield equal tokens, so this both
+        // Interning is idempotent. Equal strings yield equal tokens, so this both
         // mints the token and lets the cache short-circuit every later sighting.
-        ovx_token_t minted = 0;
+        ovx_token_t minted = OVX_INVALID_TOKEN;
         if (path_dictionary_create_tokens_from_strings(dict, &s, 1, &minted).status == OVX_API_SUCCESS)
             sim = minted;
     }
@@ -178,14 +193,14 @@ static ovx_token_t sim_token_for(
 }
 
 // app -> physics: author physics:velocity on every prim covered by `g`, reusing
-// the group's interned prim_list directly (no path rebuild). Only the new
-// velocity values are built; the prim set is reused verbatim.
-static void author_velocity(
+// the group's interned prim_list directly with no path rebuild. Only the new
+// velocity values are built. The prim set is reused verbatim.
+static int author_velocity(
     ovstage_instance_t* inst, const ovstage_read_group_t* g, ovstage_ordinal_t ordinal, const float vel[3])
 {
     const uint32_t count = g->prims.count;
-    if (count == 0 || g->prims.list == 0)
-        return;
+    if (count == 0 || !ovx_primpath_list_is_valid(g->prims.list))
+        return 1; // nothing to author is not a failure
 
     float* values = (float*)malloc((size_t)count * 3 * sizeof(float));
     for (uint32_t i = 0; i < count; ++i)
@@ -211,96 +226,269 @@ static void author_velocity(
     w.tensors = &t;
     w.tensor_count = 1;
     w.is_array = false;
-    // Match the existing USD attribute's metadata; no new semantic needs to be
-    // stamped when updating physics:velocity.
+    // Match the existing USD attribute's metadata. Updating physics:velocity
+    // stamps no new semantic.
     w.semantic = OVSTAGE_SEMANTIC_NONE;
 
+    int ok = 0;
     ovstage_query_handle_t q = OVSTAGE_INVALID_QUERY_HANDLE;
-    if (ovstage_query_from_path_list(inst, (ovx_primpath_list_t)g->prims.list, &q) == OVSTAGE_OK
-        && q != OVSTAGE_INVALID_QUERY_HANDLE)
+    if (ovstage_query_from_path_list(inst, g->prims.list, &q) == OVSTAGE_OK
+        && q.raw_id != 0)
     {
-        ovstage_sample_wait(inst, ovstage_write_attribute(inst, q, name_str("physics:velocity"), ordinal, w,
-                                                          OVSTAGE_PRIM_MODE_UPSERT));
-        ovstage_sample_wait(inst, ovstage_release_query(inst, q));
+        ok = ovstage_sample_wait(inst, ovstage_write_attribute(inst, q, name_str("physics:velocity"), ordinal, w,
+                                                               OVSTAGE_PRIM_MODE_UPSERT));
+        // Released either way. A failed write still owns the query.
+        ok = ovstage_sample_wait(inst, ovstage_release_query(inst, q)) && ok;
+    }
+    else
+    {
+        fprintf(stderr, "ovstage_query_from_path_list failed for physics:velocity\n");
     }
     free(values);
+    return ok;
+}
+
+// One pinned write-back, held until its ordinal is sealed so it can be read back.
+//
+// The output ordinal is above the effective write floor until advance_floor() seals it, and
+// ovstage refuses to read state above the floor with OVSTAGE_ERROR_WRITE_FLOOR_VIOLATION, for
+// both snapshot and range reads. The round trip therefore straddles the seal: pin during the
+// write, read after advance_floor().
+//
+// The prim list is borrowed from the read group and dies with it, so a reference is taken here
+// and released after the read back. That is the path_dictionary ownership rule for handles that
+// outlive the producing op.
+typedef struct
+{
+    int armed;
+    ovx_primpath_list_t list;
+    ovx_token_t attr;
+    ovstage_ordinal_t ordinal;
+    path_dictionary_instance_t* dict;
+} pending_readback_t;
+
+// Read the pinned sim:<name> column back out of ovstage after its ordinal has been sealed.
+//
+// An accepted write only proves acceptance. An accepted write whose value cannot be retrieved
+// is exactly the failure this sample has to catch, so the loop is only closed by this read.
+// The prim list the write used is reused, so the prims are identical by construction and a
+// mismatch can only be the write-back.
+//
+// Returns 1 if a group carrying data came back. Always clears the pin.
+static int verify_pending_readback(ovstage_instance_t* inst, pending_readback_t* pending)
+{
+    if (!pending->armed)
+        return 1; // nothing pinned this frame. run() checks that one was verified overall
+
+    int ok = 0;
+    ovstage_query_handle_t q = OVSTAGE_INVALID_QUERY_HANDLE;
+    if (ovstage_query_from_path_list(inst, pending->list, &q) == OVSTAGE_OK
+        && q.raw_id != 0)
+    {
+        ovstage_read_handle_t read = OVSTAGE_INVALID_READ_HANDLE;
+        // A latest snapshot, not a range pinned to the write. After the seal the column's latest
+        // committed payload is the value just written, and pinning the ordinal would trip the
+        // write-floor check.
+        ovstage_ordinal_range_t range;
+        memset(&range, 0, sizeof(range));
+        range.end_ordinal = pending->ordinal;
+        range.has_start_ordinal = false;
+
+        const ovstage_enqueue_result_t rr =
+            ovstage_read_attributes(inst, q, &pending->attr, 1, range, &read);
+        if (rr.status != OVSTAGE_OK)
+        {
+            fprintf(stderr, "read-back: ovstage_read_attributes failed (status %d)\n", (int)rr.status);
+        }
+        else
+        {
+            int seen_values = 0;
+            for (;;)
+            {
+                ovstage_read_group_t g;
+                size_t fetched = 0;
+                memset(&g, 0, sizeof(g));
+                const ovstage_api_status_t fs =
+                    ovstage_fetch_read_next(inst, read, OVSTAGE_TIMEOUT_INFINITE, &g, 1, &fetched);
+                if (fs == OVSTAGE_ERROR_END_OF_ITERATION)
+                    break;
+                if (fs != OVSTAGE_OK)
+                {
+                    fprintf(stderr, "read-back: ovstage_fetch_read_next failed (status %d)\n", (int)fs);
+                    break;
+                }
+                // A delete column carries no values. Counting it would let an erased column read as
+                // a successful round trip. One attribute was requested, so a group has one column.
+                if (g.column_count == 1 && !g.columns[0].is_delete && g.columns[0].data.tensor_count > 0 &&
+                    g.columns[0].data.tensors)
+                    ++seen_values;
+                ovstage_release_groups(inst, &g, 1);
+            }
+            ok = ovstage_sample_wait(inst, rr) && seen_values > 0;
+            ok = ovstage_sample_wait(inst, ovstage_release_read(inst, read)) && ok;
+            if (seen_values == 0)
+                fprintf(stderr, "read-back: no sim column came back at ordinal %llu\n",
+                        (unsigned long long)pending->ordinal);
+        }
+        ovstage_sample_wait(inst, ovstage_release_query(inst, q));
+    }
+    else
+    {
+        fprintf(stderr, "read-back: ovstage_query_from_path_list failed\n");
+    }
+
+    // Drop the pin either way. A failed read must not leak the reference.
+    if (pending->dict)
+        path_dictionary_release_path_list_reference(pending->dict, pending->list);
+    memset(pending, 0, sizeof(*pending));
+    return ok;
 }
 
 // physics -> app: write one read-output group back into ovstage under
-// sim:<attribute> at `ordinal`, reusing the group's interned prim_list AND its
-// borrowed ovstage column tensors verbatim -- the faithful no-repack write-back.
-// The destination name is the cached interned "sim:<name>" token (built once per
-// attribute, see sim_token_for), so the write passes a token with no per-call
-// string work. These output ordinals are never drained by ovphysx_update_from_ovstage.
-static void dump_group(ovstage_instance_t* inst,
-                       sim_token_cache_t* tokens,
-                       path_dictionary_instance_t* dict,
-                       const ovstage_read_group_t* g,
-                       ovstage_ordinal_t ordinal)
+// sim:<attribute> at `ordinal`, reusing the group's interned prim_list and its
+// borrowed ovstage column tensors verbatim. The destination name is the cached
+// interned "sim:<name>" token (see sim_token_for), so the write passes a token
+// with no per-call string work. These output ordinals are never drained by
+// ovphysx_update_from_ovstage. Returns 1 if the group was written back or there
+// was nothing to write, 0 on failure.
+static int dump_group(ovstage_instance_t* inst,
+                      sim_token_cache_t* tokens,
+                      path_dictionary_instance_t* dict,
+                      const ovstage_read_group_t* g,
+                      ovstage_ordinal_t ordinal,
+                      int* out_written,
+                      pending_readback_t* out_pending)
 {
-    if (g->is_delete || g->data.tensor_count == 0 || !g->data.tensors || g->prims.list == 0)
-        return;
+    if (g->columns[0].is_delete || g->columns[0].data.tensor_count == 0 || !g->columns[0].data.tensors
+        || !ovx_primpath_list_is_valid(g->prims.list))
+        return 1; // nothing to write back. Not a failure and not a dumped group either
 
-    // The interned "sim:<name>" token for this emitted attribute (resolved+interned
-    // once, then cached). Same shared dictionary as the group, so the token is
-    // valid for the ovstage write target with no re-intern. Fall back to a literal
-    // name only if the token could not be resolved.
-    const ovx_token_t sim = sim_token_for(tokens, dict, (ovx_token_t)g->attribute);
-    const ovx_string_or_token_t attr = sim ? name_tok(sim) : name_str("sim:value");
+    // The interned "sim:<name>" token for this emitted attribute, resolved once and
+    // then cached. It comes from the same shared dictionary as the group, so it is
+    // valid as the ovstage write target with no re-intern. A literal name is the
+    // fallback when the token could not be resolved.
+    const ovx_token_t sim = sim_token_for(tokens, dict, g->columns[0].attribute);
+    const ovx_token_or_string_t attr = ovx_token_is_valid(sim) ? name_tok(sim) : name_str("sim:value");
 
-    // Reuse the group's data block verbatim: the borrowed tensors are already in
+    // Reuse the group's data block verbatim. The borrowed tensors are already in
     // ovstage column layout (tuple width in dtype.lanes), so they assign straight
-    // into the write payload -- no per-tensor reshape, no copy.
+    // into the write payload without reshape or copy.
     ovstage_write_data_t w;
     memset(&w, 0, sizeof(w));
-    w.tensors = g->data.tensors;
-    w.tensor_count = g->data.tensor_count;
-    w.semantic = g->semantic;
-    w.is_array = g->is_array;
+    w.tensors = g->columns[0].data.tensors;
+    w.tensor_count = g->columns[0].data.tensor_count;
+    w.semantic = g->columns[0].semantic;
+    w.is_array = g->columns[0].is_array;
 
     ovstage_query_handle_t q = OVSTAGE_INVALID_QUERY_HANDLE;
-    if (ovstage_query_from_path_list(inst, (ovx_primpath_list_t)g->prims.list, &q) == OVSTAGE_OK
-        && q != OVSTAGE_INVALID_QUERY_HANDLE)
+    if (ovstage_query_from_path_list(inst, g->prims.list, &q) != OVSTAGE_OK
+        || q.raw_id == 0)
     {
-        ovstage_sample_wait(inst, ovstage_write_attribute(inst, q, attr, ordinal, w, OVSTAGE_PRIM_MODE_UPSERT));
-        ovstage_sample_wait(inst, ovstage_release_query(inst, q));
+        fprintf(stderr, "ovstage_query_from_path_list failed for a read group\n");
+        return 0;
     }
+
+    int ok = ovstage_sample_wait(inst, ovstage_write_attribute(inst, q, attr, ordinal, w, OVSTAGE_PRIM_MODE_UPSERT));
+
+    // Pin one write per run for the post-seal read-back. It is pinned rather than read here
+    // because the ordinal is still above the write floor (see pending_readback_t). One per run
+    // is enough, since the round trip has the same shape for every attribute. The pin is skipped
+    // when the sim token could not be interned, because the read is by token. `run()` fails if
+    // nothing was ever verified, so skipping cannot quietly become never.
+    if (ok && out_pending && !out_pending->armed && ovx_token_is_valid(sim) && dict
+        && path_dictionary_add_path_list_reference(dict, g->prims.list).status == OVX_API_SUCCESS)
+    {
+        out_pending->armed = 1;
+        out_pending->list = g->prims.list;
+        out_pending->attr = sim;
+        out_pending->ordinal = ordinal;
+        out_pending->dict = dict;
+    }
+
+    // Released either way. A failed write still owns the query.
+    ok = ovstage_sample_wait(inst, ovstage_release_query(inst, q)) && ok;
+    if (ok)
+        ++(*out_written);
+    return ok;
 }
 
-// app -> physics: nudge every rigid body sideways. Read RIGID_BODY, reuse each
-// fixed group's prim_list to author physics:velocity. Returns 1 if anything was
-// authored (so the caller knows to drain the control ordinal).
+// app -> physics: nudge every rigid body sideways. Read RIGID_BODY and reuse each
+// fixed group's prim_list to author physics:velocity.
+//
+// Returns the number of groups authored, or -1 if any step failed. Success and failure are
+// tracked separately so that a fetch or release failure after a successfully authored group
+// is not reported as a healthy control update that the caller then drains.
 static int author_rigid_body_velocity(
-    ovphysx_handle_t handle, ovstage_instance_t* inst, ovstage_ordinal_t ordinal, const float vel[3])
+    ovphysx_instance_handle_t handle, ovstage_instance_t* inst, ovstage_ordinal_t ordinal, const float vel[3])
 {
     int authored = 0;
+    int failed = 0;
     ovphysx_query_handle_t query = 0;
-    if (ovphysx_query(handle, OVPHYSX_OBJECT_RIGID_BODY, OVPHYSX_SCOPE_ALL, &query).status != OVPHYSX_API_SUCCESS
-        || query == 0)
-        return 0;
-
-    const ovx_string_or_token_t names[] = { name_str(OVPHYSX_ATTR_POSITION) };
+    const ovphysx_result_t qr = ovphysx_sample_complete_task(handle, ovphysx_query(handle, OVPHYSX_QUERY_TARGET_RIGID_BODY, OVPHYSX_SCOPE_ALL, &query, NULL));
+    if (qr.status != OVPHYSX_API_SUCCESS || query == 0)
+    {
+        // A query error is not "no rigid bodies". Conflating them would let a broken read path
+        // pass as an empty scene.
+        fprintf(stderr, "ovphysx_query(RIGID_BODY) failed (status %d)\n", (int)qr.status);
+        if (query != 0)
+            ovphysx_sample_complete_task(handle, ovphysx_release_query(handle, query));
+        return -1;
+    }
+    const ovx_token_or_string_t names[] = { name_str(OVPHYSX_ATTR_POSITION) };
     ovphysx_read_handle_t read = 0;
-    if (ovphysx_read(handle, query, names, 1, &read).status == OVPHYSX_API_SUCCESS && read != 0)
+    const ovphysx_result_t rr = ovphysx_sample_complete_task(handle, ovphysx_read(handle, query, names, 1, (ovstage_cuda_sync_t){0, 0}, &read, NULL));
+    if (rr.status != OVPHYSX_API_SUCCESS || read == 0)
+    {
+        fprintf(stderr, "ovphysx_read(RIGID_BODY) failed (status %d)\n", (int)rr.status);
+        if (read != 0)
+            ovphysx_sample_complete_task(handle, ovphysx_release_read(handle, read));
+        failed = 1;
+    }
+    else
     {
         for (;;)
         {
             // Producer-owned: fetch hands back a borrowed ovstage_read_group_t*.
             const ovstage_read_group_t* g = NULL;
-            const ovphysx_result_t r = ovphysx_fetch_read_next(handle, read, &g);
-            if (r.status == OVPHYSX_API_END_OF_ITERATION || r.status != OVPHYSX_API_SUCCESS)
-                break;
-            if (!g->is_array) // standalone bodies carry a writable physics:velocity
+            const ovphysx_result_t r = ovphysx_sample_complete_task(handle, ovphysx_fetch_read_next(handle, read, &g));
+            if (r.status == OVPHYSX_API_SUCCESS && !g)
+                break; // exhausted. The only exit that is not a failure
+            if (r.status != OVPHYSX_API_SUCCESS)
             {
-                author_velocity(inst, g, ordinal, vel);
-                authored = 1;
+                fprintf(stderr, "ovphysx_fetch_read_next(RIGID_BODY) failed (status %d)\n", (int)r.status);
+                failed = 1;
+                break;
             }
-            ovphysx_release_group(handle, read, g->read_group_id);
+            if (!g->columns[0].is_array) // standalone bodies carry a writable physics:velocity
+            {
+                // Counts writes that succeeded, not writes attempted. The caller drains the control
+                // ordinal based on this count, and draining after a failed write would make the
+                // loop look closed when it is not.
+                if (author_velocity(inst, g, ordinal, vel))
+                    ++authored;
+                else
+                    failed = 1;
+            }
+            if (ovphysx_sample_complete_task(handle, ovphysx_release_group(handle, read, g->read_group_id)).status != OVPHYSX_API_SUCCESS)
+            {
+                fprintf(stderr, "ovphysx_release_group(RIGID_BODY) failed\n");
+                failed = 1;
+            }
+            if (failed)
+                break;
         }
-        ovphysx_release_read(handle, read);
+        if (ovphysx_sample_complete_task(handle, ovphysx_release_read(handle, read)).status != OVPHYSX_API_SUCCESS)
+        {
+            fprintf(stderr, "ovphysx_release_read(RIGID_BODY) failed\n");
+            failed = 1;
+        }
     }
-    ovphysx_release_query(handle, query);
-    return authored;
+    if (ovphysx_sample_complete_task(handle, ovphysx_release_query(handle, query)).status != OVPHYSX_API_SUCCESS)
+    {
+        fprintf(stderr, "ovphysx_release_query(RIGID_BODY) failed\n");
+        failed = 1;
+    }
+    return failed ? -1 : authored;
 }
 
 typedef struct
@@ -323,32 +511,40 @@ static double absolute_double(double value)
 
 // Read one fixed-width rigid-body vector column and summarize its x component.
 // The sample runs in CPU mode, so the borrowed DLTensor data is directly readable.
-static int read_rigid_body_vector_stats(ovphysx_handle_t handle, const char* attribute, vector_stats_t* stats)
+static int read_rigid_body_vector_stats(ovphysx_instance_handle_t handle, const char* attribute, vector_stats_t* stats)
 {
     memset(stats, 0, sizeof(*stats));
     stats->min_x = FLT_MAX;
     stats->max_x = -FLT_MAX;
 
     ovphysx_query_handle_t query = 0;
-    if (ovphysx_query(handle, OVPHYSX_OBJECT_RIGID_BODY, OVPHYSX_SCOPE_ALL, &query).status
-            != OVPHYSX_API_SUCCESS
-        || query == 0)
+    const ovphysx_result_t query_result =
+        ovphysx_sample_complete_task(
+            handle, ovphysx_query(handle, OVPHYSX_QUERY_TARGET_RIGID_BODY, OVPHYSX_SCOPE_ALL, &query, NULL));
+    if (query_result.status != OVPHYSX_API_SUCCESS || query == 0)
+    {
+        if (query != 0)
+            ovphysx_sample_complete_task(handle, ovphysx_release_query(handle, query));
         return 0;
+    }
 
     int valid = 1;
-    const ovx_string_or_token_t name = name_str(attribute);
+    const ovx_token_or_string_t name = name_str(attribute);
     ovphysx_read_handle_t read = 0;
-    if (ovphysx_read(handle, query, &name, 1, &read).status != OVPHYSX_API_SUCCESS || read == 0)
+    if (ovphysx_sample_complete_task(handle, ovphysx_read(handle, query, &name, 1, (ovstage_cuda_sync_t){0, 0}, &read, NULL)).status != OVPHYSX_API_SUCCESS || read == 0)
     {
-        ovphysx_release_query(handle, query);
+        if (read != 0)
+            ovphysx_sample_complete_task(handle, ovphysx_release_read(handle, read));
+        if (ovphysx_sample_complete_task(handle, ovphysx_release_query(handle, query)).status != OVPHYSX_API_SUCCESS)
+            valid = 0;
         return 0;
     }
 
     for (;;)
     {
         const ovstage_read_group_t* g = NULL;
-        const ovphysx_result_t r = ovphysx_fetch_read_next(handle, read, &g);
-        if (r.status == OVPHYSX_API_END_OF_ITERATION)
+        const ovphysx_result_t r = ovphysx_sample_complete_task(handle, ovphysx_fetch_read_next(handle, read, &g));
+        if (r.status == OVPHYSX_API_SUCCESS && !g)
             break;
         if (r.status != OVPHYSX_API_SUCCESS || !g)
         {
@@ -356,9 +552,10 @@ static int read_rigid_body_vector_stats(ovphysx_handle_t handle, const char* att
             break;
         }
 
-        if (!g->is_delete && !g->is_array && g->data.tensor_count == 1 && g->data.tensors)
+        if (!g->columns[0].is_delete && !g->columns[0].is_array && g->columns[0].data.tensor_count == 1
+            && g->columns[0].data.tensors)
         {
-            const DLTensor* tensor = &g->data.tensors[0];
+            const DLTensor* tensor = &g->columns[0].data.tensors[0];
             if (!tensor->data || tensor->device.device_type != kDLCPU || tensor->dtype.code != kDLFloat
                 || tensor->dtype.bits != 32 || tensor->dtype.lanes < 1 || tensor->ndim != 1 || !tensor->shape)
             {
@@ -380,60 +577,108 @@ static int read_rigid_body_vector_stats(ovphysx_handle_t handle, const char* att
                 }
             }
         }
-        ovphysx_release_group(handle, read, g->read_group_id);
+        if (ovphysx_sample_complete_task(handle, ovphysx_release_group(handle, read, g->read_group_id)).status != OVPHYSX_API_SUCCESS)
+            valid = 0;
         if (!valid)
             break;
     }
 
-    ovphysx_release_read(handle, read);
-    ovphysx_release_query(handle, query);
+    if (ovphysx_sample_complete_task(handle, ovphysx_release_read(handle, read)).status != OVPHYSX_API_SUCCESS)
+        valid = 0;
+    if (ovphysx_sample_complete_task(handle, ovphysx_release_query(handle, query)).status != OVPHYSX_API_SUCCESS)
+        valid = 0;
     return valid && stats->count > 0;
 }
 
-// physics -> app: read every output type and dump each group back to ovstage at
+// physics -> app: read every type in OUTPUT_SPECS and dump each group to ovstage at
 // `ordinal`. `tokens` caches the interned "sim:<name>" write-back tokens across
-// types and frames. Returns the number of groups dumped.
-static int read_and_dump_all(
-    ovphysx_handle_t handle, ovstage_instance_t* inst, sim_token_cache_t* tokens, ovstage_ordinal_t ordinal)
+// types and frames. Returns the number of groups written back, or -1 if any step
+// failed. The count is incremented on a successful write rather than per fetched
+// group, so a frame whose writes all failed cannot report a healthy number.
+static int read_and_dump_all(ovphysx_instance_handle_t handle,
+                             ovstage_instance_t* inst,
+                             sim_token_cache_t* tokens,
+                             ovstage_ordinal_t ordinal,
+                             pending_readback_t* out_pending)
 {
     int dumped = 0;
     for (int s = 0; s < NUM_OUTPUT_SPECS; ++s)
     {
         const output_spec_t* spec = &OUTPUT_SPECS[s];
         ovphysx_query_handle_t query = 0;
-        if (ovphysx_query(handle, spec->type, OVPHYSX_SCOPE_ALL, &query).status != OVPHYSX_API_SUCCESS || query == 0)
-            continue; // no objects of this type in the scene
+        const ovphysx_result_t qr = ovphysx_sample_complete_task(handle, ovphysx_query(handle, spec->type, OVPHYSX_SCOPE_ALL, &query, NULL));
+        if (qr.status != OVPHYSX_API_SUCCESS || query == 0)
+        {
+            // A query error is not "no objects of this type". Conflating them would let a broken
+            // read path pass as an empty scene.
+            fprintf(stderr, "ovphysx_query failed for output spec %d (status %d)\n", s, (int)qr.status);
+            if (query != 0)
+                ovphysx_sample_complete_task(handle, ovphysx_release_query(handle, query));
+            return -1;
+        }
+        // The attached Stage's own path dictionary, the same one that interned this
+        // query's prim lists and attribute tokens and that the ovstage write path
+        // interns into. ovphysx has no dictionary of its own.
+        path_dictionary_instance_t* dict = ovstage_get_path_dictionary(inst);
+        if (!dict)
+        {
+            fprintf(stderr, "the attached Stage published no path dictionary\n");
+            ovphysx_sample_complete_task(handle, ovphysx_release_query(handle, query));
+            return -1;
+        }
 
-        // ovstage's own shared source dictionary -- the same one that interned this
-        // query's prim lists and attribute tokens, and the one the ovstage write
-        // path interns into. Not an ovphysx-private dictionary.
-        void* dictVoid = NULL;
-        ovphysx_query_shared_dictionary(handle, query, &dictVoid);
-        path_dictionary_instance_t* dict = (path_dictionary_instance_t*)dictVoid;
-
-        // Build the ovx_string_or_token_t attribute array for this type.
-        ovx_string_or_token_t attrs[4];
+        ovx_token_or_string_t attrs[4];
         for (size_t i = 0; i < spec->attr_count; ++i)
             attrs[i] = name_str(spec->attrs[i]);
 
         ovphysx_read_handle_t read = 0;
-        if (ovphysx_read(handle, query, attrs, spec->attr_count, &read).status == OVPHYSX_API_SUCCESS
-            && read != 0)
+        const ovphysx_result_t rr = ovphysx_sample_complete_task(handle, ovphysx_read(handle, query, attrs, spec->attr_count, (ovstage_cuda_sync_t){0, 0}, &read, NULL));
+        if (rr.status != OVPHYSX_API_SUCCESS || read == 0)
         {
-            for (;;)
-            {
-                // Producer-owned: fetch hands back a borrowed ovstage_read_group_t*.
-                const ovstage_read_group_t* g = NULL;
-                const ovphysx_result_t r = ovphysx_fetch_read_next(handle, read, &g);
-                if (r.status == OVPHYSX_API_END_OF_ITERATION || r.status != OVPHYSX_API_SUCCESS)
-                    break;
-                dump_group(inst, tokens, dict, g, ordinal);
-                ++dumped;
-                ovphysx_release_group(handle, read, g->read_group_id);
-            }
-            ovphysx_release_read(handle, read);
+            fprintf(stderr, "ovphysx_read failed for output spec %d (status %d)\n", s, (int)rr.status);
+            if (read != 0)
+                ovphysx_sample_complete_task(handle, ovphysx_release_read(handle, read));
+            ovphysx_sample_complete_task(handle, ovphysx_release_query(handle, query));
+            return -1;
         }
-        ovphysx_release_query(handle, query);
+
+        int failed = 0;
+        for (;;)
+        {
+            // Producer-owned: fetch hands back a borrowed ovstage_read_group_t*.
+            const ovstage_read_group_t* g = NULL;
+            const ovphysx_result_t r = ovphysx_sample_complete_task(handle, ovphysx_fetch_read_next(handle, read, &g));
+            if (r.status == OVPHYSX_API_SUCCESS && !g)
+                break; // exhausted. The normal exit, not an error
+            if (r.status != OVPHYSX_API_SUCCESS)
+            {
+                fprintf(stderr, "ovphysx_fetch_read_next failed (status %d)\n", (int)r.status);
+                failed = 1;
+                break;
+            }
+            if (!dump_group(inst, tokens, dict, g, ordinal, &dumped, out_pending))
+                failed = 1;
+            if (ovphysx_sample_complete_task(handle, ovphysx_release_group(handle, read, g->read_group_id)).status != OVPHYSX_API_SUCCESS)
+            {
+                fprintf(stderr, "ovphysx_release_group failed\n");
+                failed = 1;
+            }
+            if (failed)
+                break;
+        }
+
+        if (ovphysx_sample_complete_task(handle, ovphysx_release_read(handle, read)).status != OVPHYSX_API_SUCCESS)
+        {
+            fprintf(stderr, "ovphysx_release_read failed\n");
+            failed = 1;
+        }
+        if (ovphysx_sample_complete_task(handle, ovphysx_release_query(handle, query)).status != OVPHYSX_API_SUCCESS)
+        {
+            fprintf(stderr, "ovphysx_release_query failed\n");
+            failed = 1;
+        }
+        if (failed)
+            return -1;
     }
     return dumped;
 }
@@ -447,12 +692,19 @@ static int run(void)
         fprintf(stderr, "Failed to initialize ovphysx\n");
         return 1;
     }
-    // CPU mode keeps the read deterministic (no GPU warmup step before the read).
-    ovphysx_set_cpu_mode(true);
+    // CPU mode keeps the read deterministic, with no GPU warmup step before the read. If an
+    // instance was already created in this process, this call fails, and every later read would
+    // then need a warmup step the sample never takes, so the failure is not ignored.
+    if (ovphysx_set_global_config(
+            OVPHYSX_GLOBAL_CONFIG_CPU_ONLY, ovphysx_config_value_bool(true)).status != OVPHYSX_API_SUCCESS)
+    {
+        fprintf(stderr, "Failed to enter CPU-only mode\n");
+        ovphysx_shutdown();
+        return 1;
+    }
 
-    ovphysx_create_args create_args = OVPHYSX_CREATE_ARGS_DEFAULT;
-    ovphysx_handle_t handle = 0;
-    if (ovphysx_create_instance(&create_args, &handle).status != OVPHYSX_API_SUCCESS)
+    ovphysx_instance_handle_t handle = 0;
+    if (ovphysx_create_instance(&handle).status != OVPHYSX_API_SUCCESS)
     {
         fprintf(stderr, "Failed to create PhysX instance\n");
         ovphysx_shutdown();
@@ -473,9 +725,9 @@ static int run(void)
 
     ovstage_instance_t* stage = attachment.stage;
 
-    // Two interleaved ordinal lanes past the parse ordinal (1): even ordinals
-    // carry control edits (drained); odd ordinals carry physics output (never
-    // drained).
+    // Two interleaved ordinal lanes past the parse ordinal (1). Even ordinals
+    // carry control edits and are drained. Odd ordinals carry physics output and
+    // are never drained.
     ovstage_ordinal_t control_ordinal = 2;
     ovstage_ordinal_t output_ordinal = 3;
     const float velocity[3] = { 2.0f, 0.0f, 0.0f };
@@ -484,6 +736,11 @@ static int run(void)
     // Interned "sim:<name>" write-back tokens, populated lazily on first sight and
     // reused for the rest of the run (see sim_token_for).
     sim_token_cache_t sim_tokens = { 0 };
+    // Set once a written-back sim column has been read back out again. `run()` fails if it is
+    // still clear at the end, so a run that never reached the verification cannot pass quietly.
+    int readback_verified = 0;
+    pending_readback_t pending;
+    memset(&pending, 0, sizeof(pending));
     int failed = 0;
 
     for (int frame = 0; frame < 5; ++frame)
@@ -501,7 +758,17 @@ static int run(void)
             failed = 1;
             break;
         }
-        if (!author_rigid_body_velocity(handle, stage, control_ordinal, target_velocity))
+        // The two results mean different things. -1 is a broken control lane. 0 is a scene with
+        // no rigid bodies, which is equally a failure here because this scene has them by
+        // construction, but it is not the same diagnosis.
+        const int controlAuthored = author_rigid_body_velocity(handle, stage, control_ordinal, target_velocity);
+        if (controlAuthored < 0)
+        {
+            fprintf(stderr, "  frame %d: the velocity control write failed\n", frame);
+            failed = 1;
+            break;
+        }
+        if (controlAuthored == 0)
         {
             fprintf(stderr, "No rigid bodies were available for the velocity control write\n");
             failed = 1;
@@ -510,7 +777,7 @@ static int run(void)
 
         advance_floor(stage, control_ordinal);
         ovstage_ordinal_range_t ctrl_range = { control_ordinal, control_ordinal, true };
-        if (ovphysx_update_from_ovstage(handle, ctrl_range).status != OVPHYSX_API_SUCCESS)
+        if (ovphysx_sample_complete_task(handle, ovphysx_update_from_ovstage(handle, ctrl_range)).status != OVPHYSX_API_SUCCESS)
         {
             ovphysx_string_t err = ovphysx_get_last_error();
             fprintf(stderr, "update_from_ovstage failed: %.*s\n", (int)err.length, err.ptr ? err.ptr : "");
@@ -567,15 +834,85 @@ static int run(void)
                velocity_before.sum_x / velocity_before.count, velocity_after.sum_x / velocity_after.count,
                velocity_after.count, mean_displacement);
 
-        // 3. physics -> app: read every output type and dump it back to ovstage at
+        // 3. physics -> app: read every type in OUTPUT_SPECS and dump it to ovstage at
         //    the output ordinal (sealed but never drained).
-        const int dumped = read_and_dump_all(handle, stage, &sim_tokens, output_ordinal);
-        advance_floor(stage, output_ordinal);
+        const int dumped = read_and_dump_all(handle, stage, &sim_tokens, output_ordinal, &pending);
+        if (dumped < 0)
+        {
+            fprintf(stderr, "  frame %d: output read/write-back failed\n", frame);
+            failed = 1;
+            break;
+        }
+        if (!advance_floor(stage, output_ordinal))
+        {
+            fprintf(stderr, "  frame %d: advancing the output write floor failed\n", frame);
+            failed = 1;
+            break;
+        }
+
+        // The read back happens after the seal. The write sat above the effective write floor
+        // until this advance, and ovstage refuses to read above the floor.
+        if (pending.armed)
+        {
+            if (!verify_pending_readback(stage, &pending))
+            {
+                fprintf(stderr, "  frame %d: the sim column written back could not be read back\n", frame);
+                failed = 1;
+                break;
+            }
+            readback_verified = 1;
+        }
+        // A frame that wrote nothing back is a failure of the closed loop, not a quiet success.
+        // The scene has rigid bodies by construction, so zero groups means the read produced
+        // nothing or every write-back was rejected.
+        if (dumped == 0)
+        {
+            fprintf(stderr, "  frame %d: no output column groups were written back\n", frame);
+            failed = 1;
+            break;
+        }
         printf("  frame %d: dumped %d output column group(s) to ovstage\n", frame, dumped);
 
-        // 4. advance both lanes; the output ordinal we just wrote is skipped forever.
+        // 4. advance both lanes. The output ordinal just written is never drained.
         control_ordinal += 2;
         output_ordinal += 2;
+    }
+
+    // A frame that broke out early may still hold a pin. Drop it rather than leak the reference
+    // into teardown. This is not a verification, `readback_verified` decides that below.
+    if (pending.armed && pending.dict)
+    {
+        path_dictionary_release_path_list_reference(pending.dict, pending.list);
+        memset(&pending, 0, sizeof(pending));
+    }
+
+    // The closed loop is only closed if a sim column was read back. Without this the sample could
+    // still declare success having written values nothing can retrieve.
+    if (!failed && !readback_verified)
+    {
+        fprintf(stderr, "no sim column was ever read back; the closed loop was never verified\n");
+        failed = 1;
+    }
+
+    // Forced write failure. The write floor was advanced to the last output ordinal, so a write at
+    // that ordinal is a floor violation, a real rejection from the public API rather than a test
+    // hook. This checks that the failure propagates end to end: write_attribute -> wait ->
+    // dump_group -> read_and_dump_all -> run. A non-negative return means a failed frame is being
+    // reported as a healthy one.
+    if (!failed)
+    {
+        const ovstage_ordinal_t floored = output_ordinal - 2;
+        printf("\nChecking a rejected write is reported (writing at floored ordinal %llu)...\n",
+               (unsigned long long)floored);
+        if (read_and_dump_all(handle, stage, &sim_tokens, floored, NULL) >= 0)
+        {
+            fprintf(stderr, "a write below the write floor was NOT reported as a failure\n");
+            failed = 1;
+        }
+        else
+        {
+            printf("  rejected write correctly reported as a failure\n");
+        }
     }
 
     if (!failed)

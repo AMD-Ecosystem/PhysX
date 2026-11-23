@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "DyFeatherstoneArticulation.h"
 #include "DyDynamics.h"
@@ -292,7 +269,8 @@ namespace Dy
 			const ArticulationLink& rLink = mArticulationData.getLink(0);
 			// PT:: tag: scalar transform*transform
 			rLink.bodyCore->body2World = cache.rootLinkData->transform * rLink.bodyCore->getBody2Actor();
-			mGPUDirtyFlags |= ArticulationDirtyFlag::eDIRTY_ROOT_TRANSFORM;
+			// The root transform moves every link (see teleportLinks below), so every link is dirty.
+			mGPUDirtyFlags |= ArticulationDirtyFlag::eDIRTY_LINKS;
 		}
 
 		if(flag & PxArticulationCacheFlag::eROOT_VELOCITIES)
@@ -301,7 +279,9 @@ namespace Dy
 			rLink.bodyCore->linearVelocity = cache.rootLinkData->worldLinVel;
 			rLink.bodyCore->angularVelocity = cache.rootLinkData->worldAngVel;
 			localShouldWake = localShouldWake || (!cache.rootLinkData->worldLinVel.isZero()) || (!cache.rootLinkData->worldAngVel.isZero());
-			mGPUDirtyFlags |= ArticulationDirtyFlag::eDIRTY_ROOT_VELOCITIES;
+			// The root velocities change every link's velocity (see computeLinkVelocities below), so every link is dirty,
+			// as when they are set through PxArticulationReducedCoordinate::setRootLinearVelocity().
+			mGPUDirtyFlags |= ArticulationDirtyFlag::eDIRTY_LINKS;
 		}
 		
 		if (flag & PxArticulationCacheFlag::ePOSITION)
@@ -1646,7 +1626,7 @@ namespace Dy
 
 			Dy::SpatialMatrix cSpatialInertia = compositeSpatialInertia[i];
 			//transform current link's spatial inertia to parent's space
-			PxVec3 rw = link.bodyCore->body2World.p - links[link.parent].bodyCore->body2World.p;
+			const PxVec3& rw = mArticulationData.getRw()[i];
 			FeatherstoneArticulation::translateInertia(FeatherstoneArticulation::constructSkewSymmetricMatrix(rw), cSpatialInertia);
 
 			//compute parent's composite spatial inertia
@@ -1703,7 +1683,7 @@ namespace Dy
 
 			Dy::SpatialMatrix cSpatialInertia = compositeSpatialInertia[i];
 			// transform current link's spatial inertia to parent's space
-			PxVec3 rw = link.bodyCore->body2World.p - links[link.parent].bodyCore->body2World.p;
+			const PxVec3& rw = mArticulationData.getRw()[i];
 			FeatherstoneArticulation::translateInertia(FeatherstoneArticulation::constructSkewSymmetricMatrix(rw), cSpatialInertia);
 
 			// compute parent's composite spatial inertia
@@ -1728,7 +1708,7 @@ namespace Dy
 
 			// transform F to the base link space
 
-			PxVec3 brw = links[j].bodyCore->body2World.p - links[0].bodyCore->body2World.p;
+			const PxVec3& brw = mArticulationData.getRw()[j];
 			for (PxU32 ind = 0; ind < jointDatum.nbDof; ++ind)
 			{
 				f[ind] = translateSpatialVector(brw, f[ind]);

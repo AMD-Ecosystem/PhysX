@@ -1,14 +1,14 @@
 #!/bin/bash
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
-#
-# Usage: ./pull_dependencies.sh [--config release|debug|all] [--devphysx] [--devschema]
+# Usage: ./pull_dependencies.sh [--config release|debug|all] [--devphysx] [--devschema] [--no-schema]
 
 set -e
 
 DO_DEV_PHYSX=0
 DO_DEV_SCHEMA=0
+DO_NO_SCHEMA=0
 CONFIGS="release"
 
 while [ $# -gt 0 ]; do
@@ -18,6 +18,9 @@ while [ $# -gt 0 ]; do
             ;;
         --devschema)
             DO_DEV_SCHEMA=1
+            ;;
+        --no-schema)
+            DO_NO_SCHEMA=1
             ;;
         --config)
             shift
@@ -36,7 +39,7 @@ while [ $# -gt 0 ]; do
             esac
             ;;
         *)
-            echo "Error: unknown option '$1'; expected --config, --devphysx, or --devschema"
+            echo "Error: unknown option '$1'; expected --config, --devphysx, --devschema, or --no-schema"
             exit 1
             ;;
     esac
@@ -63,16 +66,23 @@ fi
 # Pull host deps (msvc)
 $PACKMAN pull deps/host-deps.packman.xml -p "$PLATFORM"
 
-# Pull target deps (PhysX, onnx-mlir, physxdevice, leveldb, snappy, python311)
+# Pull target deps (PhysX, physxdevice, leveldb, snappy, cmake)
 $PACKMAN pull deps/target-deps.packman.xml -p "$PLATFORM"
+
+# ovruntime_deps (release variant, config-independent). The config-dependent
+# import below reads a manifest inside it, so it comes first.
+$PACKMAN pull deps/ovruntime-deps.packman.xml -p "$PLATFORM" -t "platform_target_abi=$PLATFORM"
+
+# carb_sdk_plugins, then python/cxxopts/doctest imported from it. Config-independent,
+# and python must exist before the ovstage fetch below, which uses it as interpreter.
+$PACKMAN pull deps/carb-sdk-deps.packman.xml -p "$PLATFORM" -t "platform_target_abi=$PLATFORM"
+$PACKMAN pull deps/carb-sdk-deps-import.packman.xml -p "$PLATFORM" -t "platform_target_abi=$PLATFORM" -t "platform_target=$PLATFORM" -t "config=release"
 
 PYTHON=""
 for PYTHON_CANDIDATE in \
     "_build/target-deps/python/python" \
     "_build/target-deps/python/python3" \
-    "_build/target-deps/python311/python" \
-    "_build/target-deps/python311/python3" \
-    "_build/target-deps/python311/bin/python3"; do
+    "_build/target-deps/python/bin/python3"; do
     if [ -x "$PYTHON_CANDIDATE" ]; then
         PYTHON="$PYTHON_CANDIDATE"
         break
@@ -83,11 +93,10 @@ if [ -z "$PYTHON" ]; then
     exit 1
 fi
 
-# ovstage backend (ADR-0002): fetch the released package per platform into
-# _build/target-deps/ovstage (OVSTAGE_DIR). The packman <source> in
-# deps/ovstage-deps.packman.xml is commented out; the fetch lives in
-# ovphysx/scripts/fetch_ovstage_release.py (shipped in the open-source drop).
-# A local <source> in ovstage-deps.packman.xml still uses packman when present.
+# ovstage backend (ADR-0002) into _build/target-deps/ovstage. Two modes:
+#   1. Local source checkout: if deps/ovstage-deps.packman.xml declares a <source>
+#      path (opt-in, for ovstage development), packman links that local build.
+#   2. Default: fetch the released package via fetch_ovstage_release.py.
 OVSTAGE_FETCH="../scripts/fetch_ovstage_release.py"
 if grep -q '<source path="\([^"]*\)"' deps/ovstage-deps.packman.xml 2>/dev/null; then
     OVSTAGE_SRC=$(sed -n 's/.*<source path="\([^"]*\)".*/\1/p' deps/ovstage-deps.packman.xml | head -1)
@@ -105,22 +114,14 @@ else
     exit 1
 fi
 
-# Pull ovruntime_deps (always release variant, config-independent).
-$PACKMAN pull deps/ovruntime-deps.packman.xml -p "$PLATFORM" -t "platform_target_abi=$PLATFORM"
-
 # Pull config-dependent deps
 for CONFIG in $CONFIGS; do
-    # Pull kit-kernel for dev headers not yet in ovruntime_deps (omni/timeline, omni/kit/renderer, etc.)
-    # Namespaced import manifests also read kit_sdk_${config}/dev/all-deps.packman.xml,
-    # so kit-kernel must exist before the config-dependent import runs.
-    $PACKMAN pull deps/kit-kernel-deps.packman.xml -p "$PLATFORM" -t "platform_target_abi=$PLATFORM" -t "config=$CONFIG"
+    # platform_target and usd_ver are placeholders: they only build version strings
+    # for filtered-out entries (nvtx, omniusdresolver), never resolved.
+    $PACKMAN pull deps/ovruntime-deps-import.packman.xml -p "$PLATFORM" -t "platform_target_abi=$PLATFORM" -t "platform_target=$PLATFORM" -t "usd_ver=unused" -t "config=$CONFIG"
 
-    # Import the namespaced dependencies for this build config.
-    $PACKMAN pull deps/ovruntime-deps-import.packman.xml -p "$PLATFORM" -t "platform_target_abi=$PLATFORM" -t "config=$CONFIG"
-
-    # Pull namespaced schema deps (physxSchema, physicsSchemaTools headers/libs).
-    # Skipped in --devschema mode: CMake will point at the local schema build instead.
-    if [ "$DO_DEV_SCHEMA" -eq 0 ]; then
+    # Skip prebuilt schema headers for local-schema builds and USD-free consumers.
+    if [ "$DO_DEV_SCHEMA" -eq 0 ] && [ "$DO_NO_SCHEMA" -eq 0 ]; then
         $PACKMAN pull deps/schema-deps.packman.xml -p "$PLATFORM" -t "platform_target_abi=$PLATFORM" -t "config=$CONFIG"
     fi
 done

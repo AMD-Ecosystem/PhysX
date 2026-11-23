@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "foundation/PxMath.h"
 #include "foundation/PxSimpleTypes.h"
@@ -126,8 +103,6 @@ static __device__ void setupInternalConstraints(PxgArticulationBlockData& artiBl
 {
 	const PxU32 numLinks = artiBlock.mNumLinks[threadIndexInWarp];
 
-	const PxReal maxForceScale = artiBlock.mFlags[threadIndexInWarp] & PxArticulationFlag::eDRIVE_LIMITS_ARE_FORCES ? dt : 1.f;
-
 	//KS - we skip link 0 because it does not have any joints
 
 	PxgArticulationBlockDofData* PX_RESTRICT dofs = artiDofs;
@@ -150,16 +125,12 @@ static __device__ void setupInternalConstraints(PxgArticulationBlockData& artiBl
 		const float c2py = link.mRw_y[threadIndexInWarp];
 		const float c2pz = link.mRw_z[threadIndexInWarp];
 		PxVec3 child2Parent(c2px, c2py, c2pz);
-		PxReal transmissionForce;
 		PxReal cfm;
 
 		bool loaded = false;
 
-		//KS - maxFrictionForce stores the friction coefficient...
 		if (nbDofs)
 		{
-			PxReal deprecatedFrictionCoefficient = dofs->mConstraintData.mDeprecatedFrictionCoefficient[threadIndexInWarp] * stepDt;
-
 			PxU32 jointType = link.mJointType[threadIndexInWarp];
 			const bool isAngularConstraint = jointType == PxArticulationJointType::eREVOLUTE || jointType == PxArticulationJointType::eREVOLUTE_UNWRAPPED || jointType == PxArticulationJointType::eSPHERICAL;
 
@@ -237,7 +208,6 @@ static __device__ void setupInternalConstraints(PxgArticulationBlockData& artiBl
 
 				PxU32 dofId = dofs[i].mDofIds[threadIndexInWarp];
 				{
-					const PxReal maxForce = dofs[i].mConstraintData.mMaxForce[threadIndexInWarp];
 					const PxReal maxEffort = dofs[i].mConstraintData.mMaxEffort[threadIndexInWarp];
 
 					PxReal stiffness = dofs[i].mConstraintData.mDriveStiffness[threadIndexInWarp];
@@ -246,8 +216,6 @@ static __device__ void setupInternalConstraints(PxgArticulationBlockData& artiBl
 					if (!loaded)
 					{
 						loadSpatialMatrix(artiLinks[parent].mSpatialResponseMatrix, threadIndexInWarp, parentResponse);
-						Cm::UnAlignedSpatialVector bias = loadSpatialVector(link.mBiasForce, threadIndexInWarp);
-						transmissionForce = bias.magnitude() * deprecatedFrictionCoefficient;
 						cfm = PxMax(artiLinks[parent].mCfm[threadIndexInWarp], link.mCfm[threadIndexInWarp]);
 						loaded = true;
 					}
@@ -310,8 +278,6 @@ static __device__ void setupInternalConstraints(PxgArticulationBlockData& artiBl
 
 					const PxReal recipResponse = 1.0f / (unitResponse + cfm);
 
-					dofs[i].mConstraintData.mMaxDeprecatedFrictionForce[threadIndexInWarp] = transmissionForce;
-
 					//Set up drives...
 					if (motion == PxArticulationMotion::eLIMITED)
 					{
@@ -321,7 +287,7 @@ static __device__ void setupInternalConstraints(PxgArticulationBlockData& artiBl
 					}
 
 					//Set up drive...
-					if ((maxForce > 0.0f || maxEffort > 0.0f) && (stiffness > 0.0f || damping > 0.0f))
+					if (maxEffort > 0.0f && (stiffness > 0.0f || damping > 0.0f))
 					{
 						const PxReal targetVelocity = dofs[i].mConstraintData.mDriveTargetVel[threadIndexInWarp];
 						const PxArticulationDriveType::Enum type = PxArticulationDriveType::Enum(dofs[i].mConstraintData.mDriveType[threadIndexInWarp]);
@@ -332,13 +298,11 @@ static __device__ void setupInternalConstraints(PxgArticulationBlockData& artiBl
 									unitResponse, recipResponse,
 									error, targetVelocity,
 									isTGSSolver));
-						dofs[i].mConstraintData.mConstraintMaxImpulse[threadIndexInWarp] = maxForce * maxForceScale;
 					}
 					else
 					{
 						//Zero drives...
 						dofs[i].mConstraintData.setImplicitDriveDesc(threadIndexInWarp, ArticulationImplicitDriveDesc(PxZero));
-						dofs[i].mConstraintData.mConstraintMaxImpulse[threadIndexInWarp] = 0.f;
 					}
 					dofs[i].mConstraintData.mDriveImpulse[threadIndexInWarp] = 0.f;
 					storeSpatialVector(dofs[i].mConstraintData.mDeltaVA, deltaVA, threadIndexInWarp);
@@ -1566,23 +1530,25 @@ static __device__ void artiSolveInternalConstraints1T(PxgArticulationCoreDesc* P
 		Cm::UnAlignedSpatialVector parentDeltaV(PxVec3(0.f), PxVec3(0.f)), storeParentDeltaV(PxVec3(0.f), PxVec3(0.f));
 		Cm::UnAlignedSpatialVector parentImp(PxVec3(0.f), PxVec3(0.f));	
 
-		if (!fixBase && doStaticContactsAnd1dConstraints)
+		if (!fixBase)
 		{
-			const PxU32 constraintCounts0 = data[0].mNbStaticJoints[threadIdx.x];
-
 			Dy::SpatialMatrix spatialMatrix;
 			loadSpatialMatrix(blockData.mInvSpatialArticulatedInertia, threadIdx.x, spatialMatrix);
 
-			const Cm::UnAlignedSpatialVector motionVelocity0 = loadSpatialVector(data[0].mMotionVelocity, threadIdx.x);
-
 			parentDeltaV = spatialMatrix * -rootDeferredZ;
 
-			Cm::UnAlignedSpatialVector rootVel = motionVelocity0 + parentDeltaV;
 			storeParentDeltaV = parentDeltaV;
-			
-			//Solve constraints...
-			solveStaticConstraints(scDesc, data[0], sharedDesc, rootVel, parentImp, parentDeltaV, threadIdx.x,
-				doFriction, minPen, elapsedTime, 0, constraintCounts0, rigidContactBiasCoefficient);
+
+			if (doStaticContactsAnd1dConstraints)
+			{
+				const PxU32 constraintCounts0 = data[0].mNbStaticJoints[threadIdx.x];
+				const Cm::UnAlignedSpatialVector motionVelocity0 = loadSpatialVector(data[0].mMotionVelocity, threadIdx.x);
+				Cm::UnAlignedSpatialVector rootVel = motionVelocity0 + parentDeltaV;
+
+				//Solve constraints...
+				solveStaticConstraints(scDesc, data[0], sharedDesc, rootVel, parentImp, parentDeltaV, threadIdx.x,
+					doFriction, minPen, elapsedTime, 0, constraintCounts0, rigidContactBiasCoefficient);
+			}
 		}
 		
 		PxgArticulationTraversalStackData* PX_RESTRICT stack = scDesc->mArticulationTraversalStackBlocks + scDesc->mMaxLinksPerArticulation * blockIdx.x;
@@ -1679,11 +1645,9 @@ static __device__ void artiSolveInternalConstraints1T(PxgArticulationCoreDesc* P
 						// PT: preload as much data as we can
 						const Cm::UnAlignedSpatialVector row0 = loadSpatialVector(thisDof.mConstraintData.mRow0, threadIdx.x);
 						const Cm::UnAlignedSpatialVector row1 = loadSpatialVector(thisDof.mConstraintData.mRow1, threadIdx.x);
-						const PxReal maxDriveForce = thisDof.mConstraintData.mConstraintMaxImpulse[threadIdx.x];
 						PxReal appliedDriveImpulse = thisDof.mConstraintData.mDriveImpulse[threadIdx.x];
 						const PxReal recipResponse = thisDof.mConstraintData.mRecipResponse[threadIdx.x];
 						const PxReal response = thisDof.mConstraintData.mResponse[threadIdx.x];
-						const PxReal maxFrictionForce = thisDof.mConstraintData.mMaxDeprecatedFrictionForce[threadIdx.x];
 						const Cm::UnAlignedSpatialVector deltaVA = loadSpatialVector(thisDof.mConstraintData.mDeltaVA, threadIdx.x);
 						const Cm::UnAlignedSpatialVector deltaVB = loadSpatialVector(thisDof.mConstraintData.mDeltaVB, threadIdx.x);
 
@@ -1712,23 +1676,6 @@ static __device__ void artiSolveInternalConstraints1T(PxgArticulationCoreDesc* P
 						PxReal posLimitDeltaF = 0.0f;
 						if(doFrictionDrivePosLimit)
 						{
-							bool newFrictionModel = staticFrictionImpulse != 0.0f || viscousFrictionCoefficient !=  0.0f;
-
-							// deprecated friction model
-							if (!newFrictionModel)	
-							{
-								// Friction force is accumulated through all position iterations only for PGS
-								const PxReal appliedFriction = isTGS ? 0.0f : thisDof.mConstraintData.mAccumulatedFrictionImpulse[threadIdx.x];
-
-								const PxReal frictionForce = PxClamp(-jointV * recipResponse + appliedFriction,
-																	-maxFrictionForce, maxFrictionForce);
-								thisDof.mConstraintData.mAccumulatedFrictionImpulse[threadIdx.x] = frictionForce; // This is not used for TGS
-
-								frictionDeltaF = frictionForce - appliedFriction;
-
-								jointV += frictionDeltaF * response;
-							}
-
 							if (maxImpulse > 0.0f)
 							{
 								appliedDriveImpulse = perSubset ? 0.0f: appliedDriveImpulse;
@@ -1751,29 +1698,14 @@ static __device__ void artiSolveInternalConstraints1T(PxgArticulationCoreDesc* P
 								driveDeltaF = clampedImpulse - appliedDriveImpulse; // to keep track of accumulated impulse for velIter in TGS with isExternalForceEveryStep
 								thisDof.mConstraintData.mDriveImpulse[threadIdx.x] += driveDeltaF;
 							}
-
-							else
-							{
-								const PxReal unclampedForce = (isTGS && isVelIter) ? appliedDriveImpulse :
-										computeDriveImpulse(appliedDriveImpulse, jointV, jointDeltaP, elapsedTime,
-											implicitDriveDesc);
-
-								const PxReal clampedForce = PxClamp(unclampedForce, -maxDriveForce, maxDriveForce);
-										driveDeltaF = (clampedForce - appliedDriveImpulse);
-
-								thisDof.mConstraintData.mDriveImpulse[threadIdx.x] = clampedForce;
-							}
 							jointV += driveDeltaF * response;
 
-							if (newFrictionModel)
-							{
-								const PxReal appliedFriction = isTGS && isExternalForceEveryStep && !isVelIter ? 0.0f : thisDof.mConstraintData.mAccumulatedFrictionImpulse[threadIdx.x];
-								PxReal totalImpulse = appliedFriction - jointV * recipResponse;
-								totalImpulse = computeFrictionImpulse(totalImpulse, staticFrictionImpulse, dynamicFrictionImpulse, viscousFrictionCoefficient, jointV);
-								frictionDeltaF = totalImpulse - appliedFriction;
-								thisDof.mConstraintData.mAccumulatedFrictionImpulse[threadIdx.x] += frictionDeltaF; // to keep track of accumulated impulse for velIter in TGS with isExternalForceEveryStep
-								jointV += frictionDeltaF * response;
-							}
+							const PxReal appliedFriction = isTGS && isExternalForceEveryStep && !isVelIter ? 0.0f : thisDof.mConstraintData.mAccumulatedFrictionImpulse[threadIdx.x];
+							PxReal totalImpulse = appliedFriction - jointV * recipResponse;
+							totalImpulse = computeFrictionImpulse(totalImpulse, staticFrictionImpulse, dynamicFrictionImpulse, viscousFrictionCoefficient, jointV);
+							frictionDeltaF = totalImpulse - appliedFriction;
+							thisDof.mConstraintData.mAccumulatedFrictionImpulse[threadIdx.x] += frictionDeltaF; // to keep track of accumulated impulse for velIter in TGS with isExternalForceEveryStep
+							jointV += frictionDeltaF * response;
 
 							if (motion == PxArticulationMotion::eLIMITED)
 							{

@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 
 #include "PxgArticulation.h"
@@ -723,6 +700,7 @@ extern "C" __global__ void computeArtiCentrifugalForces(
 				const PxTransform& body2World = arti.linkBody2Worlds[link];
 				const PxU32 parentLink = arti.parents[link];
 				const ArticulationJointCoreData& jointData = arti.jointData[link];
+				const Dy::ArticulationJointCore& joint = arti.joints[link];
 				const PxTransform& parentBody2World = arti.linkBody2Worlds[parentLink];
 				const PxVec3 rw = computeLinkRwInvDyn(arti, link, parentBody2World.q, body2World.q);
 				const Cm::UnAlignedSpatialVector pVel = motionVelocities[parentLink];
@@ -732,7 +710,8 @@ extern "C" __global__ void computeArtiCentrifugalForces(
 				Cm::UnAlignedSpatialVector deltaV = Cm::UnAlignedSpatialVector::Zero();
 				for (PxU32 dof = 0; dof < jointData.nbDof; ++dof)
 				{
-					const PxReal maxJointVelocity = arti.joints[link].maxJointVelocity[dof];
+					// The limits are stored per axis, and dofIds maps each dof of the joint to its axis.
+					const PxReal maxJointVelocity = joint.maxJointVelocity[joint.dofIds[dof]];
 					const PxReal jointVelocity = jointVelocities[jointData.jointOffset + dof];
 					const PxReal jVel = PxMin(jointVelocity, maxJointVelocity);
 					Cm::UnAlignedSpatialVector dofMotion = arti.motionMatrix[link][dof].rotate(body2World);

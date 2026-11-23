@@ -1,8 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * @implements REQ-OMNIPVD-TRANSPORT-001
+ * @covers AC-1
+ *
+ * @implements REQ-OMNIPVD-LATE-001
+ * @covers AC-1 AC-2
+ */
 
 #pragma once
 #include <omni/physics/IUsdPhysicsSettings.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
 
 #define DEFINE_PHYSX_SETTING(name, path)                                                                               \
     static constexpr char name[] = PHYSICS_SETTINGS_PREFIX path;                                                         \
@@ -51,8 +63,6 @@ constexpr int kSettingCudaDeviceDefaultVal = -1;
 /// \ingroup private
 /// (bool) Force process-wide CPU-only PhysX startup before any CUDA probing.
 DEFINE_PHYSX_SETTING(kSettingForceCpuMode, "/forceCpuMode");
-/// (string) Simulation engine name.
-DEFINE_PHYSX_SETTING(kSettingDefaultSimulator, "/defaultSimulator");
 /** @rst
     (int) See :ref:`simulation_on_multiple_gpus` and :ref:`Use Physics Scene Multi-GPU Mode<Use Physics Scene Multi-GPU Mode>`. Changeable through :ref:`Physics Preferences`.
     @endrst */
@@ -183,6 +193,17 @@ DEFINE_PHYSX_SETTING(kSettingMousePickingForce, "/pickingForce");
 DEFINE_PHYSX_SETTING(kSettingPhysicsDevelopmentMode, "/developmentMode");
 /// \ingroup private
 DEFINE_PHYSX_SETTING(kSettingSuppressReadback, "/suppressReadback");
+/// (int) Total memory, in mebibytes, that the DirectGPU ovstage-read buffer pool may RETAIN per CUDA
+/// context for reuse across reads. A read allocates the columns it needs either way; the pool normally
+/// hands them back on the next read instead of freeing them -- a large win for the columns read every
+/// step -- but retaining them costs device memory. Once a context's pooled buffers reach this budget,
+/// further released buffers are freed at release rather than kept, which is no worse than before the
+/// pool existed. The default (256) comfortably holds the state working set of a large articulation
+/// scene -- 8192 environments of 60 DOFs is tens of MB of joint/link/root columns, plus a mass matrix --
+/// while a one-off multi-hundred-MB Jacobian falls outside it. Raise it for a scene that reads such
+/// heavy inverse dynamics columns every step and has the memory; lower it to bound the footprint; 0 or a
+/// negative value disables the pool (nothing is retained).
+DEFINE_PHYSX_SETTING(kSettingOvstageReadPoolMaxMB, "/ovstageReadPoolMaxMB");
 /// (bool) Assign replicator environment ids at body creation during stage attach/parse (GPU
 /// dynamics + GPU broadphase scenes only): bodies get the scene-partition primvar id, or 0. Set
 /// before attach by clone-driving consumers (ovphysx) so a later cloneEnvironments() finds the
@@ -438,20 +459,35 @@ DEFINE_PERSISTENT_PHYSX_SETTING(kSettingPVDEnabled, "/pvdEnabled");
 
 // OmniPvd
 
+enum class OmniPvdTransport : uint8_t
+{
+    eFile,
+    eTcp,
+};
+
+struct OmniPvdDestination
+{
+    OmniPvdTransport transport{ OmniPvdTransport::eFile };
+    // A literal .ovd suffix selects a named file; any other value selects a
+    // directory for a timestamped capture. Explicit start creates missing parents.
+    std::string fileTarget;
+    std::string tcpAddress;
+    uint16_t tcpPort{ 0 };
+    uint32_t tcpTimeoutMs{ 0 };
+};
+
+inline bool copyOmniPvdConfigString(const char* value, size_t length, std::string& result)
+{
+    if ((!value && length != 0) || (value && std::string(value, length).find('\0') != std::string::npos))
+        return false;
+    result.assign(value ? value : "", length);
+    return true;
+}
+
+/** (bool) Declares whether OmniPVD recording is available in this process. */
+DEFINE_PHYSX_SETTING(kOmniPvdRecordingCapable, "/omniPvdRecordingCapable");
 /** @rst
-    (string) Sets the directory for OmniPVD output files.
-    @endrst */
-DEFINE_PERSISTENT_PHYSX_SETTING(kOmniPvdOvdRecordingDirectory, "/omniPvdOvdRecordingDirectory");
-/** @rst
-    (bool) Toggles collection of OmniPVD telemetry. Only if this setting is true, do the other OmniPVD settings matter.
-    @endrst */
-DEFINE_PHYSX_SETTING(kOmniPvdOutputEnabled, "/omniPvdOutputEnabled");
-/** @rst
-    (bool) Toggles if the Stage is an OmniPVD stage or not. Only non-OmniPVD stages get recorded into OVD files.
-    @endrst */
-DEFINE_PHYSX_SETTING(kOmniPvdIsOVDStage, "/omniPvdIsOVDStage");
-/** @rst
-    (bool) Toggles if the Stage is being recorded into OmniPVD.
+    (bool) Reports whether an explicit OmniPVD recording is active.
     @endrst */
 DEFINE_PHYSX_SETTING(kOmniPvdIsRecording, "/omniPvdIsRecording");
 

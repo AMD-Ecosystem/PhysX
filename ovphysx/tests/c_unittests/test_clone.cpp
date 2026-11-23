@@ -1,15 +1,24 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 // C-API tests for ovphysx_clone (replicator-backed). Clones are physics-only: live PhysX bodies
-// addressable by their target path via the tensor API, not authored as USD prims -- so a clone is
-// verified by reading its body pose through a tensor binding. basic_simulation.usda places one
-// rigid body 'table' under each env.
+// addressable by their target path, not authored as USD prims. A clone is therefore verified by
+// reading its body pose through a session read selected by that path. basic_simulation.usda
+// places one rigid body 'table' under each env.
 
-#include "global_test_environment.h"  // PhysXTestFixture, waitForOperationSuccess, ovphysx.h
+/**
+ * @implements REQ-CAPI-ASYNC-003
+ * @covers AC-2 AC-3 AC-4
+ */
+
+#include "global_test_environment.h"  // PhysXTestFixture, waitForTaskSuccess, ovphysx.h
+#include "ovphysx/ovphysx_attributes.h"
 #include "test_utilities.h"
 
+#include <ovstage/ovx_path_dictionary.h>
+
 #include <algorithm>
+#include <array>
 #include <gtest/gtest.h>
 #include <cmath>
 #include <iostream>
@@ -19,13 +28,13 @@
 using test_utils::make_ovx_string;
 
 // Attach an ovstage-backed USD scene and drain it (matches the other c_unittests' helper).
-static bool load_usd_and_wait(ovphysx_handle_t handle, const char* usd_path, ovphysx_usd_handle_t& out_handle)
+static bool load_usd_and_wait(ovphysx_instance_handle_t handle, const char* usd_path, ovphysx_usd_handle_t& out_handle)
 {
     (void)out_handle;
     return test_utils::attach_usd_with_ovstage(handle, usd_path);
 }
 
-static ovphysx_enqueue_result_t enqueue_clone(ovphysx_handle_t handle,
+static ovphysx_enqueue_result_t enqueue_clone(ovphysx_instance_handle_t handle,
                                               const char* source_path,
                                               const char* const* targets,
                                               uint32_t num_targets)
@@ -39,46 +48,119 @@ static ovphysx_enqueue_result_t enqueue_clone(ovphysx_handle_t handle,
     return ovphysx_clone(handle, make_ovx_string(source_path), target_vec.data(), num_targets, nullptr, nullptr);
 }
 
-// Read a rigid body's world position via a tensor binding (position = first 3 of the [1,7] pose).
-static bool read_position(ovphysx_handle_t handle, const char* prim_path, double* out_pos)
+// The rigid bodies a selected session read covers: each body's prim path and world position, in row order.
+struct SelectedBodies
 {
-    ovphysx_tensor_binding_desc_t desc{};
-    desc.pattern = make_ovx_string(prim_path);
-    desc.tensor_type = OVPHYSX_TENSOR_RIGID_BODY_POSE_F32;
+    std::vector<std::string> paths;
+    std::vector<std::array<float, 3>> positions;
+};
 
-    ovphysx_tensor_binding_handle_t binding_handle = 0;
-    ovphysx_result_t res = ovphysx_create_tensor_binding(handle, &desc, &binding_handle);
-    if (res.status != OVPHYSX_API_SUCCESS)
-    {
+// Reads the rigid bodies `selection` names. The shared instance runs on CPU, so every column is host memory.
+static bool read_selected_bodies(ovphysx_instance_handle_t handle, const ovphysx_query_selection_t& selection,
+                                 SelectedBodies& out)
+{
+    out = {};
+    ovphysx_query_handle_t query = 0;
+    const ovphysx_enqueue_result_t opened =
+        ovphysx_query_selection(handle, OVPHYSX_QUERY_TARGET_RIGID_BODY, &selection, &query, nullptr);
+    if (test_utils::complete_task(handle, opened).status != OVPHYSX_API_SUCCESS)
         return false;
-    }
-
-    float pose_data[7] = {};
-    int64_t shape[] = { 1, 7 };
-    DLTensor tensor{};
-    tensor.data = pose_data;
-    tensor.ndim = 2;
-    tensor.shape = shape;
-    tensor.strides = nullptr;
-    tensor.dtype = { kDLFloat, 32, 1 };
-    tensor.device = { kDLCPU, 0 };
-
-    res = ovphysx_read_tensor_binding(handle, binding_handle, &tensor);
-    ovphysx_destroy_tensor_binding(handle, binding_handle);
-    if (res.status != OVPHYSX_API_SUCCESS)
+    path_dictionary_instance_t* dictionary = test_utils::attached_ovstage_dictionary(handle);
+    bool ok = dictionary != nullptr;
+    ovx_path_dictionary_t* dict = static_cast<ovx_path_dictionary_t*>(dictionary);
+    const ovx_token_or_string_t position = { 0, { OVPHYSX_ATTR_POSITION, sizeof(OVPHYSX_ATTR_POSITION) - 1 } };
+    ovphysx_read_handle_t read = 0;
+    ok = ok && test_utils::complete_task(handle, ovphysx_read(handle, query, &position, 1,
+                                                              ovstage_cuda_sync_t{ 0, 0 }, &read, nullptr)).status ==
+                   OVPHYSX_API_SUCCESS;
+    while (ok)
     {
-        return false;
+        const ovstage_read_group_t* group = nullptr;
+        ok = test_utils::complete_task(handle, ovphysx_fetch_read_next(handle, read, &group)).status ==
+             OVPHYSX_API_SUCCESS;
+        if (!ok || !group)
+            break;
+        const DLTensor* tensor = group->columns[0].data.tensor_count ? &group->columns[0].data.tensors[0] : nullptr;
+        const ovx_primpath_t* paths = nullptr;
+        size_t path_count = 0;
+        ok = !group->columns[0].is_array && tensor && tensor->data && tensor->device.device_type == kDLCPU &&
+             tensor->dtype.lanes == 3 &&
+             ovx_path_dictionary_get_paths(dict, group->prims.list, &paths, &path_count) == OVX_OK;
+        const float* values =
+            ok ? reinterpret_cast<const float*>(static_cast<const char*>(tensor->data) + tensor->byte_offset) : nullptr;
+        const int64_t stride = (ok && tensor->strides) ? tensor->strides[0] : 1;
+        for (uint32_t row = 0; ok && row < group->prims.count; ++row)
+        {
+            const uint32_t index = group->prims.index_map ? group->prims.index_map[row] : group->prims.offset + row;
+            ovx_string_t path{};
+            ok = index < path_count && ovx_path_dictionary_path_to_string(dict, paths[index], &path) == OVX_OK;
+            if (!ok)
+                break;
+            const float* xyz = values + row * stride * 3;
+            out.paths.emplace_back(path.ptr, path.length);
+            out.positions.push_back({ xyz[0], xyz[1], xyz[2] });
+        }
+        ok = test_utils::complete_task(handle, ovphysx_release_group(handle, read, group->read_group_id)).status ==
+                 OVPHYSX_API_SUCCESS &&
+             ok;
     }
+    if (read != 0)
+        ok = test_utils::complete_task(handle, ovphysx_release_read(handle, read)).status == OVPHYSX_API_SUCCESS && ok;
+    ok = test_utils::complete_task(handle, ovphysx_release_query(handle, query)).status == OVPHYSX_API_SUCCESS && ok;
+    return ok;
+}
 
-    out_pos[0] = static_cast<double>(pose_data[0]);
-    out_pos[1] = static_cast<double>(pose_data[1]);
-    out_pos[2] = static_cast<double>(pose_data[2]);
+static bool read_pattern(ovphysx_instance_handle_t handle, const char* pattern, SelectedBodies& out)
+{
+    ovphysx_query_selection_t selection{};
+    selection.pattern = make_ovx_string(pattern);
+    return read_selected_bodies(handle, selection, out);
+}
+
+// An explicit selection takes native prim-path handles, interned here into the attached Stage's dictionary.
+static bool read_paths(ovphysx_instance_handle_t handle, const std::vector<std::string>& paths, SelectedBodies& out)
+{
+    ovphysx_query_handle_t query = 0;
+    if (test_utils::complete_task(handle, ovphysx_query(handle, OVPHYSX_QUERY_TARGET_RIGID_BODY, OVPHYSX_SCOPE_ALL, &query, nullptr))
+            .status != OVPHYSX_API_SUCCESS)
+        return false;
+    path_dictionary_instance_t* dictionary = test_utils::attached_ovstage_dictionary(handle);
+    bool ok = dictionary != nullptr;
+    std::vector<ovx_primpath_t> handles;
+    for (const std::string& path : paths)
+    {
+        ovx_primpath_t interned = OVX_INVALID_PRIMPATH;
+        const ovx_string_t text = { path.c_str(), path.size() };
+        ok = ok &&
+             ovx_path_dictionary_intern_path(static_cast<ovx_path_dictionary_t*>(dictionary), text, &interned) ==
+                 OVX_OK &&
+             interned != OVX_INVALID_PRIMPATH;
+        handles.push_back(interned);
+    }
+    ok = test_utils::complete_task(handle, ovphysx_release_query(handle, query)).status == OVPHYSX_API_SUCCESS && ok;
+    if (!ok)
+        return false;
+
+    ovphysx_query_selection_t selection{};
+    selection.prim_paths = handles.data();
+    selection.prim_paths_count = static_cast<uint32_t>(handles.size());
+    return read_selected_bodies(handle, selection, out);
+}
+
+// Reads one rigid body's world position; fails unless exactly that body resolves.
+static bool read_position(ovphysx_instance_handle_t handle, const char* prim_path, double* out_pos)
+{
+    SelectedBodies bodies;
+    if (!read_pattern(handle, prim_path, bodies) || bodies.positions.size() != 1)
+        return false;
+    for (int axis = 0; axis < 3; ++axis)
+        out_pos[axis] = static_cast<double>(bodies.positions[0][axis]);
     return true;
 }
 
-// A clone "exists" when its replicated rigid body is addressable: a tensor binding on the clone
-// body path resolves and reads a pose.
-static bool verify_clones_exist(ovphysx_handle_t handle, const std::vector<std::string>& env_paths)
+// A clone "exists" when its replicated rigid body is addressable: a read selected by the clone body
+// path resolves it and reads a pose.
+static bool verify_clones_exist(ovphysx_instance_handle_t handle, const std::vector<std::string>& env_paths)
 {
     for (const std::string& env : env_paths)
     {
@@ -92,33 +174,11 @@ static bool verify_clones_exist(ovphysx_handle_t handle, const std::vector<std::
     return true;
 }
 
-static bool read_binding_prim_paths(ovphysx_handle_t handle,
-                                    ovphysx_tensor_binding_handle_t binding,
-                                    uint32_t max_paths,
-                                    std::vector<std::string>& out_paths)
-{
-    std::vector<ovphysx_string_t> path_views(max_paths);
-    uint32_t out_count = 0;
-    const ovphysx_result_t result =
-        ovphysx_tensor_binding_get_prim_paths(handle, binding, path_views.data(), max_paths, &out_count);
-    if (result.status != OVPHYSX_API_SUCCESS)
-        return false;
-
-    out_paths.clear();
-    out_paths.reserve(out_count);
-    for (uint32_t i = 0; i < out_count; ++i)
-    {
-        const ovphysx_string_t& path = path_views[i];
-        out_paths.emplace_back(path.ptr ? path.ptr : "", path.ptr ? path.length : 0);
-    }
-    return true;
-}
-
-static void step_and_wait(ovphysx_handle_t handle, float dt)
+static void step_and_wait(ovphysx_instance_handle_t handle, float dt)
 {
     ovphysx_enqueue_result_t step_res = ovphysx_step(handle, dt);
     ASSERT_EQ(step_res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(handle, step_res.op_index));
+    ASSERT_TRUE(waitForTaskSuccess(handle, step_res));
 }
 
 class CloneTest : public PhysXTestFixture
@@ -139,7 +199,7 @@ TEST_F(CloneTest, ErrorInvalidParameters)
     EXPECT_EQ(nullSource.status, OVPHYSX_API_INVALID_ARGUMENT);
     if (nullSource.op_index != 0)
     {
-        EXPECT_FALSE(waitForOperationSuccess(m_handle, nullSource.op_index, 2'000'000'000ULL));
+        EXPECT_FALSE(waitForTaskSuccess(m_handle, nullSource, 2'000'000'000ULL));
     }
 
     ovphysx_enqueue_result_t nullTargets =
@@ -147,7 +207,7 @@ TEST_F(CloneTest, ErrorInvalidParameters)
     EXPECT_EQ(nullTargets.status, OVPHYSX_API_INVALID_ARGUMENT);
     if (nullTargets.op_index != 0)
     {
-        EXPECT_FALSE(waitForOperationSuccess(m_handle, nullTargets.op_index, 2'000'000'000ULL));
+        EXPECT_FALSE(waitForTaskSuccess(m_handle, nullTargets, 2'000'000'000ULL));
     }
 
     ovphysx_enqueue_result_t zeroTargets =
@@ -155,20 +215,20 @@ TEST_F(CloneTest, ErrorInvalidParameters)
     EXPECT_EQ(zeroTargets.status, OVPHYSX_API_INVALID_ARGUMENT);
     if (zeroTargets.op_index != 0)
     {
-        EXPECT_FALSE(waitForOperationSuccess(m_handle, zeroTargets.op_index, 2'000'000'000ULL));
+        EXPECT_FALSE(waitForTaskSuccess(m_handle, zeroTargets, 2'000'000'000ULL));
     }
 }
 
+// The attachment check runs in the clone job, so a clone without a stage is accepted and
+// its task fails.
 TEST_F(CloneTest, ErrorNoStageLoaded)
 {
     ovphysx_string_t target = make_ovx_string("/World/clone1");
     ovphysx_enqueue_result_t res =
         ovphysx_clone(m_handle, make_ovx_string("/World/table"), &target, 1, nullptr, nullptr);
-    EXPECT_EQ(res.status, OVPHYSX_API_ERROR);
-    if (res.op_index != 0)
-    {
-        EXPECT_FALSE(waitForOperationSuccess(m_handle, res.op_index, 2'000'000'000ULL));
-    }
+    ASSERT_EQ(res.status, OVPHYSX_API_SUCCESS);
+    EXPECT_NE(res.op_index, 0u);
+    EXPECT_TRUE(waitForTaskFailure(m_handle, res, "clone: no ovstage is attached"));
 }
 
 TEST_F(CloneTest, ErrorSourceDoesNotExist)
@@ -178,8 +238,9 @@ TEST_F(CloneTest, ErrorSourceDoesNotExist)
 
     const char* targets[] = { "/World/envs/envX" };
     ovphysx_enqueue_result_t clone_res = enqueue_clone(m_handle, "/World/envs/nonexistent", targets, 1);
-    EXPECT_EQ(clone_res.status, OVPHYSX_API_ERROR);
-    EXPECT_EQ(clone_res.op_index, 0u) << "a synchronous clone error must not register an async op";
+    ASSERT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
+    EXPECT_EQ(clone_res.instance, m_handle);
+    EXPECT_FALSE(waitForTaskSuccess(m_handle, clone_res));
 }
 
 TEST_F(CloneTest, CloneSingleTarget)
@@ -190,13 +251,13 @@ TEST_F(CloneTest, CloneSingleTarget)
     const char* targets[] = { "/World/envs/env1" };
     ovphysx_enqueue_result_t clone_res = enqueue_clone(m_handle, "/World/envs/env0", targets, 1);
     EXPECT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res.op_index));
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res));
 
     std::vector<std::string> target_vec(targets, targets + 1);
     ASSERT_TRUE(verify_clones_exist(m_handle, target_vec)) << "Clone body not addressable at target path";
 
     // No duplicate actors: env0 parsed at attach, env1 created by replicate. Overlapping duplicates
-    // would explode into NaNs; a stable 10-step run confirms exactly one body per env.
+    // would explode into NaNs. A stable 10-step run confirms exactly one body per env.
     for (int i = 0; i < 10; ++i)
     {
         step_and_wait(m_handle, 1.0f / 60.0f);
@@ -216,7 +277,7 @@ TEST_F(CloneTest, CloneMultipleTargets)
 
     ovphysx_enqueue_result_t clone_res = enqueue_clone(m_handle, "/World/envs/env0", targets, num_targets);
     EXPECT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res.op_index));
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res));
 
     std::vector<std::string> target_vec(targets, targets + num_targets);
     ASSERT_TRUE(verify_clones_exist(m_handle, target_vec)) << "One or more clone bodies not addressable";
@@ -227,7 +288,7 @@ TEST_F(CloneTest, CloneMultipleTargets)
     }
 }
 
-TEST_F(CloneTest, CloneWithParentTransforms)
+TEST_F(CloneTest, CloneWithAnchorTransforms)
 {
     ovphysx_usd_handle_t usd_handle = 0;
     ASSERT_TRUE(load_basic_usd(usd_handle)) << "USD load timed out or failed";
@@ -249,7 +310,7 @@ TEST_F(CloneTest, CloneWithParentTransforms)
     ovphysx_enqueue_result_t clone_res =
         ovphysx_clone(m_handle, make_ovx_string("/World/envs/env0"), target_ovx.data(), num_targets, transforms, nullptr);
     ASSERT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res.op_index, 5'000'000'000ULL))
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res, 5'000'000'000ULL))
         << "Clone with transforms timed out or failed";
 
     step_and_wait(m_handle, 1.0f / 60.0f);
@@ -260,20 +321,20 @@ TEST_F(CloneTest, CloneWithParentTransforms)
     ASSERT_TRUE(read_position(m_handle, "/World/envs/env2/table", env2_pos));
 
     const double tol = 0.5;
-    EXPECT_NEAR(env1_pos[0] - env0_pos[0], 5.0, tol) << "env1 X offset does not match parent transform";
-    EXPECT_NEAR(env2_pos[0] - env0_pos[0], 10.0, tol) << "env2 X offset does not match parent transform";
+    EXPECT_NEAR(env1_pos[0] - env0_pos[0], 5.0, tol) << "env1 X offset does not match anchor transform";
+    EXPECT_NEAR(env2_pos[0] - env0_pos[0], 10.0, tol) << "env2 X offset does not match anchor transform";
     EXPECT_NEAR(env1_pos[2] - env0_pos[2], 0.0, tol) << "env1 Z offset should be ~0";
     EXPECT_NEAR(env2_pos[2] - env0_pos[2], 0.0, tol) << "env2 Z offset should be ~0";
 }
 
-TEST_F(CloneTest, CloneWithParentRotation)
+TEST_F(CloneTest, CloneWithAnchorRotation)
 {
     ovphysx_usd_handle_t usd_handle = 0;
     ASSERT_TRUE(load_basic_usd(usd_handle)) << "USD load timed out or failed";
 
     const char* targets[] = { "/World/envs/env1" };
 
-    // 90-degree yaw about Y: quat (0, sin45, 0, cos45); placed at (20,0,0).
+    // 90-degree yaw about Y, quat (0, sin45, 0, cos45), placed at (20,0,0).
     const float s = 0.7071068f;
     float transforms[] = { 20.0f, 0.0f, 0.0f, 0.0f, s, 0.0f, s };
 
@@ -282,7 +343,7 @@ TEST_F(CloneTest, CloneWithParentRotation)
     ovphysx_enqueue_result_t clone_res =
         ovphysx_clone(m_handle, make_ovx_string("/World/envs/env0"), target_ovx.data(), 1, transforms, nullptr);
     ASSERT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res.op_index, 5'000'000'000ULL))
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res, 5'000'000'000ULL))
         << "Clone with rotation timed out or failed";
 
     step_and_wait(m_handle, 1.0f / 60.0f);
@@ -299,6 +360,116 @@ TEST_F(CloneTest, CloneWithParentRotation)
     EXPECT_NEAR(env1_pos[2], dx, tol) << "Rotated clone Z does not match expected value";
 }
 
+TEST_F(CloneTest, CloneAfterWarmupRejectedInAllModes) {
+    ovphysx_usd_handle_t usd_handle = 0;
+    ASSERT_TRUE(load_basic_usd(usd_handle)) << "USD load timed out or failed";
+
+    ovphysx_result_t warmup_res = ovphysx_warmup(m_handle);
+    ASSERT_EQ(warmup_res.status, OVPHYSX_API_SUCCESS) << "warmup failed";
+
+    const char* targets[] = { "/World/envs/env1" };
+    const uint32_t num_targets = 1;
+    std::vector<ovphysx_string_t> target_ovx;
+    target_ovx.push_back(make_ovx_string(targets[0]));
+
+    ovphysx_enqueue_result_t clone_res = ovphysx_clone(
+        m_handle,
+        make_ovx_string("/World/envs/env0"),
+        target_ovx.data(),
+        num_targets, nullptr, nullptr);
+
+    // The after-warmup check runs in the clone job, which fails the task.
+    ASSERT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
+    EXPECT_TRUE(waitForTaskFailure(m_handle, clone_res, "clone() must be called before warmup() and the first step()"))
+        << "clone() after warmup must be rejected in all modes";
+}
+
+// ============================================================================
+// Regression: xformOp:scale is preserved during clone with anchor_transforms.
+//
+// When the source root has xformOp:scale in its xformOpOrder, batchClone
+// copies the attribute to every target. restoreTargetTransforms must include
+// scale in the target's xformOpOrder, otherwise updateWorldXforms ignores it
+// and children end up at the wrong world-space size.
+// ============================================================================
+
+TEST_F(CloneTest, CloneWithSourceScale) {
+    // In this scene env0 has translate + orient + scale (0.5x).
+    ovphysx_usd_handle_t usd_handle = 0;
+    ASSERT_TRUE(load_usd_and_wait(m_handle, "tests/data/clone_with_root_transforms.usda", usd_handle))
+        << "ovstage attach/update failed";
+
+    // Clone env0 -> env1 with explicit transform at (5, 0, 0) + identity quat
+    const char* targets[] = { "/World/envs/env1" };
+    std::vector<ovphysx_string_t> target_ovx;
+    target_ovx.push_back(make_ovx_string(targets[0]));
+
+    float transforms[] = {
+        5.0f, 0.0f, 0.0f,  0.0f, 0.0f, 0.0f, 1.0f
+    };
+
+    ovphysx_enqueue_result_t clone_res = ovphysx_clone(
+        m_handle,
+        make_ovx_string("/World/envs/env0"),
+        target_ovx.data(),
+        1,
+        transforms, nullptr);
+    ASSERT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res, 5'000'000'000ULL))
+        << "Clone with source scale timed out or failed";
+
+    // Warmup initializes the tensor data.
+    ovphysx_result_t warmup_res = ovphysx_warmup(m_handle);
+    ASSERT_EQ(warmup_res.status, OVPHYSX_API_SUCCESS) << "warmup failed";
+
+    double env0_box_pos[3], env1_box_pos[3];
+    ASSERT_TRUE(read_position(m_handle, "/World/envs/env0/box", env0_box_pos));
+    ASSERT_TRUE(read_position(m_handle, "/World/envs/env1/box", env1_box_pos));
+
+    std::cout << "env0/box pos: (" << env0_box_pos[0] << ", " << env0_box_pos[1]
+              << ", " << env0_box_pos[2] << ")" << std::endl;
+    std::cout << "env1/box pos: (" << env1_box_pos[0] << ", " << env1_box_pos[1]
+              << ", " << env1_box_pos[2] << ")" << std::endl;
+
+    // env0 has scale 0.5 and a -90-deg rotation around Z (quat w=0.707, z=-0.707),
+    // so child box at local (0,2,0) -> scaled to (0,1,0) -> rotated -90 deg
+    // around Z to (1,0,0) -> translated by (0,0,1) = world (1, 0, 1).
+    //
+    // env1 has scale 0.5 with identity rotation, so child box at
+    // local (0,2,0) -> scaled to (0,1,0) -> no rotation -> translated
+    // by (5,0,0) = world (5, 1, 0).
+    //
+    // If scale is dropped, env1's child Y would be 2.0 instead of 1.0.
+
+    const double tol = 0.1;
+
+    // env0's box position confirms the scene setup.
+    EXPECT_NEAR(env0_box_pos[0], 1.0, tol) << "env0 box X should be ~1.0";
+    EXPECT_NEAR(env0_box_pos[1], 0.0, tol) << "env0 box Y should be ~0.0";
+    EXPECT_NEAR(env0_box_pos[2], 1.0, tol) << "env0 box Z should be ~1.0";
+
+    // env1 parent is at (5, 0, 0) with identity orient.
+    // Child local Y=2, scaled by 0.5 -> world Y offset of 1.0 from parent.
+    double env1_child_y_offset = env1_box_pos[1] - 0.0;  // parent Y = 0
+    EXPECT_NEAR(env1_child_y_offset, 1.0, tol)
+        << "env1 child Y offset should be ~1.0 (scale 0.5 * local Y 2.0). "
+        << "A value of ~2.0 means xformOp:scale was dropped from xformOpOrder.";
+
+    // Simulation must run without crashing.
+    for (int i = 0; i < 10; ++i) {
+        step_and_wait(m_handle, 1.0f / 60.0f);
+    }
+
+    std::cout << "[OK] Clone with source scale preserved correctly" << std::endl;
+}
+
+// ============================================================================
+// Non-clone regression tests: deferred attachStage() must work for users who
+// never call clone(). These exercise the lazy attach path through
+// simulate / warmup / tensor read.
+// ============================================================================
+
+// The first step() triggers the lazy attachStage() without any clone() call.
 TEST_F(CloneTest, StepWithoutClone)
 {
     ovphysx_usd_handle_t usd_handle = 0;
@@ -308,37 +479,24 @@ TEST_F(CloneTest, StepWithoutClone)
     step_and_wait(m_handle, 1.0f / 60.0f);
 }
 
-TEST_F(CloneTest, ErrorCloneAfterStepRejectedOnCpu)
-{
-    ovphysx_usd_handle_t usd_handle = 0;
-    ASSERT_TRUE(load_basic_usd(usd_handle));
-
-    step_and_wait(m_handle, 1.0f / 60.0f);
-
-    const char* targets[] = { "/World/envs/env1" };
-    ovphysx_enqueue_result_t clone_res = enqueue_clone(m_handle, "/World/envs/env0", targets, 1);
-    EXPECT_EQ(clone_res.status, OVPHYSX_API_INVALID_ARGUMENT);
-    EXPECT_EQ(clone_res.op_index, 0u);
-}
-
 TEST_F(CloneTest, WarmupWithoutClone)
 {
     ovphysx_usd_handle_t usd_handle = 0;
     ASSERT_TRUE(load_basic_usd(usd_handle)) << "USD load timed out or failed";
 
-    ovphysx_result_t res = ovphysx_warmup_gpu(m_handle);
-    ASSERT_EQ(res.status, OVPHYSX_API_SUCCESS) << "warmup_gpu failed without clone";
+    ovphysx_result_t res = ovphysx_warmup(m_handle);
+    ASSERT_EQ(res.status, OVPHYSX_API_SUCCESS) << "warmup failed without clone";
 
     step_and_wait(m_handle, 1.0f / 60.0f);
 }
 
-TEST_F(CloneTest, TensorReadWithoutClone)
+TEST_F(CloneTest, ReadWithoutClone)
 {
     ovphysx_usd_handle_t usd_handle = 0;
     ASSERT_TRUE(load_basic_usd(usd_handle)) << "USD load timed out or failed";
 
     double pos[3] = {};
-    ASSERT_TRUE(read_position(m_handle, "/World/envs/env0/table", pos)) << "Tensor read without clone failed";
+    ASSERT_TRUE(read_position(m_handle, "/World/envs/env0/table", pos)) << "Read without clone failed";
 }
 
 TEST_F(CloneTest, ValidationClonesCanBeSimulated)
@@ -353,7 +511,7 @@ TEST_F(CloneTest, ValidationClonesCanBeSimulated)
 
     ovphysx_enqueue_result_t clone_res = enqueue_clone(m_handle, "/World/envs/env0", targets, num_targets);
     ASSERT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res.op_index, 2'000'000'000ULL)) << "Clone timed out or failed";
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res, 2'000'000'000ULL)) << "Clone timed out or failed";
 
     std::vector<std::string> target_vec(targets, targets + num_targets);
     ASSERT_TRUE(verify_clones_exist(m_handle, target_vec)) << "One or more clone bodies not addressable";
@@ -379,7 +537,7 @@ TEST_F(CloneTest, ValidationMediumScale50Clones)
     ovphysx_enqueue_result_t clone_res =
         ovphysx_clone(m_handle, make_ovx_string("/World/envs/env0"), target_ovx.data(), 50, nullptr, nullptr);
     ASSERT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res.op_index, 5'000'000'000ULL))
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res, 5'000'000'000ULL))
         << "Clone timed out or failed (50 clones)";
 
     for (int i = 0; i < 60; ++i)
@@ -388,7 +546,7 @@ TEST_F(CloneTest, ValidationMediumScale50Clones)
     }
 }
 
-TEST_F(CloneTest, RegressionLargeBatchRetainsTargetPathsForBinding)
+TEST_F(CloneTest, RegressionLargeBatchRetainsTargetPaths)
 {
     ovphysx_usd_handle_t usd_handle = 0;
     ASSERT_TRUE(load_basic_usd(usd_handle)) << "USD load timed out or failed";
@@ -420,78 +578,53 @@ TEST_F(CloneTest, RegressionLargeBatchRetainsTargetPathsForBinding)
     ovphysx_enqueue_result_t clone_res = ovphysx_clone(
         m_handle, make_ovx_string("/World/envs/env0"), target_ovx.data(), kNumClones, nullptr, nullptr);
     ASSERT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res.op_index, 20'000'000'000ULL))
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res, 20'000'000'000ULL))
         << "Large clone batch timed out or failed";
 
-    ovphysx_tensor_binding_desc_t desc{};
-    desc.pattern = make_ovx_string("/World/envs/env*/table");
-    desc.tensor_type = OVPHYSX_TENSOR_RIGID_BODY_POSE_F32;
-    ovphysx_tensor_binding_handle_t binding = 0;
-    ASSERT_EQ(ovphysx_create_tensor_binding(m_handle, &desc, &binding).status, OVPHYSX_API_SUCCESS)
-        << "Failed to create tensor binding";
+    SelectedBodies wildcard;
+    ASSERT_TRUE(read_pattern(m_handle, "/World/envs/env*/table", wildcard)) << "Wildcard read failed";
+    std::sort(wildcard.paths.begin(), wildcard.paths.end());
+    EXPECT_EQ(wildcard.paths, expected_body_paths) << "Wildcard read returned wrong or duplicate clone paths";
 
-    ovphysx_tensor_spec_t spec{};
-    ASSERT_EQ(ovphysx_get_tensor_binding_spec(m_handle, binding, &spec).status, OVPHYSX_API_SUCCESS)
-        << "Failed to get tensor spec";
-    EXPECT_EQ(spec.shape[0], static_cast<int64_t>(kNumClones + 1))
-        << "Every cloned target path must remain addressable through tensor matching";
-    EXPECT_EQ(spec.shape[1], 7) << "Pose tensor should be [N, 7]";
-
-    std::vector<std::string> wildcard_paths;
-    ASSERT_TRUE(read_binding_prim_paths(
-        m_handle, binding, static_cast<uint32_t>(expected_body_paths.size()), wildcard_paths));
-    std::sort(wildcard_paths.begin(), wildcard_paths.end());
-    EXPECT_EQ(wildcard_paths, expected_body_paths) << "Wildcard binding returned wrong or duplicate clone paths";
-    ovphysx_destroy_tensor_binding(m_handle, binding);
-
-    std::vector<ovphysx_string_t> explicit_path_views;
-    explicit_path_views.reserve(expected_body_paths.size());
-    for (const std::string& expected_path : expected_body_paths)
-    {
-        explicit_path_views.push_back(make_ovx_string(expected_path.c_str()));
-    }
-
-    ovphysx_tensor_binding_desc_t explicit_desc{};
-    explicit_desc.prim_paths = explicit_path_views.data();
-    explicit_desc.prim_paths_count = static_cast<uint32_t>(explicit_path_views.size());
-    explicit_desc.tensor_type = OVPHYSX_TENSOR_RIGID_BODY_POSE_F32;
-    ovphysx_tensor_binding_handle_t explicit_binding = 0;
-    ASSERT_EQ(ovphysx_create_tensor_binding(m_handle, &explicit_desc, &explicit_binding).status, OVPHYSX_API_SUCCESS)
-        << "Failed to create explicit-path tensor binding";
-
-    ovphysx_tensor_spec_t explicit_spec{};
-    ASSERT_EQ(ovphysx_get_tensor_binding_spec(m_handle, explicit_binding, &explicit_spec).status,
-              OVPHYSX_API_SUCCESS)
-        << "Failed to get explicit-path tensor spec";
-    EXPECT_EQ(explicit_spec.shape[0], static_cast<int64_t>(expected_body_paths.size()))
-        << "Explicit binding must resolve every requested clone path";
-    EXPECT_EQ(explicit_spec.shape[1], 7) << "Explicit pose tensor should be [N, 7]";
-
-    std::vector<std::string> explicit_paths;
-    ASSERT_TRUE(read_binding_prim_paths(
-        m_handle, explicit_binding, static_cast<uint32_t>(expected_body_paths.size()), explicit_paths));
-    std::sort(explicit_paths.begin(), explicit_paths.end());
-    EXPECT_EQ(explicit_paths, expected_body_paths) << "Explicit binding returned wrong or duplicate clone paths";
-    ovphysx_destroy_tensor_binding(m_handle, explicit_binding);
+    SelectedBodies explicit_bodies;
+    ASSERT_TRUE(read_paths(m_handle, expected_body_paths, explicit_bodies)) << "Explicit-path read failed";
+    std::sort(explicit_bodies.paths.begin(), explicit_bodies.paths.end());
+    EXPECT_EQ(explicit_bodies.paths, expected_body_paths)
+        << "Explicit-path read returned wrong or duplicate clone paths";
 }
 
-static ovphysx_enqueue_result_t enqueue_clone_count(ovphysx_handle_t handle, uint32_t num_targets)
+static ovphysx_enqueue_result_t enqueue_clone_count(ovphysx_instance_handle_t handle, uint32_t num_targets)
 {
+    // Spread the clones over an XZ grid rather than passing null anchors, which co-locates every
+    // copy on the source.
+    const uint32_t gridWidth = static_cast<uint32_t>(std::ceil(std::sqrt(double(num_targets) + 1.0)));
+    const float kSpacing = 5.0f;
+
     std::vector<std::string> target_paths;
     std::vector<ovphysx_string_t> target_ovx;
+    std::vector<float> anchors; // [x,y,z, qx,qy,qz,qw] per target
     target_paths.reserve(num_targets);
     target_ovx.reserve(num_targets);
+    anchors.reserve(static_cast<size_t>(num_targets) * 7u);
     for (uint32_t i = 1; i <= num_targets; ++i)
     {
         target_paths.push_back("/World/envs/env" + std::to_string(i));
         target_ovx.push_back(make_ovx_string(target_paths.back().c_str()));
+
+        anchors.push_back(float(i % gridWidth) * kSpacing); // x
+        anchors.push_back(0.0f); // y
+        anchors.push_back(float(i / gridWidth) * kSpacing); // z
+        anchors.push_back(0.0f); // qx
+        anchors.push_back(0.0f); // qy
+        anchors.push_back(0.0f); // qz
+        anchors.push_back(1.0f); // qw (identity)
     }
-    return ovphysx_clone(handle, make_ovx_string("/World/envs/env0"), target_ovx.data(), num_targets, nullptr,
-                         nullptr);
+    return ovphysx_clone(handle, make_ovx_string("/World/envs/env0"), target_ovx.data(), num_targets,
+                         anchors.data(), nullptr);
 }
 
-// NVBugs 6473884: the filed repro cycles reset_stage() -> reload -> clone again at large N.
-// RegressionLargeBatchRetainsTargetPathsForBinding covers the single-batch binding path.
+// NVBugs 6473884: the filed repro cycles detach_ovstage() -> reload -> clone again at large N.
+// RegressionLargeBatchRetainsTargetPaths covers a single batch.
 TEST_F(CloneTest, RegressionLargeBatchCloneAfterReset_NVBugs6473884)
 {
     constexpr uint32_t kNumTargets = 512;
@@ -501,7 +634,7 @@ TEST_F(CloneTest, RegressionLargeBatchCloneAfterReset_NVBugs6473884)
 
     ovphysx_enqueue_result_t clone_res_first = enqueue_clone_count(m_handle, kNumTargets);
     ASSERT_EQ(clone_res_first.status, OVPHYSX_API_SUCCESS) << "first cycle: clone enqueue failed";
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res_first.op_index, 30'000'000'000ULL))
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res_first, 30'000'000'000ULL))
         << "first cycle: large clone timed out or failed";
 
     const std::vector<std::string> spot_check = { "/World/envs/env1",
@@ -515,11 +648,11 @@ TEST_F(CloneTest, RegressionLargeBatchCloneAfterReset_NVBugs6473884)
         step_and_wait(m_handle, 1.0f / 60.0f);
     }
 
-    ovphysx_enqueue_result_t reset = ovphysx_reset_stage(m_handle);
+    ovphysx_enqueue_result_t reset = ovphysx_detach_ovstage(m_handle);
     ASSERT_EQ(reset.status, OVPHYSX_API_SUCCESS);
     if (reset.op_index != 0)
     {
-        ASSERT_TRUE(waitForOperationSuccess(m_handle, reset.op_index, 5'000'000'000ULL));
+        ASSERT_TRUE(waitForTaskSuccess(m_handle, reset, 5'000'000'000ULL));
     }
     test_utils::destroy_ovstage_test_attachments(m_handle);
 
@@ -528,27 +661,22 @@ TEST_F(CloneTest, RegressionLargeBatchCloneAfterReset_NVBugs6473884)
 
     ovphysx_enqueue_result_t clone_res_second = enqueue_clone_count(m_handle, kNumTargets);
     ASSERT_EQ(clone_res_second.status, OVPHYSX_API_SUCCESS) << "second cycle: clone enqueue failed";
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res_second.op_index, 30'000'000'000ULL))
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res_second, 30'000'000'000ULL))
         << "second cycle: large clone timed out or failed after reset";
 
     ASSERT_TRUE(verify_clones_exist(m_handle, spot_check))
         << "second cycle: clone bodies not addressable after reset + large batch";
 
-    ovphysx_tensor_binding_desc_t wildcard_desc{};
-    wildcard_desc.pattern = make_ovx_string("/World/envs/env*/table");
-    wildcard_desc.tensor_type = OVPHYSX_TENSOR_RIGID_BODY_POSE_F32;
-    ovphysx_tensor_binding_handle_t wildcard_binding = 0;
-    ASSERT_EQ(ovphysx_create_tensor_binding(m_handle, &wildcard_desc, &wildcard_binding).status,
-              OVPHYSX_API_SUCCESS)
-        << "second cycle: failed to create wildcard tensor binding";
-
-    ovphysx_tensor_spec_t wildcard_spec{};
-    ASSERT_EQ(ovphysx_get_tensor_binding_spec(m_handle, wildcard_binding, &wildcard_spec).status,
-              OVPHYSX_API_SUCCESS)
-        << "second cycle: failed to get wildcard tensor spec";
-    EXPECT_EQ(wildcard_spec.shape[0], static_cast<int64_t>(kNumTargets + 1))
-        << "second cycle: every cloned target path must remain addressable through wildcard binding";
-    ovphysx_destroy_tensor_binding(m_handle, wildcard_binding);
+    SelectedBodies wildcard;
+    ASSERT_TRUE(read_pattern(m_handle, "/World/envs/env*/table", wildcard)) << "second cycle: wildcard read failed";
+    std::vector<std::string> expected_paths;
+    expected_paths.reserve(kNumTargets + 1);
+    for (uint32_t i = 0; i <= kNumTargets; ++i)
+        expected_paths.push_back("/World/envs/env" + std::to_string(i) + "/table");
+    std::sort(expected_paths.begin(), expected_paths.end());
+    std::sort(wildcard.paths.begin(), wildcard.paths.end());
+    EXPECT_EQ(wildcard.paths, expected_paths)
+        << "second cycle: every cloned target path must remain addressable through a wildcard";
 }
 
 TEST_F(CloneTest, ValidationNonSequentialTargetPaths)
@@ -556,8 +684,8 @@ TEST_F(CloneTest, ValidationNonSequentialTargetPaths)
     ovphysx_usd_handle_t usd_handle = 0;
     ASSERT_TRUE(load_basic_usd(usd_handle)) << "USD load timed out or failed";
 
-    // Non-standard target paths prove the system honors caller-supplied paths (it isn't
-    // auto-generating env1/env2/...).
+    // Non-standard target paths prove the system honors caller-supplied paths rather than
+    // auto-generating env1/env2/...
     const char* targets[] = {
         "/World/envs/custom_clone_A", "/World/envs/custom_clone_B", "/World/envs/test_env_99",
         "/World/different/path/structure", "/World/envs/env_with_underscores_123"
@@ -566,7 +694,7 @@ TEST_F(CloneTest, ValidationNonSequentialTargetPaths)
 
     ovphysx_enqueue_result_t clone_res = enqueue_clone(m_handle, "/World/envs/env0", targets, num_targets);
     ASSERT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res.op_index, 2'000'000'000ULL))
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res, 2'000'000'000ULL))
         << "Clone operation timed out or failed";
 
     std::vector<std::string> target_vec(targets, targets + num_targets);
@@ -584,16 +712,16 @@ TEST_F(CloneTest, ValidationMultipleCloneOperations)
     ASSERT_TRUE(load_basic_usd(usd_handle)) << "USD load timed out or failed";
 
     // Both clone operations run before the first step (the clone contract): a clone must precede
-    // GPU warmup / the first step.
+    // warmup / the first step.
     const char* targets1[] = { "/World/envs/batch1_clone_A", "/World/envs/batch1_clone_B" };
     ovphysx_enqueue_result_t clone_res1 = enqueue_clone(m_handle, "/World/envs/env0", targets1, 2);
     ASSERT_EQ(clone_res1.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res1.op_index, 2'000'000'000ULL)) << "First clone operation failed";
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res1, 2'000'000'000ULL)) << "First clone operation failed";
 
     const char* targets2[] = { "/World/envs/batch2_clone_X", "/World/envs/batch2_clone_Y", "/World/envs/batch2_clone_Z" };
     ovphysx_enqueue_result_t clone_res2 = enqueue_clone(m_handle, "/World/envs/env0", targets2, 3);
     ASSERT_EQ(clone_res2.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res2.op_index, 2'000'000'000ULL)) << "Second clone operation failed";
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res2, 2'000'000'000ULL)) << "Second clone operation failed";
 
     for (int i = 0; i < 30; ++i)
     {
@@ -612,45 +740,23 @@ TEST_F(CloneTest, RegressionNoDuplicateActorsFromAttachStage)
     const char* targets[] = { "/World/envs/env1", "/World/envs/env2", "/World/envs/env3", "/World/envs/env4" };
     ovphysx_enqueue_result_t clone_res = enqueue_clone(m_handle, "/World/envs/env0", targets, NUM_CLONES);
     ASSERT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res.op_index, 5'000'000'000ULL)) << "Clone timed out or failed";
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res, 5'000'000'000ULL)) << "Clone timed out or failed";
 
-    ovphysx_result_t warmup_res = ovphysx_warmup_gpu(m_handle);
-    ASSERT_EQ(warmup_res.status, OVPHYSX_API_SUCCESS) << "warmup_gpu failed";
+    ovphysx_result_t warmup_res = ovphysx_warmup(m_handle);
+    ASSERT_EQ(warmup_res.status, OVPHYSX_API_SUCCESS) << "warmup failed";
 
-    // A binding over every env's body must resolve exactly TOTAL_ENVS actors. A count of
+    // A read over every env's body must resolve exactly TOTAL_ENVS actors. A count of
     // TOTAL_ENVS+1 would mean env0 was parsed twice (the duplicate-actor bug).
-    ovphysx_tensor_binding_handle_t binding = 0;
-    ovphysx_tensor_binding_desc_t desc{};
-    desc.pattern = make_ovx_string("/World/envs/env*/table");
-    desc.tensor_type = OVPHYSX_TENSOR_RIGID_BODY_POSE_F32;
-    ASSERT_EQ(ovphysx_create_tensor_binding(m_handle, &desc, &binding).status, OVPHYSX_API_SUCCESS)
-        << "Failed to create tensor binding";
-
-    ovphysx_tensor_spec_t spec{};
-    ASSERT_EQ(ovphysx_get_tensor_binding_spec(m_handle, binding, &spec).status, OVPHYSX_API_SUCCESS)
-        << "Failed to get tensor spec";
-    EXPECT_EQ(spec.shape[0], static_cast<int64_t>(TOTAL_ENVS))
+    SelectedBodies bodies;
+    ASSERT_TRUE(read_pattern(m_handle, "/World/envs/env*/table", bodies)) << "Read failed";
+    EXPECT_EQ(bodies.positions.size(), static_cast<size_t>(TOTAL_ENVS))
         << "Expected exactly " << TOTAL_ENVS << " rigid bodies (source + " << NUM_CLONES << " clones), got "
-        << spec.shape[0];
-    EXPECT_EQ(spec.shape[1], 7) << "Pose tensor should be [N, 7]";
-
-    const int64_t N = spec.shape[0];
-    std::vector<float> poses(static_cast<size_t>(N) * 7, 0.0f);
-    int64_t shape[2] = { N, 7 };
-    DLTensor tensor{};
-    tensor.data = poses.data();
-    tensor.ndim = 2;
-    tensor.shape = shape;
-    tensor.strides = nullptr;
-    tensor.dtype = { kDLFloat, 32, 1 };
-    tensor.device = { kDLCPU, 0 };
-    ASSERT_EQ(ovphysx_read_tensor_binding(m_handle, binding, &tensor).status, OVPHYSX_API_SUCCESS) << "Tensor read failed";
-
-    for (int64_t i = 0; i < N * 7; ++i)
+        << bodies.positions.size();
+    for (size_t i = 0; i < bodies.positions.size(); ++i)
     {
-        ASSERT_FALSE(std::isnan(poses[i])) << "NaN in rigid body pose at index " << i;
+        for (float coordinate : bodies.positions[i])
+            ASSERT_FALSE(std::isnan(coordinate)) << "NaN in the position of " << bodies.paths[i];
     }
-    ovphysx_destroy_tensor_binding(m_handle, binding);
 
     for (int i = 0; i < 30; ++i)
     {
@@ -658,8 +764,8 @@ TEST_F(CloneTest, RegressionNoDuplicateActorsFromAttachStage)
     }
 }
 
-// A successful clone registers a replicator for the backing stage id; the seam must unregister it so
-// a later reset_stage() -> reload is a normal parse, not the replicator re-attach path (which sets
+// A successful clone registers a replicator for the backing stage id. The seam must unregister it so
+// a later detach_ovstage() and reload is a normal parse, not the replicator re-attach path (which sets
 // loadPhysics=false and parses no physics). Reload and a fresh clone must both work.
 TEST_F(CloneTest, RegressionReplicatorUnregisteredForReattachAfterReset)
 {
@@ -669,20 +775,20 @@ TEST_F(CloneTest, RegressionReplicatorUnregisteredForReattachAfterReset)
     const char* targets[] = { "/World/envs/env1", "/World/envs/env2" };
     ovphysx_enqueue_result_t clone_res = enqueue_clone(m_handle, "/World/envs/env0", targets, 2);
     ASSERT_EQ(clone_res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res.op_index, 5'000'000'000ULL)) << "Clone timed out or failed";
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res, 5'000'000'000ULL)) << "Clone timed out or failed";
     std::vector<std::string> target_vec(targets, targets + 2);
     ASSERT_TRUE(verify_clones_exist(m_handle, target_vec)) << "Clone bodies not addressable";
 
-    // reset_stage() detaches; the clone's replicator registration must not survive it.
-    ovphysx_enqueue_result_t reset = ovphysx_reset_stage(m_handle);
+    // detach_ovstage() detaches. The clone's replicator registration must not survive it.
+    ovphysx_enqueue_result_t reset = ovphysx_detach_ovstage(m_handle);
     ASSERT_EQ(reset.status, OVPHYSX_API_SUCCESS);
     if (reset.op_index != 0)
     {
-        ASSERT_TRUE(waitForOperationSuccess(m_handle, reset.op_index, 3'000'000'000ULL));
+        ASSERT_TRUE(waitForTaskSuccess(m_handle, reset, 3'000'000'000ULL));
     }
     test_utils::destroy_ovstage_test_attachments(m_handle);
 
-    // Reload the same scene and clone again -- both before any step/tensor read, which auto-warms
+    // Reload the same scene and clone again, both before any step/tensor read, which auto-warms
     // and would trip the clone-before-warmup guard. If the stale registration had survived, the
     // re-attach of the reused backing stage id would take the replicator path (loadPhysics=false)
     // and parse no physics, so the reloaded source would have no body to clone.
@@ -691,7 +797,7 @@ TEST_F(CloneTest, RegressionReplicatorUnregisteredForReattachAfterReset)
 
     ovphysx_enqueue_result_t clone_res2 = enqueue_clone(m_handle, "/World/envs/env0", targets, 2);
     ASSERT_EQ(clone_res2.status, OVPHYSX_API_SUCCESS) << "second clone (after reset+reload) failed";
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, clone_res2.op_index, 5'000'000'000ULL)) << "second clone timed out";
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, clone_res2, 5'000'000'000ULL)) << "second clone timed out";
 
     // Source + both clone bodies must be addressable: proves the reload parsed physics normally and
     // the fresh clone materialized. (Tensor reads here auto-warm, which is fine post-clone.)
@@ -713,7 +819,7 @@ TEST_F(CloneTest, ErrorEmptyTargetPath)
     EXPECT_EQ(res.status, OVPHYSX_API_INVALID_ARGUMENT);
     if (res.op_index != 0)
     {
-        EXPECT_FALSE(waitForOperationSuccess(m_handle, res.op_index, 2'000'000'000ULL));
+        EXPECT_FALSE(waitForTaskSuccess(m_handle, res, 2'000'000'000ULL));
     }
 }
 
@@ -727,7 +833,7 @@ TEST_F(CloneTest, ErrorTargetEqualsSource)
     EXPECT_EQ(res.status, OVPHYSX_API_INVALID_ARGUMENT);
     if (res.op_index != 0)
     {
-        EXPECT_FALSE(waitForOperationSuccess(m_handle, res.op_index, 2'000'000'000ULL));
+        EXPECT_FALSE(waitForTaskSuccess(m_handle, res, 2'000'000'000ULL));
     }
 }
 
@@ -747,7 +853,7 @@ TEST_F(CloneTest, ErrorTargetWithEmbeddedNul)
     EXPECT_EQ(res.status, OVPHYSX_API_INVALID_ARGUMENT);
     if (res.op_index != 0)
     {
-        EXPECT_FALSE(waitForOperationSuccess(m_handle, res.op_index, 2'000'000'000ULL));
+        EXPECT_FALSE(waitForTaskSuccess(m_handle, res, 2'000'000'000ULL));
     }
 }
 
@@ -779,11 +885,9 @@ TEST_F(CloneTest, ErrorTargetNotAbsolutePrimPath)
     {
         const char* targets[] = { bad };
         ovphysx_enqueue_result_t res = enqueue_clone(m_handle, "/World/envs/env0", targets, 1);
-        EXPECT_NE(res.status, OVPHYSX_API_SUCCESS) << "target '" << bad << "' must be rejected";
-        if (res.op_index != 0)
-        {
-            EXPECT_FALSE(waitForOperationSuccess(m_handle, res.op_index, 2'000'000'000ULL));
-        }
+        ASSERT_EQ(res.status, OVPHYSX_API_SUCCESS);
+        EXPECT_TRUE(waitForTaskFailure(m_handle, res, "must be a non-root absolute prim path"))
+            << "target '" << bad << "' must fail its task";
     }
 }
 
@@ -796,7 +900,7 @@ TEST_F(CloneTest, ErrorEnvIdOutOfRange)
     ovphysx_usd_handle_t usd_handle = 0;
     ASSERT_TRUE(load_basic_usd(usd_handle)) << "USD load timed out or failed";
 
-    // Just over the boundary and both former (too-wide) sentinels must all be rejected.
+    // Just over the boundary and the two wide sentinel values must all be rejected.
     for (uint32_t bad : { 0x00FFFFFFu, 0x01000000u, 0xFFFFFFFEu, 0xFFFFFFFFu })
     {
         ovphysx_string_t target = make_ovx_string("/World/envs/env1");
@@ -805,7 +909,7 @@ TEST_F(CloneTest, ErrorEnvIdOutOfRange)
         EXPECT_EQ(res.status, OVPHYSX_API_INVALID_ARGUMENT) << "env_id " << bad << " must be rejected";
         if (res.op_index != 0)
         {
-            EXPECT_FALSE(waitForOperationSuccess(m_handle, res.op_index, 2'000'000'000ULL));
+            EXPECT_FALSE(waitForTaskSuccess(m_handle, res, 2'000'000'000ULL));
         }
     }
 
@@ -818,7 +922,7 @@ TEST_F(CloneTest, ErrorEnvIdOutOfRange)
     EXPECT_EQ(ok.status, OVPHYSX_API_SUCCESS) << "max valid env_id 0x00FFFFFE must be accepted";
     if (ok.status == OVPHYSX_API_SUCCESS)
     {
-        EXPECT_TRUE(waitForOperationSuccess(m_handle, ok.op_index, 5'000'000'000ULL));
+        EXPECT_TRUE(waitForTaskSuccess(m_handle, ok, 5'000'000'000ULL));
     }
 }
 
@@ -847,7 +951,7 @@ TEST_F(CloneTest, CloneWithExplicitEnvIds)
     ovphysx_enqueue_result_t res = ovphysx_clone(m_handle, make_ovx_string("/World/envs/env0"), target_ovx.data(), 2,
                              transforms, env_ids);
     ASSERT_EQ(res.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, res.op_index, 5'000'000'000ULL))
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, res, 5'000'000'000ULL))
         << "Clone with env_ids timed out or failed";
 
     step_and_wait(m_handle, 1.0f / 60.0f);
@@ -867,11 +971,11 @@ TEST_F(CloneTest, ErrorDuplicateTargetInBatchDoesNotWedgeReset)
     EXPECT_EQ(res.status, OVPHYSX_API_INVALID_ARGUMENT);
     EXPECT_EQ(res.op_index, 0u);
 
-    ovphysx_enqueue_result_t reset = ovphysx_reset_stage(m_handle);
+    ovphysx_enqueue_result_t reset = ovphysx_detach_ovstage(m_handle);
     ASSERT_EQ(reset.status, OVPHYSX_API_SUCCESS);
     if (reset.op_index != 0)
     {
-        ASSERT_TRUE(waitForOperationSuccess(m_handle, reset.op_index, 3'000'000'000ULL));
+        ASSERT_TRUE(waitForTaskSuccess(m_handle, reset, 3'000'000'000ULL));
     }
     test_utils::destroy_ovstage_test_attachments(m_handle);
 
@@ -880,7 +984,7 @@ TEST_F(CloneTest, ErrorDuplicateTargetInBatchDoesNotWedgeReset)
     const char* valid_targets[] = { "/World/envs/env1" };
     ovphysx_enqueue_result_t valid = enqueue_clone(m_handle, "/World/envs/env0", valid_targets, 1);
     ASSERT_EQ(valid.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, valid.op_index, 5'000'000'000ULL));
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, valid, 5'000'000'000ULL));
 }
 
 TEST_F(CloneTest, ErrorTargetReusedAcrossBatches)
@@ -891,63 +995,57 @@ TEST_F(CloneTest, ErrorTargetReusedAcrossBatches)
     const char* targets[] = { "/World/envs/env1" };
     ovphysx_enqueue_result_t first = enqueue_clone(m_handle, "/World/envs/env0", targets, 1);
     ASSERT_EQ(first.status, OVPHYSX_API_SUCCESS);
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, first.op_index, 5'000'000'000ULL)) << "first clone failed";
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, first, 5'000'000'000ULL)) << "first clone failed";
 
-    // env1 now exists; reusing it on the same attach must be rejected.
+    // env1 now exists, so reusing it on the same attach fails the second clone's task.
     ovphysx_enqueue_result_t second = enqueue_clone(m_handle, "/World/envs/env0", targets, 1);
-    EXPECT_EQ(second.status, OVPHYSX_API_INVALID_ARGUMENT);
-    if (second.op_index != 0)
-    {
-        EXPECT_FALSE(waitForOperationSuccess(m_handle, second.op_index, 2'000'000'000ULL));
-    }
+    ASSERT_EQ(second.status, OVPHYSX_API_SUCCESS);
+    EXPECT_TRUE(waitForTaskFailure(m_handle, second, "clone: target path was already cloned on this attach"));
 }
 
-// A target already populated with physics from the INITIAL PARSE (not from a prior clone) must be
+// A target already populated with physics from the initial parse (not from a prior clone) must be
 // rejected before replicate(), otherwise it would add duplicate actors under an existing path.
-// Distinct from ErrorTargetReusedAcrossBatches (prior-clone targets, caught C-first by
-// cloned_target_paths -> INVALID_ARGUMENT): here the runtime ObjectDb subtree check in the seam
-// catches it, so the clone is rejected (OVPHYSX_API_ERROR) before replicate() can mutate anything.
+// Distinct from ErrorTargetReusedAcrossBatches (prior-clone targets, caught by the clone job's
+// cloned_target_paths check before the runtime call): here the runtime ObjectDb subtree check in
+// the seam catches it, before replicate() can mutate anything.
 TEST_F(CloneTest, ErrorTargetAlreadyPopulated)
 {
     ovphysx_usd_handle_t usd_handle = 0;
     ASSERT_TRUE(load_basic_usd(usd_handle)) << "USD load timed out or failed";
 
-    // /World/envs/env0/table is a rigid body from the parse; cloning onto it must be rejected.
+    // /World/envs/env0/table is a rigid body from the parse, so cloning onto it must be rejected.
     const char* targets[] = { "/World/envs/env0/table" };
     ovphysx_enqueue_result_t res = enqueue_clone(m_handle, "/World/envs/env0", targets, 1);
-    EXPECT_EQ(res.status, OVPHYSX_API_ERROR);
-    if (res.op_index != 0)
-    {
-        EXPECT_FALSE(waitForOperationSuccess(m_handle, res.op_index, 2'000'000'000ULL));
-    }
+    ASSERT_EQ(res.status, OVPHYSX_API_SUCCESS);
+    EXPECT_TRUE(waitForTaskFailure(m_handle, res, "is already populated with physics"));
 }
 
-// A synchronous clone error must not register a failed async op (op_index 0). Otherwise
-// wait_for_all_pending_ops() keeps the orphan and every later attach/reset/clone fails until an
-// undocumented wait_all() consumes it. Here a clone-before-attach error is followed by a normal
-// attach + clone that must succeed with no wait_all() in between.
-TEST_F(CloneTest, ErrorLeavesNoOrphanOpThenRecovers)
+// A clone submitted before attach is accepted and its task fails: the attach submitted
+// after it runs after the clone job. A normal clone follows without an intervening
+// wait-all, and the earlier failure stays collectable.
+TEST_F(CloneTest, ErrorBeforeAttachFailsItsTaskThenRecovers)
 {
     const char* targets[] = { "/World/envs/env1" };
     // No ovstage is attached yet.
     ovphysx_enqueue_result_t errored = enqueue_clone(m_handle, "/World/envs/env0", targets, 1);
-    EXPECT_EQ(errored.status, OVPHYSX_API_ERROR);
-    EXPECT_EQ(errored.op_index, 0u) << "synchronous error must not register an async op";
+    ASSERT_EQ(errored.status, OVPHYSX_API_SUCCESS);
+    EXPECT_NE(errored.op_index, 0u) << "the attachment check runs in the job, so the clone has a task";
 
     ovphysx_usd_handle_t usd_handle = 0;
     ASSERT_TRUE(load_basic_usd(usd_handle)) << "USD load timed out or failed";
 
     ovphysx_enqueue_result_t ok = enqueue_clone(m_handle, "/World/envs/env0", targets, 1);
-    ASSERT_EQ(ok.status, OVPHYSX_API_SUCCESS) << "clone after a prior synchronous error must succeed";
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, ok.op_index, 5'000'000'000ULL));
+    ASSERT_EQ(ok.status, OVPHYSX_API_SUCCESS) << "clone after a prior failure must succeed";
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, ok, 5'000'000'000ULL));
     std::vector<std::string> tv(targets, targets + 1);
     ASSERT_TRUE(verify_clones_exist(m_handle, tv));
+    EXPECT_TRUE(waitForTaskFailure(m_handle, errored, "clone: no ovstage is attached"));
 }
 
 // A clone that fails inside replicate() (here: a non-existent source, which registers the replicator
-// then returns false) must still unregister it via the seam's scope guard -- the guard also covers
+// then returns false) must still unregister it via the seam's scope guard. The guard also covers
 // the replicate-throws path. Otherwise a later re-attach takes the hijacked replicator path
-// (loadPhysics=false) and parses no physics. reset -> reload -> clone must succeed afterwards.
+// (loadPhysics=false) and parses no physics. Reset, reload and clone must succeed afterwards.
 TEST_F(CloneTest, FailedCloneUnregistersReplicatorForReattach)
 {
     ovphysx_usd_handle_t usd_handle = 0;
@@ -955,14 +1053,14 @@ TEST_F(CloneTest, FailedCloneUnregistersReplicatorForReattach)
 
     const char* badTargets[] = { "/World/envs/env1" };
     ovphysx_enqueue_result_t failed = enqueue_clone(m_handle, "/World/envs/does_not_exist", badTargets, 1);
-    EXPECT_EQ(failed.status, OVPHYSX_API_ERROR);
+    ASSERT_EQ(failed.status, OVPHYSX_API_SUCCESS);
 
-    // reset + reload; a stale registration from the failed clone would hijack the re-attach.
-    ovphysx_enqueue_result_t reset = ovphysx_reset_stage(m_handle);
+    // Reset and reload before collecting the recoverable clone failure. A stale registration from the failed clone would hijack the re-attach.
+    ovphysx_enqueue_result_t reset = ovphysx_detach_ovstage(m_handle);
     ASSERT_EQ(reset.status, OVPHYSX_API_SUCCESS);
     if (reset.op_index != 0)
     {
-        ASSERT_TRUE(waitForOperationSuccess(m_handle, reset.op_index, 3'000'000'000ULL));
+        ASSERT_TRUE(waitForTaskSuccess(m_handle, reset, 3'000'000'000ULL));
     }
     test_utils::destroy_ovstage_test_attachments(m_handle);
 
@@ -972,8 +1070,13 @@ TEST_F(CloneTest, FailedCloneUnregistersReplicatorForReattach)
     const char* targets[] = { "/World/envs/env1" };
     ovphysx_enqueue_result_t ok = enqueue_clone(m_handle, "/World/envs/env0", targets, 1);
     ASSERT_EQ(ok.status, OVPHYSX_API_SUCCESS) << "clone after a failed clone + reset + reload must succeed";
-    ASSERT_TRUE(waitForOperationSuccess(m_handle, ok.op_index, 5'000'000'000ULL));
+    ASSERT_TRUE(waitForTaskSuccess(m_handle, ok, 5'000'000'000ULL));
     std::vector<std::string> verify_paths = { "/World/envs/env0", "/World/envs/env1" };
     ASSERT_TRUE(verify_clones_exist(m_handle, verify_paths))
         << "source/clone unaddressable -- a stale registration from the failed clone hijacked re-attach";
+    ovphysx_wait_task_result_t all{};
+    EXPECT_EQ(ovphysx_wait_all(m_handle, UINT64_MAX, &all).status, OVPHYSX_API_ERROR);
+    ASSERT_EQ(all.num_errors, 1u);
+    EXPECT_EQ(all.error_tasks[0].op_index, failed.op_index);
+    ovphysx_destroy_wait_task_result(&all);
 }

@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
 """Session-scoped PhysX instance for the benchmark suite.
 
 Each benchmark process exercises one device (cpu or gpu). The harness driver
 (``scripts/test_benchmarks_python.cmake``) passes ``--bench-device=cpu|gpu``
-to pytest, which we read via the standard ``pytest_addoption`` hook.
+to pytest, which is read via the standard ``pytest_addoption`` hook.
 
 Tests that target a specific device (e.g. ``bench_tensor_io_gpu``) use
 ``pytest.skip`` when the active device does not match.
@@ -19,6 +19,11 @@ import sys
 from pathlib import Path
 
 import pytest
+
+# Exercise the application-side schema recipe, including fresh subprocesses.
+_schema_samples = os.path.join(os.path.dirname(__file__), "..", "python_samples")
+sys.path.insert(0, _schema_samples)
+os.environ["PYTHONPATH"] = _schema_samples + os.pathsep + os.environ.get("PYTHONPATH", "")
 
 
 def pytest_addoption(parser):
@@ -108,26 +113,38 @@ def physx(bench_device):
     sdk = PhysX()
     yield sdk
     try:
-        sdk.release()
+        sdk.destroy()
     except Exception:
         pass
 
 
-def attach_usd_with_ovstage(physx, usd_path: Path, stage_name: str):
-    import ovstage
+_physx_schemas_registered = False
 
+
+def attach_usd_with_ovstage(physx, usd_path: Path, stage_name: str):
+    import ovphysx
+    from schema_support import physx_schema_paths
+    import ovstage
+    from ovphysx.population import physics_population_descs
     if not ovstage.population.available():
         raise RuntimeError("ovstage population bridge is unavailable")
 
+    # Register external PhysX and Newton schemas before the first population.
+    global _physx_schemas_registered
+    if not _physx_schemas_registered:
+        ovstage.population.register_usd_schemas(
+            [*[str(p) for p in physx_schema_paths()], str(ovphysx.newton_schema_root())]
+        )
+        _physx_schemas_registered = True
     stage = ovstage.Stage(stage_name)
     ordinal = 1
     try:
-        ovstage.population.open_usd(stage, str(usd_path), ordinal=ordinal, domains=ovstage.PopulationDomain.PHYSICS)
-        # Population does not seal: the caller owns ordinal lifecycle, and
-        # attach_ovstage() reads at a sealed ordinal.
+        ovstage.population.open_usd_with_desc(stage, str(usd_path), ordinal=ordinal, time=ovstage.population.DEFAULT_TIME, descs=physics_population_descs())
         stage.advance_write_floor(ordinal=ordinal).wait()
-        physx.attach_ovstage(stage, read_ordinal=ordinal)
+        physx.wait_task(physx.attach_ovstage(stage, read_ordinal=ordinal))
     except Exception:
+        if physx.is_stage_attached(stage):
+            physx.wait_task(physx.detach_ovstage())
         stage.destroy()
         raise
 
@@ -143,10 +160,7 @@ def destroy_ovstage_benchmark_attachments(physx):
     stages = getattr(physx, "_ovphysx_benchmark_ovstages", None)
     if not stages:
         return
-    try:
-        physx.detach_ovstage()
-    except Exception:
-        pass
+    physx.wait_task(physx.detach_ovstage())
     while stages:
         stage = stages.pop()
         try:
@@ -156,14 +170,10 @@ def destroy_ovstage_benchmark_attachments(physx):
 
 
 @pytest.fixture(autouse=True)
-def _reset_stage(physx):
-    """Reset the stage between tests so each benchmark starts clean."""
-    physx.reset_stage()
-    physx.wait_all()
+def _detach_stage(physx):
+    """Detach the stage between tests so each benchmark starts clean."""
     destroy_ovstage_benchmark_attachments(physx)
     yield
-    physx.reset_stage()
-    physx.wait_all()
     destroy_ovstage_benchmark_attachments(physx)
 
 

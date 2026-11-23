@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+// @implements REQ-ATTACH-RESOLVE-001
+// @covers AC-5 AC-6
+/**
+ * @implements REQ-SIM-FILTER-001
+ * @covers AC-1
+ */
 
 #include "InternalFilteredPairs.h"
 #include "InternalPhysXDatabase.h"
@@ -9,11 +14,11 @@
 #include <usdLoad/AttachedStage.h>
 #include <usdLoad/FilteredPairs.h>
 
+#include <omni/physics/parse/KnownTokens.h>
 #include <omni/physx/IPhysx.h>
 
 #include <PxPhysicsAPI.h>
 
-using namespace PXR_NS;
 using namespace carb;
 using namespace ::physx;
 using namespace omni::physx;
@@ -24,6 +29,10 @@ using namespace omni::physx::internal;
 // collection objects that do have filtered data
 void collectFilteredObjects(std::vector<PxBase*>& filteredObjects, const InternalDatabase::Record& objectRecord)
 {
+    // Disabled deformables retain a record without a native PhysX object.
+    if (!objectRecord.mPtr)
+        return;
+
     switch (objectRecord.mType)
     {
     case ePTShape:
@@ -122,11 +131,11 @@ void resetFiltering(PxBase* basePtr)
     }
 }
 
-void handleFilteringPair(size_t index0, size_t index1)
+void handleFilteringPair(AttachedStage& attachedStage, size_t index0, size_t index1)
 {
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
     PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     InternalDatabase::Record& objectRecord0 = db.getRecords()[index0];
     InternalDatabase::Record& objectRecord1 = db.getRecords()[index1];
@@ -153,16 +162,16 @@ void handleFilteringPair(size_t index0, size_t index1)
             setFilterPairData(objects1[j], hash1);
             resetFiltering(objects1[j]);
             const Pair<uint32_t> filterPair(hash0, hash1);
-            physxSetup.addFilteredPair(filterPair);
+            attachedStage.addFilteredPair(filterPair);
         }
     }
 }
 
-void removeFilteringPair(size_t index0, size_t index1)
+void removeFilteringPair(AttachedStage& attachedStage, size_t index0, size_t index1)
 {
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
     PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     if (index0 < db.getRecords().size() && index1 < db.getRecords().size())
     {
@@ -192,7 +201,7 @@ void removeFilteringPair(size_t index0, size_t index1)
                     const uint32_t hash1 = ::physx::PxComputeHash(uint64_t(objects1[j]));
                     resetFiltering(objects1[j]);
                     const Pair<uint32_t> filterPair(hash0, hash1);
-                    physxSetup.removeFilteredPair(filterPair);
+                    attachedStage.removeFilteredPair(filterPair);
                 }
             }
         }
@@ -204,7 +213,7 @@ void InternalFilteredPairs::createFilteredPairs()
 {
     for (const ObjectIdPair& pair : mPairs)
     {
-        handleFilteringPair(size_t(pair.first), size_t(pair.second));
+        handleFilteringPair(mAttachedStage, size_t(pair.first), size_t(pair.second));
     }
 }
 
@@ -212,18 +221,18 @@ void InternalFilteredPairs::removeFilteredPairs()
 {
     for (const ObjectIdPair& pair : mPairs)
     {
-        removeFilteringPair(size_t(pair.first), size_t(pair.second));
+        removeFilteringPair(mAttachedStage, size_t(pair.first), size_t(pair.second));
     }
 }
 
-void omni::physx::internal::changeFilteredPairs(usdparser::AttachedStage& attachedStage, const PXR_NS::SdfPath& path, bool removed)
+void omni::physx::internal::changeFilteredPairs(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, bool removed)
 {
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     if (removed)
     {
-        ObjectIdMap* entries = attachedStage.getObjectDatabase()->getEntries(path);
+        ObjectIdMap* entries = attachedStage.getObjectDatabase()->getEntries(key);
         if (entries && !entries->empty())
         {
             auto it = entries->begin();
@@ -232,30 +241,35 @@ void omni::physx::internal::changeFilteredPairs(usdparser::AttachedStage& attach
                 const InternalDatabase::Record& rec = db.getRecords()[it->second];
                 if (rec.mType == ePTFilteredPair)
                 {
-                    attachedStage.getPhysXPhysicsInterface()->releaseObject(attachedStage, path, it->second);
+                    attachedStage.getPhysXPhysicsInterface()->releaseObject(attachedStage, key, it->second);
                     it = entries->erase(it);
                 }
                 else
                     it++;
             }
         }
-        attachedStage.getObjectDatabase()->removeSchemaAPI(path, SchemaAPIFlag::eFilteredPairsAPI);
+        attachedStage.getObjectDatabase()->removeSchemaAPI(key, SchemaAPIFlag::eFilteredPairsAPI);
     }
     else
     {
-        const omni::physics::parse::ObjectKey key = attachedStage.keyFor(path);
         const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
-        if (source && hasAppliedSchema<UsdPhysicsFilteredPairsAPI>(*source, key))
+        omni::physics::parse::KnownTokens tok;
+        if (source)
+            tok.intern(*source);
+        if (source && source->hasSchema(key, tok.physicsFilteredPairsAPI))
         {
-            InternalFilteredPairs* intPairs = ICE_NEW(InternalFilteredPairs);
+            InternalFilteredPairs* intPairs = ICE_NEW(InternalFilteredPairs)(attachedStage);
 
-            SdfPathVector data;
-            getRelationshipValue(attachedStage, key, TfToken("physics:filteredPairs"), data);
-            collectFilteredPairs(attachedStage, path, data, intPairs->mPairs);
+            // Source-routed relationship read (TokenId, no TfToken literal); collectFilteredPairs
+            // (usdLoad/FilteredPairs.h) is ObjectKey-typed (ADR-0019), so the targets pass
+            // through directly with no pathFor round-trip.
+            std::vector<omni::physics::parse::ObjectKey> targetKeys;
+            source->getRelationshipTargets(key, tok.physicsFilteredPairs, targetKeys);
+            collectFilteredPairs(attachedStage, key, targetKeys, intPairs->mPairs);
             intPairs->createFilteredPairs();
             const ObjectId outId = db.addRecord(ePTFilteredPair, nullptr, intPairs, key);
-            attachedStage.getObjectDatabase()->findOrCreateEntry(path, eFilteredPair, outId);
-            attachedStage.getObjectDatabase()->addSchemaAPI(path, SchemaAPIFlag::eFilteredPairsAPI);
+            attachedStage.getObjectDatabase()->findOrCreateEntry(key, attachedStage.textFor(key), eFilteredPair, outId);
+            attachedStage.getObjectDatabase()->addSchemaAPI(key, SchemaAPIFlag::eFilteredPairsAPI);
         }
     }
 }

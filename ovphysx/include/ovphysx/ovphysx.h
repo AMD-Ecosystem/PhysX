@@ -1,5 +1,76 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+/** @cond OVPHYSX_PLC_TRACE */
+/**
+ * @implements REQ-CAPI-OMNIPVD-CAPTURE-001
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5 AC-7
+ */
+/** @endcond */
+
+/** @cond OVPHYSX_PLC_TRACE */
+
+/** @implements REQ-CAPI-DETACH-001
+ * @covers AC-3 AC-4 AC-5
+ */
+
+/**
+ * @implements REQ-CAPI-ASYNC-002
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5 AC-6 AC-7 AC-8 AC-9 AC-10 AC-11 AC-12 AC-13 AC-14
+ */
+/**
+ * @implements REQ-CAPI-OVD-NAMES-001
+ * @covers AC-1 AC-2 AC-3 AC-4
+ * @implements REQ-CAPI-LOG-001
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5 AC-6 AC-7
+ * @implements REQ-CAPI-STRING-001
+ * @covers AC-1 AC-2 AC-3 AC-4
+ * @implements REQ-CAPI-ASYNC-001
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5
+ * @implements REQ-CAPI-STEP-001
+ * @covers AC-1 AC-2
+ * @implements REQ-CAPI-OMNIPVD-LATE-001
+ * @covers AC-1 AC-4 AC-9 AC-10 AC-11 AC-12
+ * @implements REQ-CAPI-OVSTAGE-UPDATE-001
+ * @covers AC-1 AC-2 AC-3 AC-6
+ * @implements REQ-CAPI-OVSTAGE-SCHEMA-001
+ * @covers AC-1 AC-2 AC-3 AC-8
+ * @implements REQ-CAPI-WRITE-001
+ * @covers AC-5a AC-11
+ * @implements REQ-CAPI-READ-001
+ * @covers AC-1 AC-2 AC-3 AC-4
+ * @implements REQ-PYTHON-CLONE-001
+ * @covers AC-2
+ * @implements REQ-CAPI-LEGACY-001
+ * @covers AC-3
+ * @implements REQ-CAPI-CONTACT-001
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5 AC-6 AC-7
+ * @implements REQ-CAPI-CONTACT-002
+ * @covers AC-1 AC-2 AC-3 AC-4
+ * @implements REQ-CAPI-SCENEQUERY-001
+ * @covers AC-1 AC-2 AC-3 AC-4
+ * @implements REQ-CAPI-INSTANCE-SCOPE-001
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5 AC-6
+ * @implements REQ-CAPI-CONFIG-001
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5 AC-6 AC-7
+ * @implements REQ-CAPI-PATTERN-002
+ * @covers AC-8
+ * @implements REQ-CAPI-SESSION-001
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5 AC-6 AC-7 AC-8 AC-9 AC-10
+ * @implements REQ-CAPI-READ-CONTACT-002
+ * @covers AC-1 AC-2
+ * @implements REQ-CAPI-ASYNC-003
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5 AC-6 AC-7 AC-8
+ * @implements REQ-CAPI-OVSTAGE-ATTACH-001
+ * @covers AC-5
+ * @implements REQ-CAPI-TEARDOWN-001
+ * @covers AC-1 AC-2 AC-3 AC-5
+ * @implements REQ-CAPI-HOST-EXIT-001
+ * @covers AC-4
+ * @implements REQ-CAPI-COMPILED-CACHE-001
+ * @covers AC-2 AC-3 AC-5
+ */
+/** @endcond */
 
 
 // C-compatible PhysX API
@@ -15,42 +86,70 @@
 extern "C" {
 #endif
 
-    /* General notes 
-    * 
+
+    /** @deprecated Use ovphysx_ovd_start_recording(). Forwarding export introduced in 0.6 and retained in 0.7. */
+    OVPHYSX_API OVPHYSX_DEPRECATED_MSG("use ovphysx_ovd_start_recording") ovphysx_result_t
+    ovphysx_start_recording(ovphysx_instance_handle_t handle, const ovphysx_omnipvd_destination_t* destination);
+    /** @deprecated Use ovphysx_ovd_stop_recording(). */
+    OVPHYSX_API OVPHYSX_DEPRECATED_MSG("use ovphysx_ovd_stop_recording") ovphysx_result_t
+    ovphysx_stop_recording(ovphysx_instance_handle_t handle);
+    /** @deprecated Use ovphysx_ovd_is_recording(). */
+    OVPHYSX_API OVPHYSX_DEPRECATED_MSG("use ovphysx_ovd_is_recording") ovphysx_result_t
+    ovphysx_is_recording(ovphysx_instance_handle_t handle, bool* out_is_recording);
+
+    /* General notes
+    *
     * Version information: See ovphysx_get_version() and ovphysx_get_version_string() below.
     *
     * DLPack Integration:
     *   This API uses DLPack for tensor data exchange between the user and the system.
-    *   Same-device paths are zero-copy where supported; cross-device paths use staging.
-    *   DLPack is a stable, widely-adopted open standard for tensor interoperability.
-    *   See dlpack.h for tensor format details.
-    * 
+    *   Same-device paths are zero-copy where supported. Cross-device support depends on
+    *   the tensor type and process policy. See ovphysx_legacy.h (tensor bindings) and
+    *   dlpack.h for the tensor format.
+    *
     * Return values:
     *   Synchronous functions (blocking calls) return ovphysx_result_t (status).
-    *   Asynchronous functions return ovphysx_enqueue_result_t (status, op_index).
+    *   Task producers return ovphysx_enqueue_result_t (status, op_index, instance).
+    *   SUCCESS means admission; collect execution status with a task wait. A
+    *   task-returning call may complete before it returns, or later: do not depend
+    *   on either.
     *   On failure, call ovphysx_get_last_error() on the same thread to retrieve the
     *   error message. The returned string is valid until the next ovphysx API call on
     *   that thread.
-    * 
-    * Stream ordered asynchronous execution:
-    *   - Async operations execute in submission order on a single queue
-    *   - Results appear as if operations completed serially (sequential consistency)
-    *   - Use ovphysx_wait_op() to ensure operations have completed before using results
-    *   - If an asynchronous operation fails to enqueue (error returned from the function call),
-    *     the returned op index is invalid and cannot be used for synchronization.
-    *   - Each op_index is SINGLE-USE: once ovphysx_wait_op reports completion or
-    *     operation failure, the op_index is consumed and cannot be reused. A timeout
-    *     does not consume an operation that remains pending. Concurrent waits on the
-    *     same op_index from multiple threads have undefined behavior.
-    * 
+    *
+    * Asynchronous execution:
+    *   - Calls on one instance run in submission order.
+    *   - By default, a dedicated worker runs attach, update, detach, clone, and
+    *     step. These calls usually return before their work finishes.
+    *   - Query, read, write, fetch, commit, and release run immediately when the
+    *     instance is idle. Otherwise they queue behind earlier work. A new query,
+    *     read, or write handle is available on acceptance; wait before using its
+    *     other outputs.
+    *   - Calls that need the caller's CUDA stream wait for earlier work, then run
+    *     on the calling thread.
+    *   - During OmniPVD recording, attach and detach also run on the calling thread.
+    *   - Set OVPHYSX_GLOBAL_CONFIG_ASYNC_EXECUTION to false before instance
+    *     creation to disable its worker. Calls then finish before returning.
+    *   - An infinite wait may run an unstarted job. Finite waits and polls only
+    *     observe progress. Do not depend on the thread that runs callbacks.
+    *   - Wait for pending tasks before CUDA graph capture on the same context.
+    *   - Use ovphysx_wait_task() for one result, ovphysx_wait_all() for all
+    *     outstanding results, or ovphysx_query_task_status() to inspect without
+    *     collecting. A result can be collected once.
+    *   - Serialize all calls on the same instance, including waits and error lookup.
+    *
     * Failure handling:
-    *   - If operation N fails, the error is recorded and returned via ovphysx_wait_op()
-    *   - The error string will indicate whether subsequent operations will fail or succeed based on the failure of operation N
-    *   - and whether the instance is left in a defined state or not.
-    * 
+    *   - A rejected call returns an error and no task. Common reasons are invalid
+    *     arguments or handles, callback re-entry, a full queue, or a stopped worker.
+    *     Each function lists its immediate errors.
+    *   - An accepted call reports later state or execution errors through its task
+    *     wait. One failed task does not stop later valid work.
+    *   - ovphysx_wait_task() reports only its task. ovphysx_wait_all() reports all
+    *     uncollected failures, including failures whose receipts were discarded.
+    *
     * Memory visibility:
-    *   - Writes from operation N are visible to operation N+1
-    *   - Independent operations may execute concurrently internally for performance
+    *   - Writes from operation N are visible to operation N+1.
+    *   - Independent operations may execute concurrently internally for performance.
     *
     * Documentation and skills:
     *   Tutorials, guides, and AI-agent playbooks ship alongside this header.
@@ -64,23 +163,52 @@ extern "C" {
 
     /*
      * Thread Safety Guarantees:
-     * 
-     * Multiple ovphysx instances:
-     *   - Instances share the underlying omni.physx runtime and attached stage.
-     *     Serialize simulation, stage mutation, and binding creation across
-     *     instances.
-     * 
+     *
+    * Multiple ovphysx instances:
+    *   - Wrapper-owned state (bindings, sessions, subscriptions, op waits,
+    *     debug-render cache, scene-query buffers) is per handle.
+    *   - Global functions (initialize/shutdown, create_instance, version,
+    *     CPU-mode and global config, logging, get_last_error, destroy_wait_result,
+    *     writability) omit
+    *     the instance and must not mutate per-handle simulation state.
+    *   - Each instance holds at most one live ovstage attach. Several
+    *     instances may be attached at the same time. Attaching on one
+    *     instance does not detach another. The same ovstage instance
+    *     cannot be attached twice.
+    *   - Different instances may step their own attachments concurrently.
+    *     Process-wide limits still apply: one hard CPU-only mode, one SDK
+    *     tolerance scale, and one recording session. Recording start and stop
+    *     wait until every instance finished its queued and running work,
+    *     without collecting task results. Attach, detach and destroy calls on
+    *     different instances may also be made concurrently; attach and detach
+    *     of different instances still execute one at a time. When a destroy
+    *     overlaps another thread's destroy, recording start or stop, or detach
+    *     during a recording, one of the two may return the retryable
+    *     OVPHYSX_API_INVALID_STATE.
+    *   - Per-instance ordering does not provide global exclusion for native
+    *     calls. Cached-query validation, recording-status queries, collection
+    *     of completed receipts and already-absent releases may progress while
+    *     another instance's lifecycle callback is active.
+     *
      * Single instance, multiple threads:
      *   - Operations are NOT thread-safe for the same instance.
-     *   - Use external synchronization if calling from multiple threads.
-     * 
+     *   - Use external synchronization if calling from multiple threads; calls may
+     *     come from different threads, one at a time.
+     *
      * Data buffer lifetimes:
-     *   - User is responsible for ensuring data passed to async operations remains valid and
-     *     unmodified until the operation completes (as indicated by ovphysx_wait_op).
-     * 
+     *   - The caller keeps data passed to async operations valid and unmodified
+     *     until the operation completes (as indicated by ovphysx_wait_task),
+     *     except the inputs a call is done with when it returns: ovphysx_clone()
+     *     copies its paths, poses and environment ids, and a short call copies its
+     *     strings, attribute and path arrays and selection descriptors when it is
+     *     queued. Tensor and mask data, fetched groups and output slots stay
+     *     borrowed until the task completes, and the Stage as
+     *     ovphysx_attach_ovstage() describes.
+     *
      * CUDA context requirements:
      *   - The SDK manages CUDA contexts internally where needed.
-     *   - Users can call wait/sync functions from any thread without manual context management.
+     *   - Task waits manage the SDK's context. CUDA stream handoffs use the caller's
+     *     current context for default-stream sentinels; see ovphysx_commit_group().
      */
 
     /* ovphysx_attach_ovstage consumes a caller-owned ovstage Stage handle as an
@@ -113,18 +241,13 @@ extern "C" {
      */
 
     /**
-     * @defgroup ovphysx_tensor_binding Tensor bindings
-     * Bulk tensor access APIs for simulation data.
-     */
-
-    /**
-     * @defgroup ovphysx_stream Stream operations
-     * Stream-ordered task submission and synchronization.
+     * @defgroup ovphysx_stream Task completion
+     * Wait for tasks and collect their outcomes.
      */
 
     /**
      * @defgroup ovphysx_errors Error handling
-     * Destroy error strings and error arrays.
+     * Query borrowed error strings and destroy wait-result error arrays.
      */
 
     /**
@@ -164,124 +287,86 @@ extern "C" {
     /** @{ */
 
     /**
-     * @brief Create a new ovphysx instance.
+     * @brief Create a new instance with default instance configuration.
      *
-     * Initialize create_args with OVPHYSX_CREATE_ARGS_DEFAULT for sensible defaults:
-     * @code
-     * ovphysx_set_log_level(OVPHYSX_LOG_VERBOSE);  // optional: default is WARNING
-     * ovphysx_initialize();
-     * ovphysx_create_args args = OVPHYSX_CREATE_ARGS_DEFAULT;
-     * ovphysx_handle_t handle = OVPHYSX_INVALID_HANDLE;
-     * ovphysx_result_t r = ovphysx_create_instance(&args, &handle);
-     * @endcode
+     * Set process-global configuration before this call. After creation,
+     * instance configuration may be changed with ovphysx_set_config() until
+     * the instance attaches a stage.
      *
-     * @param create_args Configuration for the ovphysx instance (must not be NULL).
-     *   If config_entry_count is nonzero, config_entries must not be NULL.
-     * @param out_handle [out] ovphysx handle (must not be NULL).
-     * @return ovphysx_result_t with status and error info.
-     *
-     * @pre create_args != NULL, out_handle != NULL.
-     * @post On success, *out_handle is a valid handle that must be destroyed with ovphysx_destroy_instance().
-     * @post With an active lifecycle, if config_entries is NULL and config_entry_count is
-     *   nonzero, *out_handle is unchanged.
-     *
-     * @par Side Effects
-     * Loads runtime components and initializes process-level state.
-     *
-     * @par Threading
-     * Safe to call from any thread. The resulting handle is not thread-safe for concurrent use.
-     *
-     * @par Ownership
-     * Caller owns the instance handle and must destroy it.
-     *
-     * @par Errors
-     * - OVPHYSX_API_INVALID_ARGUMENT on null required pointers, inconsistent config_entries /
-     *   config_entry_count, or invalid active_cuda_gpus
-     * - OVPHYSX_API_ERROR if ovphysx_initialize() is not active, or for other initialization failures
-     *
-     * @note active_cuda_gpus restricts which GPU ordinals are available for this instance.
-     *   Per-scene device selection (CPU vs GPU dynamics) is owned by PhysX via physxScene:enableGPUDynamics
-     *   in the USD stage. Use ovphysx_set_cpu_mode() before creating any instance to force process-wide
-     *   CPU-only mode.
+     * @param out_handle [out] New owned instance handle.
+     * @return OVPHYSX_API_SUCCESS, OVPHYSX_API_INVALID_ARGUMENT when out_handle
+     * is NULL, or OVPHYSX_API_ERROR when lifecycle/runtime initialization fails
+     * or Carbonite cannot start the instance's worker thread (see
+     * OVPHYSX_GLOBAL_CONFIG_ASYNC_EXECUTION).
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_create_instance(const ovphysx_create_args* create_args, ovphysx_handle_t* out_handle);
-
-    /**
-     * @brief Force process-wide CPU-only mode.
-     *
-     * To guarantee that no CUDA driver is touched for the lifetime of the process, set this to
-     * true before the first instance is ever created. All subsequent PhysX scenes will use CPU
-     * dynamics regardless of their USD physxScene:enableGPUDynamics setting.
-     * For per-scene CPU control without this flag, author each scene explicitly
-     * (physxScene:enableGPUDynamics=false + physxScene:broadphaseType="MBP").
-     *
-     * Requires that no instances are active. Returns OVPHYSX_API_ERROR if any instances
-     * currently exist, or if attempting to set false after true has been applied. CPU-only
-     * mode is sticky as soon as a call setting it to true succeeds.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_set_cpu_mode(bool cpu_only);
-
-    /**
-     * @brief Register ovphysx USD schema/plugin discovery paths before runtime initialization.
-     *
-     * This is intended for applications that share a namespaced OpenUSD runtime between multiple
-     * subsystems, such as ovphysx and ovrtx. USD's schema registry is populated only once for the
-     * process, so every subsystem that contributes schema/plugin paths must publish them before the
-     * registry is first consulted, typically before the first USD stage is opened.
-     *
-     * The function appends ovphysx's bundled USD plugin root to the namespaced USD plugin-path
-     * environment variable, `OV_PXR_PLUGINPATH_2511`. It preserves existing entries and does not
-     * modify `PXR_PLUGINPATH_NAME`.
-     *
-     * Notes:
-     * - Safe to call before @ref ovphysx_create_instance().
-     * - Idempotent; the first successful call performs registration, subsequent calls are no-ops.
-     * - Failed calls do not mark registration complete, so callers may fix the installation or
-     *   `OVPHYSX_LIB` override and retry.
-     * - This function does not initialize ovphysx, load USD, acquire Carbonite, or open a stage.
-     * - Calling this after USD has already populated its schema registry has no retroactive effect.
-     *
-     * @return
-     * - OVPHYSX_API_SUCCESS if the schema/plugin paths were registered successfully.
-     * - OVPHYSX_API_ERROR if registration failed. Use @ref ovphysx_get_last_error() for details.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_register_schema_paths(void);
+    OVPHYSX_API ovphysx_result_t ovphysx_create_instance(ovphysx_instance_handle_t* out_handle);
 
     /**
      * @brief Destroy an ovphysx instance and release per-instance resources.
      *
-     * Carbonite and the static PhysX runtime stay resident until process exit.
+     * Per-instance destruction leaves the process lifecycle active. Call
+     * @ref ovphysx_shutdown after destroying the final handle to drain the
+     * direct PhysX runtime and clear that lifecycle token.
+     *
+     * Destruction is synchronous. It waits only for the instance's running task,
+     * then checks whether it must be retried; a retryable refusal
+     * leaves the remaining queued tasks queued, and they run as if destroy had
+     * not been called. Otherwise it cancels every queued task that has not
+     * started, joins the instance's worker thread, and then releases the
+     * instance's output sessions and attachment. While an OmniPVD recording is
+     * active it first also waits for the queued and running work of every other
+     * instance; its own queued tasks are cancelled all the same.
      *
      * @param handle ovphysx handle to destroy.
      * @return ovphysx_result_t with status and error info.
      *
-     * @pre handle must be a valid instance handle.
-     * @post The handle is invalid and must not be reused.
+     * @post On success, the handle is unregistered and its resources are
+     *       released. Waits and ovphysx_query_task_status() on its receipts,
+     *       including cancelled ones, report OVPHYSX_API_NOT_FOUND. A repeated
+     *       call for that already-unregistered value
+     *       returns OVPHYSX_API_ERROR before teardown and has no effect on
+     *       registered instances or process-global asynchronous state.
      *
      * @par Side Effects
      * Releases internal resources, plugins, and cached data for this instance.
      *
      * @par Threading
      * Do not destroy an instance while it is in use on other threads.
+     * Runtime, object-change and application log callbacks reject destruction
+     * with OVPHYSX_API_INVALID_STATE before teardown. Retry after the callback.
      *
      * @par Ownership
      * After destruction, any bindings created by this instance are invalid.
      *
      * @par Errors
-     * - OVPHYSX_API_ERROR if destruction fails. No error string is returned; consult logs.
+     * - OVPHYSX_API_INVALID_STATE is retryable: admission rejected before teardown;
+     *   the handle, attachment, queued tasks and caller ownership remain live.
+     *   Close companion leases or finish pending work/transitions before retrying.
+     *   A call inside a log, runtime or object-change callback, or on the
+     *   instance's own worker thread, is rejected the same way; retry after the
+     *   callback returns.
+     * - OVPHYSX_API_ERROR if the handle is not registered or destruction fails.
+     *   An unregistered handle is rejected before teardown and does not affect
+     *   registered instances or process-global asynchronous state. No error
+     *   string is returned. Consult logs for other destruction failures.
      *
-     * @code
-     * ovphysx_destroy_instance(handle);
+     * @code{.c}
+     * #include <ovphysx/ovphysx.h>
+     *
+     * static ovphysx_result_t destroy_owned_instance(ovphysx_instance_handle_t handle)
+     * {
+     *     return ovphysx_destroy_instance(handle);
+     * }
      * @endcode
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_destroy_instance(ovphysx_handle_t handle);
+    OVPHYSX_API ovphysx_result_t ovphysx_destroy_instance(ovphysx_instance_handle_t handle);
 
     /**
      * @brief Clear the ovphysx process-lifecycle token.
      *
      * Clears the process-global initialized state set by @ref ovphysx_initialize.
      * It does not destroy live handles and does not balance
-     * @ref ovphysx_create_instance; callers must destroy every handle explicitly
+     * @ref ovphysx_create_instance. Callers must destroy every handle explicitly
      * with @ref ovphysx_destroy_instance.
      *
      * Must be paired with a prior @ref ovphysx_initialize call. Call once when
@@ -291,13 +376,42 @@ extern "C" {
      *
      * @return
      * - OVPHYSX_API_SUCCESS on success.
+     * - OVPHYSX_API_INVALID_STATE is retryable: retained companion service leases
+     *   still prevent shutdown, or the call was made inside a runtime or
+     *   object-change callback or on an instance's worker thread. The lifecycle
+     *   token remains live.
      * - OVPHYSX_API_ERROR if called without a matching @ref ovphysx_initialize.
+     * - OVPHYSX_API_ERROR if called from the application log callback.
      *   Use @ref ovphysx_get_last_error() for details.
      *
+     * On every successful return, including when live handles remain, shutdown
+     * flushes Carbonite's buffered records, stops accepting application-callback
+     * delivery, and drains accepted callbacks. When runtime teardown occurs, the
+     * barrier includes its final log producer. The callback and its user-data
+     * resources may then be released. Accepted callbacks must not wait
+     * indefinitely on the thread performing shutdown.
+     *
+     * Before callback delivery ends, shutdown stops the worker thread of every
+     * live handle: it waits for that instance's running task, cancels its queued
+     * tasks and joins the thread. No ovphysx worker thread runs once
+     * shutdown returns. A process that exits without shutdown never joins worker
+     * threads: they are left parked, and no exit handler stops them. Unloading the
+     * library therefore requires a completed shutdown.
+     *
      * @par Static runtime mode
-     * Static ovphysx keeps Carbonite, the direct PhysX runtime, and OmniClient
-     * resident until process exit. This avoids re-entering plugin teardown from
-     * application shutdown paths.
+     * With no live handles, shutdown drains the direct PhysX runtime. On Linux it
+     * also releases the SDK-owned Carbonite framework and private cooking cache.
+     * Windows retains the framework until process exit for safe dependency DLL
+     * teardown; private cache removal after datastore shutdown is best-effort.
+     * A framework populated by a foreign host remains owned by that host, which
+     * must destroy every instance and complete shutdown before it releases
+     * Carbonite or unloads carb.tasking, the provider of the instances' worker
+     * threads. If live handles remain, callers still own them and the direct
+     * runtime remains available only for their explicit destruction. Continued
+     * stepping or other instance work after shutdown is unsupported: new tasks on
+     * those handles are rejected, while the outcomes of their earlier tasks stay
+     * collectable until destruction. Destruction-time records are not delivered
+     * to the application callback disabled by shutdown.
      */
     OVPHYSX_API ovphysx_result_t ovphysx_shutdown(void);
 
@@ -337,71 +451,185 @@ extern "C" {
 
 
     /*--------------------------------------------------*/
-    /* Typed global config (process-wide)               */
+    /* Scoped configuration                            */
     /*--------------------------------------------------*/
 
-    /** @defgroup ovphysx_config Typed global config */
-    /** @addtogroup ovphysx_config */
+    /** @defgroup ovphysx_config Scoped configuration */
     /** @{ */
 
     /**
-     * @brief Set a typed global config entry at runtime (process-global).
+     * Set process-global configuration. Environment overrides remain authoritative.
+     * Startup-only keys must be set before the first successful instance creation.
+     * Later writes return OVPHYSX_API_INVALID_STATE without changing the value,
+     * even after all instances are destroyed, until ovphysx_shutdown() succeeds
+     * with no live instances.
+     * Keys that act on every instance, OVPHYSX_GLOBAL_CONFIG_DISABLE_CONTACT_PROCESSING
+     * and the keys that require no attached stage, first wait until every instance
+     * finished its earlier work, without collecting task results, then check and apply
+     * the value. That wait lasts as long as other threads keep submitting work, so do not
+     * submit work on another thread while such a write runs. Inside a log, runtime or
+     * object-change callback such a write returns OVPHYSX_API_INVALID_STATE without waiting.
+     */
+    OVPHYSX_API ovphysx_result_t ovphysx_set_global_config(
+        ovphysx_global_config_key_t key, ovphysx_config_value_t value);
+
+    /**
+     * Read process-global configuration. COOKED_COLLIDER_CACHE_DIRECTORY reports
+     * the current /UJITSO/datastore/localCachePath setting. Before runtime startup,
+     * this is the configured value, or OVPHYSX_API_NOT_FOUND if unset. With local
+     * caching and cooking enabled, startup replaces an unset or unusable directory
+     * with a process-private path if it can create one. If creation fails, local
+     * caching is disabled and the setting is not replaced. Disabling local caching
+     * or cooking also prevents this replacement.
+     * The getter observes the setting, not user intent, persistence, or the active
+     * datastore location. The datastore keeps its initially selected directory
+     * even if a later setting change is accepted and reported by this getter.
+     * COMPILED_STAGE_CACHE reports the configured mode, AUTOMATIC included, not
+     * the mode an attach resolved from it.
+     */
+    OVPHYSX_API ovphysx_result_t ovphysx_get_global_config(
+        ovphysx_global_config_key_t key, ovphysx_config_value_t* out_value);
+
+    /**
+     * Set configuration retained by one instance.
      *
-     * IMPORTANT: Config is PROCESS-GLOBAL. Changes affect all ovphysx instances
-     * in the current process. Configure before creating instances or loading USD
-     * for predictable behavior.
+     * Current instance keys are pre-attach: changing them after a stage is
+     * attached returns OVPHYSX_API_INVALID_STATE and preserves the prior value.
+     */
+    OVPHYSX_API ovphysx_result_t ovphysx_set_config(
+        ovphysx_instance_handle_t instance,
+        ovphysx_config_key_t key,
+        ovphysx_config_value_t value);
+
+    /** Read configuration retained by one instance. */
+    OVPHYSX_API ovphysx_result_t ovphysx_get_config(
+        ovphysx_instance_handle_t instance,
+        ovphysx_config_key_t key,
+        ovphysx_config_value_t* out_value);
+
+    /** @} */
+
+    /*--------------------------------------------------*/
+    /* OVD recording                                    */
+    /*--------------------------------------------------*/
+
+    /** @defgroup ovphysx_recording OVD recording */
+    /** @addtogroup ovphysx_recording */
+    /** @{ */
+
+    /**
+     * @brief Start an OVD recording session.
      *
-     * Use the builder functions in ovphysx_config.h for convenient construction:
-     * @code
-     * #include "ovphysx/ovphysx_config.h"
-     * ovphysx_set_global_config(ovphysx_config_entry_num_threads(4));
-     * ovphysx_set_global_config(ovphysx_config_entry_disable_contact_processing(true));
-     * // Escape hatch for arbitrary Carbonite paths:
-     * ovphysx_set_global_config(ovphysx_config_entry_carbonite(
-     *     OVPHYSX_LITERAL("/physics/updateToUsd"), OVPHYSX_LITERAL("false")));
-     * @endcode
+     * The call is synchronous. A FILE path ending in the literal, case-sensitive
+     * .ovd suffix is an exact filename. Other paths select a directory for a new
+     * timestamped YYYY_MM_DD_HH_MM_SS_CC_rec.ovd file. Add a trailing separator
+     * to select a directory whose name ends in .ovd. An admitted start creates
+     * missing directories or exact-file parent directories recursively; see
+     * ovphysx_omnipvd_destination_t. A TCP destination connects to a ready listener.
+     * Validation and stream-open failures may be retried. Only one recording
+     * may be active in the shared runtime: another start returns
+     * OVPHYSX_API_INVALID_STATE without replacing its destination. After a
+     * successful stop, another FILE or TCP session may be started. Late start
+     * requires a live physics stage attached by this instance or a peer. While
+     * no instance has a live attachment, it returns OVPHYSX_API_INVALID_STATE
+     * without creating output.
      *
-     * @param entry Typed config entry to apply.
-     * @return ovphysx_result_t with status and error info.
+     * Make the shared runtime OVD recording capable by setting
+     * OVPHYSX_GLOBAL_CONFIG_OVD_RECORDING_CAPABLE to true with
+     * ovphysx_set_global_config() before the first ovphysx_create_instance().
+     * The key defaults to false. Capability alone does not start recording;
+     * attach a physics stage and call this function with the desired destination.
+     * Pass ovphysx_config_value_bool(true), declared in ovphysx_config.h.
+     * A default, incapable runtime returns OVPHYSX_API_INVALID_STATE
+     * with an error naming the capability key. Unsupported platforms retain
+     * OVPHYSX_API_NOT_IMPLEMENTED.
+     *
+     * Creation and attachment never start recording. After reattach, the runtime
+     * remains dormant until this function is called. Call it before the first
+     * simulation step to capture the initial state and every simulation frame.
+     *
+     * Start and stop are synchronous. Before accessing shared recording state,
+     * each waits until every instance finished its earlier work, without
+     * collecting task results. Argument validation can reject a call before this
+     * wait. OVPHYSX_API_INVALID_STATE is returned without waiting inside a log,
+     * runtime or object-change callback; and after the wait while a companion
+     * operation is executing, another thread holds a recording or lifecycle
+     * transition, a companion preview has unfetched simulation work or a runtime
+     * operation is still executing. Fetch or close every pending preview and
+     * retry after the conflicting activity finishes.
+     *
+     * Optional settings select exact scene and object paths and secondary data.
+     * Null options record all objects and all supported data. Nonempty path lists
+     * require the caller's attachment. Malformed paths return INVALID_ARGUMENT;
+     * missing or unsupported objects return NOT_FOUND. Validation completes before
+     * opening the destination. Lists are copied; duplicate paths are permitted.
+     * Stop and start again to change the selection.
+     *
+     * @param handle Instance requesting the recording session.
+     * @param destination FILE or TCP destination borrowed for this call.
+     * @param options Optional recording settings borrowed and copied during this call.
+     *        Set wait_for_selection to true for TCP discovery before detailed recording.
+     *        This requires the caller's live attachment. The initial catalog contains
+     *        identities and relationships within its scene/object scope, with no
+     *        simulation payload or GPU readback. Receiver selection cannot widen
+     *        that scope. Empty lists permit all supported objects in the attachment.
+     *        record_secondary_data is ignored until the receiver chooses it.
+     *        Catalog handles are local to this connection and run. The owner's
+     *        is_recording query is true while waiting; stop or owner detach ends it.
+     *        Keep calling the owner's public step/step_sync to apply buffered
+     *        selections before simulation; warmup does not poll requests. A busy
+     *        runtime or pending companion work defers application to a later step.
+     *        FILE rejects wait_for_selection with INVALID_ARGUMENT.
+     * @return OVPHYSX_API_SUCCESS, OVPHYSX_API_INVALID_ARGUMENT for an invalid
+     *         handle or destination, OVPHYSX_API_INVALID_STATE under the
+     *         synchronization conditions above, when the runtime is not
+     *         recording-capable, the shared runtime has no live physics stage,
+     *         recording is active, or the call reenters a runtime or application
+     *         log callback before transition admission,
+     *         OVPHYSX_API_NOT_IMPLEMENTED on an unsupported platform, or
+     *         OVPHYSX_API_ERROR when synchronization, runtime access,
+     *         destination opening, or sampling fails.
+     * A null destination returns INVALID_ARGUMENT before callback rejection.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_set_global_config(ovphysx_config_entry_t entry);
+    OVPHYSX_API ovphysx_result_t ovphysx_ovd_start_recording(
+        ovphysx_instance_handle_t handle, const ovphysx_omnipvd_destination_t* destination,
+        const ovphysx_omnipvd_recording_options_t* options);
 
     /**
-     * @brief Get a boolean config value.
-     * @param key Boolean config key.
-     * @param out_value [out] Current value.
-     * @return ovphysx_result_t with status and error info.
+     * @brief Stop and finalize the active recording or discovery session.
+     *
+     * The handle that started the session owns it. A peer handle is inactive
+     * and cannot stop the owner's session. A successful owner stop
+     * permits a later recording session to start.
+     * Synchronizes like ovphysx_ovd_start_recording(), including its
+     * OVPHYSX_API_INVALID_STATE synchronization conditions.
+     *
+     * Callback reentry returns INVALID_STATE before transition admission.
+     *
+     * @return OVPHYSX_API_SUCCESS, OVPHYSX_API_INVALID_ARGUMENT for an invalid
+     *         handle, OVPHYSX_API_INVALID_STATE under the synchronization
+     *         conditions above or when this handle owns no active recording
+     *         (including while a peer owns the globally active session),
+     *         OVPHYSX_API_NOT_IMPLEMENTED on an unsupported platform, or
+     *         OVPHYSX_API_ERROR when synchronization or stop/finalization fails.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_get_global_config_bool(
-        ovphysx_config_bool_t key, bool* out_value);
+    OVPHYSX_API ovphysx_result_t ovphysx_ovd_stop_recording(ovphysx_instance_handle_t handle);
 
     /**
-     * @brief Get an int32 config value.
-     * @param key Int32 config key.
-     * @param out_value [out] Current value.
-     * @return ovphysx_result_t with status and error info.
+     * @brief Query whether this instance owns the active recording or discovery session.
+     *
+     * A peer reports false while another instance owns the shared runtime's
+     * active recording. The answer reflects the last completed recording or
+     * lifecycle transition; the call waits for no instance work and may be made
+     * from any thread, including inside callbacks.
+     *
+     * @param handle Valid instance handle.
+     * @param out_is_recording [out] Receives true while this owner's recording or discovery session is active.
+     * @return OVPHYSX_API_SUCCESS, OVPHYSX_API_INVALID_ARGUMENT for an invalid
+     *         handle or null out_is_recording.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_get_global_config_int32(
-        ovphysx_config_int32_t key, int32_t* out_value);
-
-    /**
-     * @brief Get a float config value.
-     * @param key Float config key.
-     * @param out_value [out] Current value.
-     * @return ovphysx_result_t with status and error info.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_get_global_config_float(
-        ovphysx_config_float_t key, float* out_value);
-
-    /**
-     * @brief Get a string config value into a user-provided buffer.
-     * @param key String config key.
-     * @param value_out [in/out] String with pre-allocated buffer (ptr+length).
-     * @param out_required_size [out] Required buffer size including null terminator.
-     * @return ovphysx_result_t with status and error info.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_get_global_config_string(
-        ovphysx_config_string_t key, ovphysx_string_t* value_out, size_t* out_required_size);
+    OVPHYSX_API ovphysx_result_t ovphysx_ovd_is_recording(
+        ovphysx_instance_handle_t handle, bool* out_is_recording);
 
     /** @} */
 
@@ -413,87 +641,177 @@ extern "C" {
     /** @{ */
 
 
-    /*
-    * Enqueue an asynchronous operation to reset the runtime stage representation to an empty stage.
-    * Any attached ovstage is detached, and all runtime simulation state is cleared.
-    * Settings and other configuration not present in the stage will persist.
-    * @param handle ovphysx instance
-    * @return ovphysx_enqueue_result_t with status, error, and operation index
-    *
-    * @pre handle must be a valid instance handle.
-    * @post Stage is cleared when the op completes.
-    *
-    * @par Side Effects
-    * Clears the runtime stage and associated simulation state.
-    *
-    * @par Errors
-    * - OVPHYSX_API_ERROR for internal failures
-    *
-    * @code
-    * ovphysx_enqueue_result_t r = ovphysx_reset_stage(handle);
-    * @endcode
-    */
-    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_reset_stage(ovphysx_handle_t handle);
-
     /**
     * @brief Attach an ovstage Stage as the orchestration data surface.
     *
     * Once attached, the orchestration contract is **explicit and application-owned**
     * in both directions (the application owns ordinal advancement):
     *
-    *   - app → physics (control in): the app authors dirty control attributes into
-    *     ovstage (drive:force, drive:velocity, drive:position_target, physics:mass,
-    *     physics:gravityMagnitude, physics:gravityDirection, …) at ordinals it
-    *     chooses, then calls @ref ovphysx_update_from_ovstage to drain that ordinal
-    *     range into the running simulation. @ref ovphysx_step then integrates.
-    *   - physics → app (output out): @ref ovphysx_step does **not** author simulation
-    *     output back into the Stage on its own. The app reads the step's output with
-    *     @ref ovphysx_read / @ref ovphysx_fetch_read_next and writes it back into
-    *     ovstage at a separate, higher (physics-output) ordinal — the ordinal that
-    *     update_from_ovstage never covers, so physics never reprocesses its own
-    *     writes. See the ordinal-coupling section on @ref ovphysx_query.
+    *   - Application to physics (control in): the application authors dirty control
+    *     attributes into ovstage (drive:force, drive:velocity, drive:position_target,
+    *     physics:mass, physics:gravityMagnitude, physics:gravityDirection, and so on)
+    *     at ordinals it chooses, then calls @ref ovphysx_update_from_ovstage to drain
+    *     that ordinal range into the running simulation. @ref ovphysx_step then integrates.
+    *   - Physics to application (output out): @ref ovphysx_step does **not** author
+    *     simulation output back into the Stage on its own. The application reads the
+    *     step's output with @ref ovphysx_read / @ref ovphysx_fetch_read_next and writes
+    *     it back into ovstage at a separate, higher (physics-output) ordinal. That
+    *     ordinal is never covered by update_from_ovstage, so physics never reprocesses
+    *     its own writes. See the ordinal-coupling section on @ref ovphysx_query.
     *
     * This is one consistent model: initial parse at attach, explicit control updates
-    * via update_from_ovstage, and app-owned output writeback via the read API.
-    * ovphysx tensor bindings remain available as a perf escape hatch for callers
-    * that need direct control without going through ovstage.
+    * via update_from_ovstage, and application-owned output writeback via the read API.
+    * For direct control without going through ovstage, use the session write API
+    * (@ref ovphysx_write). The legacy tensor bindings remain available for the same
+    * purpose but are deprecated.
     *
-    * The attachment is init-style — call once per instance, before any
-    * ovphysx_step(). Replacing the attached Stage requires
-    * ovphysx_detach_ovstage() first.
+    * The attachment is init-style. Call it once per instance, before any
+    * ovphysx_step(). Replacing the attached Stage requires successful completion
+    * of ovphysx_detach_ovstage() first.
+    *
+    * Returns a task receipt. The call queues the attach as a job on the instance's
+    * worker thread and returns without running it or waiting for it; the worker runs
+    * it after every earlier job, and may even finish it before the call returns. An
+    * instance without a worker thread (see OVPHYSX_GLOBAL_CONFIG_ASYNC_EXECUTION)
+    * runs it on the calling thread before the call returns.
+    * Admission success does not establish that attachment succeeded. Calls submitted
+    * afterwards (update, clone, step, queries) run after it in instance stream order;
+    * collect the task with ovphysx_wait_task() before using the attachment outside
+    * that order. ovphysx_is_stage_attached() reports the attachment only once the job
+    * ran. The job runs in the CUDA context that is current on the calling thread when
+    * the call is made (an active-context attach creates its GPU scene in it): keep
+    * that context alive until the task completes. While an OmniPVD recording is active
+    * the attach runs on the calling thread instead (see the recording note below).
     *
     * @param handle ovphysx instance handle.
     * @param stage Caller-owned ovstage Stage (`ovstage_instance_t*`).
-    * @param read_ordinal Caller-owned sealed ovstage ordinal the initial scene
-    *      parse reads at. The application owns ordinal advancement; this is the
-    *      starting point (subsequent edits are drained via
-    *      ovphysx_update_from_ovstage()).
+    * @param read_ordinal Caller-owned ordinal at which the initial scan's
+    *      required physics data is sealed, from 1 through OVSTAGE_ORDINAL_MAX.
+    *      0 is reserved as the runtime's internal "use payload attach-time
+    *      ordinal" sentinel, and ovphysx does not attach at the negative
+    *      ordinals ovstage also writes: seal the population to attach at a
+    *      positive ordinal.
+    *      The application owns ordinal advancement. Subsequent edits are drained
+    *      via ovphysx_update_from_ovstage(). A lower read_ordinal does not
+    *      reconstruct historical payloads or body membership; the initial scan
+    *      can observe later-sealed values and bodies. If initial values matter,
+    *      seal the initial population and complete attach before authoring later edits.
+    *      A successful attach at OVSTAGE_ORDINAL_MAX marks every representable
+    *      ordinal consumed, so subsequent update ranges are successful no-ops.
+    *      For continuing edits, use an actual sealed ordinal below
+    *      OVSTAGE_ORDINAL_MAX.
     *
-    * @pre handle is valid; ovphysx is not already attached to a Stage; stage
-    *      is non-null.
-    * @pre stage outlives the attachment. ovphysx captures this pointer and
-    *      dereferences it on every ovphysx_update_from_ovstage() until
-    *      ovphysx_detach_ovstage(); destroying the Stage between attach and detach
-    *      is undefined behavior, not a recoverable error.
-    * @post On success, subsequent ovphysx_update_from_ovstage() calls observe
-    *       committed Stage writes through the runtime ovstage backend.
+    * @pre handle is valid, ovphysx is not already attached to a Stage, stage
+    *      is non-null, and read_ordinal is positive.
+    * @pre stage and its sealed read_ordinal data remain valid through task
+    *      completion. After successful attach, stage outlives the attachment,
+    *      through successful detach completion. Destroying an attached Stage is
+    *      undefined behavior. A failed attach may leave an attachment if rollback
+    *      fails; check ovphysx_is_stage_attached() before releasing the Stage.
+    * @post On successful task completion, ovphysx_update_from_ovstage() can observe
+    *       committed Stage writes above the consumed read_ordinal through the runtime
+    *       ovstage backend. No such ordinal exists after an attach at
+    *       OVSTAGE_ORDINAL_MAX.
     *
     * @note Not thread-safe per instance. Like the rest of the per-instance API,
     *       the caller must serialize ovphysx_attach_ovstage() against any other
-    *       call on the same handle; the already-attached check and the attach are
+    *       call on the same handle. The already-attached check and the attach are
     *       not internally locked against concurrent foreground callers.
+    * @note Each instance holds at most one live ovstage attach. Several instances
+    *       may be attached at the same time. Attaching on one instance does not
+    *       detach another. Detach or destroy only affects that instance's
+    *       attachment. The same ovstage instance cannot be attached twice.
+    *       Process-wide limits still apply: one hard CPU-only mode, one SDK
+    *       tolerance scale, and one recording session. Recording start and stop wait
+    *       for every instance's queued and running work without collecting task
+    *       results. Different instances may be attached, detached and destroyed
+    *       concurrently.
+    * @note While an OmniPVD recording is active or starting, attach and detach run
+    *       synchronously on the calling thread: they first finish the pending work of
+    *       every instance, without collecting task results, and return a finished
+    *       task, so a recording is finalized in submission order. Attach and detach
+    *       jobs of different instances never run at the same time.
+    * @note Each call reads OVPHYSX_GLOBAL_CONFIG_COMPILED_STAGE_CACHE when it is
+    *       made and uses the experimental compiled ovstage cache it selects (see
+    *       ovphysx_compiled_stage_cache_mode_t). The attachment keeps that mode
+    *       for subtrees that later updates add. The cache outcome is logged at
+    *       OVPHYSX_LOG_INFO when the attach runs.
     *
     * @par Errors
-    * - OVPHYSX_API_INVALID_ARGUMENT if stage is null
-    * - OVPHYSX_API_ERROR if already attached or the runtime attach fails
+    * Submission rejects an invalid handle, null stage, or read_ordinal below 1 with
+    * OVPHYSX_API_INVALID_ARGUMENT, an unavailable runtime API with OVPHYSX_API_ERROR,
+    * and a call inside a log, runtime or object-change callback, or while the
+    * instance's worker is stopped, its queue is full, or a companion operation or
+    * native-access lease is running, with OVPHYSX_API_INVALID_STATE. Once accepted,
+    * attach reserves companion transition admission through its lifecycle work
+    * and releases it before publishing the task outcome.
+    * The schema guard also rejects admission
+    * with OVPHYSX_API_ERROR if ovstage reports a missing PhysX schema family after
+    * USD schema definitions were built, including by population or export, or
+    * if probe setup or verification fails, unless refusal is downgraded to a
+    * warning (see below). Rejected receipts
+    * have no task identity; the schema guard takes no Stage ownership and changes
+    * no attachment.
+    * An instance that is already attached when the job runs ("a stage is already
+    * attached") and runtime attach failures belong to the accepted task. Runtime
+    * failures include unreadable schema or joint data and mismatched tolerance
+    * scales. The task wait reports these errors.
     *
-    * @code
-    * // A caller-owned ovstage instance, kept alive until ovphysx_detach_ovstage().
-    * ovstage_instance_t* stage = my_ovstage_instance;
-    * ovphysx_result_t r = ovphysx_attach_ovstage(handle, stage, read_ordinal);
-    * @endcode
+    * @note The application owns schema registration. Separately install
+    *       physx-usd-schemas and pass both module resource directories to
+    *       `ovstage_population_register_usd_schemas()` before the first USD schema
+    *       read, including population or export, in each process and worker.
+    *       Population drops attributes of
+    *       schemas it cannot resolve, including authored PhysX settings. This
+    *       call checks both plugin families, physxSchema and
+    *       omniUsdPhysicsDeformableSchema, once ovstage has built its USD schema
+    *       registry. If ovstage reports either family missing, this and every
+    *       later attach in the process fail by default. Restart and register
+    *       before populating or exporting; late registration cannot repair the registry.
+    *       A procedural Stage attached while USD schema definitions remain unbuilt
+    *       skips the family check and leaves it active for later attaches. Probe
+    *       setup or verification errors also refuse attach, even with registered
+    *       families or an unbuilt registry. The temporary directory must permit
+    *       private probe creation; Windows also requires persistent ACL support.
+    *       These errors are not cached, so a later attach retries verification.
+    *       After population or export builds the definitions, the check applies even to
+    *       procedural Stages. A registration another USD
+    *       consumer made unobservable to ovstage cannot be detected. Nor can the
+    *       guard identify schema families registered late before its first check:
+    *       catching a late registration's OVSTAGE_ERROR_OP_FAILED can let a later
+    *       attach succeed with missing data. Always restart after a registration-
+    *       ordering error; attach success does not prove schemas were available
+    *       during population. The raw Carbonite setting
+    *       `/ovphysx/schemas/requireRegistration` defaults to true and is read on
+    *       every attach whose verification fails, not latched at instance creation.
+    *       Setting it to false downgrades either refusal to a warning and permits
+    *       attach without repairing lost data or clearing a cached missing-family
+    *       result. The guard neither locates nor installs schema resources.
+    *
+    * @note Scenes that author Newton `newton:*` attributes also need the
+    *       separately installed Newton USD schema
+    *       (https://github.com/newton-physics/newton-usd-schemas) registered
+    *       the same way; ovphysx reads those attributes as fallbacks for the
+    *       PhysX spellings and does not ship that schema. Python's
+    *       `PhysX.attach_ovstage()` separately checks its registration and emits
+    *       a warning when it cannot verify it. The C API performs no Newton
+    *       check. The legacy create-time config entry
+    *       `/ovphysx/schemas/warnMissingNewtonSchema = false` silences only the
+    *       Python Newton warning, not the native PhysX registration guard.
+    *
+     * @code{.c}
+     * #include <ovphysx/ovphysx.h>
+     *
+     * static ovphysx_enqueue_result_t attach_caller_owned_stage(
+     *     ovphysx_instance_handle_t handle,
+     *     ovstage_instance_t* stage,
+     *     ovstage_ordinal_t read_ordinal)
+     * {
+     *     return ovphysx_attach_ovstage(handle, stage, read_ordinal);
+     * }
+     * @endcode
     */
-    OVPHYSX_API ovphysx_result_t ovphysx_attach_ovstage(ovphysx_handle_t handle,
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_attach_ovstage(ovphysx_instance_handle_t handle,
                                                          ovstage_instance_t* stage,
                                                          ovstage_ordinal_t read_ordinal);
 
@@ -503,52 +821,135 @@ extern "C" {
     * The caller is the producer that advanced ovstage ordinals and therefore owns
     * the range boundaries, passed as ovstage's own `ovstage_ordinal_range_t`. With
     * `has_start_ordinal == true` the closed range `[start_ordinal, end_ordinal]` is
-    * drained; with `has_start_ordinal == false` only `end_ordinal` is drained (the
+    * drained. With `has_start_ordinal == false` only `end_ordinal` is drained (the
     * single-ordinal form). The selected changes are drained through the active
     * ovstage change feed and applied to the running simulation.
+    *
+    * Returns a task receipt. The call queues the update as a job on the instance's
+    * worker thread and returns without running it or waiting for it; the worker
+    * runs it after every earlier job, and may even finish it before the call
+    * returns. An instance without a worker thread (see
+    * OVPHYSX_GLOBAL_CONFIG_ASYNC_EXECUTION) runs it on the calling thread before
+    * the call returns. Collect its outcome with ovphysx_wait_task(). The range value is
+    * copied; the caller-owned Stage and the selected sealed data must remain valid
+    * until task completion. Successful completion makes the updates visible to
+    * subsequent work.
     *
     * @param handle ovphysx instance handle.
     * @param range ovstage ordinal range to drain (see ovstage_ordinal_range_t).
     *
-    * @pre `handle` is valid; @ref ovphysx_attach_ovstage succeeded.
+    * @pre `handle` is valid and an attach submitted before this call succeeds.
     * @pre when `range.has_start_ordinal`, `range.start_ordinal <= range.end_ordinal`.
     * @pre All selected writes are sealed by a completed write-floor operation
     *      covering `range.end_ordinal`. Waiting for
-    *      `ovstage_population_apply_usd_changes()` only completes population;
-    *      it does not advance the write floor.
+    *      `ovstage_population_apply_usd_changes()` only completes population.
+    *      It does not advance the write floor.
     *
-    * @note The initial `read_ordinal` was already parsed by
-    *       ovphysx_attach_ovstage(). Normal incremental updates select only later
-    *       ordinals; including it replays initial scene changes rather than only
-    *       the new delta.
+    * Ordinals at or below the latest successfully consumed ordinal are skipped,
+    * and so are the ordinals below 1, which precede every attach read_ordinal.
+    * A range containing only consumed ordinals is a successful no-op. An
+    * overlapping range applies only its unread suffix. The initial
+    * `read_ordinal` is consumed by ovphysx_attach_ovstage(), so replaying it does
+    * not recreate the attach population or emit object-change notifications.
+    * Population authored and sealed at later ordinals is applied normally.
+    * Exclude ordinals used for ovstage_clone() when creating matching runtime
+    * copies with ovphysx_clone(). Keep ordinary physics edits on separate
+    * ordinals so they can still be consumed.
     *
     * @par Errors
-    * - OVPHYSX_API_INVALID_ARGUMENT for an invalid range or handle
-    * - OVPHYSX_API_ERROR if no ovstage is attached or the range drain fails
+    * Submission rejects an invalid range or handle with OVPHYSX_API_INVALID_ARGUMENT,
+    * an unavailable runtime API with OVPHYSX_API_ERROR, and a call inside a log,
+    * runtime or object-change callback, or while the instance's worker is stopped
+    * or its queue is full, with OVPHYSX_API_INVALID_STATE. It also rejects a call
+    * inside a CUDA graph capture with OVPHYSX_API_INVALID_STATE, because a graph
+    * replay does not repeat this update. The check detects a capture of a blocking
+    * stream, such as Warp's, in the calling thread's current CUDA context, also when
+    * another thread runs that capture. A capture of a non-blocking stream, such as
+    * the side stream PyTorch's CUDA graphs capture on, is not detected: the update
+    * is accepted and runs once, at capture time. A missing attachment
+    * ("no ovstage is attached") and runtime range drain failures belong to the
+    * accepted task and are reported by its wait. Failed updates need not be atomic;
+    * do not assume that no edits were applied or blindly replay the range.
     */
-    OVPHYSX_API ovphysx_result_t ovphysx_update_from_ovstage(ovphysx_handle_t handle,
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_update_from_ovstage(ovphysx_instance_handle_t handle,
                                                             ovstage_ordinal_range_t range);
 
     /**
     * @brief Detach the currently-attached ovstage Stage.
     *
-    * Idempotent: calling on an unattached instance is a no-op success.
+    * Returns a task receipt, including for an idempotent no-op on an unattached
+    * instance. The call queues the detach as a job on the instance's worker thread and
+    * returns without running it or waiting for it; the worker runs it after every
+    * earlier job, and may even finish it before the call returns. An instance without a
+    * worker thread (see OVPHYSX_GLOBAL_CONFIG_ASYNC_EXECUTION) runs it on the
+    * calling thread before the call returns. Collect the outcome with
+    * ovphysx_wait_task(). An attach submitted right after it runs after it.
+    * Successful task completion ends this instance's Stage ownership. Keep the
+    * Stage alive until then, and longer if other users still own it. A failed
+    * detach can retain attachment ownership after partially retiring resources;
+    * ovphysx_is_stage_attached() is an ownership diagnostic, not a readiness check.
+    *
+    * This is teardown, not restoration of initial poses. Instance configuration
+    * and the private simulation-time counter are preserved.
     * Clears registered interests and any output-buffer registrations, so a
     * subsequent ovphysx_attach_ovstage() to a different Stage starts clean.
     * After detach, stage-dependent calls such as ovphysx_update_from_ovstage() and
     * ovphysx_step() fail until a Stage is attached again. Detach invalidates the
-    * stage's tensor and contact views. Do not read or write existing bindings;
-    * destroy them and create replacements after attaching and realizing a stage again.
+    * stage's tensor and contact views. Do not read or write existing bindings.
+    * Destroy them and create replacements after attaching and realizing a stage again.
+    * While an OmniPVD recording is active or starting, the detach instead runs on the
+    * calling thread: it first finishes the pending work of every instance, then tears
+    * down and returns a finished task. Detaching the recording owner's stage or the
+    * last live attachment then attempts to finalize the session. Successful
+    * finalization clears its owner. A finalization failure is logged and does not
+    * by itself fail the detach task; stop explicitly before detach to receive
+    * recording errors. This internal wait does not collect task results; collect
+    * them with ovphysx_wait_task() or ovphysx_wait_all(). Detaching a non-owner
+    * preserves a peer-owned recording while another attachment remains live.
+    * Detaching an unattached recording owner is a no-op and leaves its session active.
+    * Reattach never starts recording automatically.
     *
     * @param handle ovphysx instance handle.
     *
     * @pre handle is valid.
-    * @post On success, ovphysx is unattached.
+    * @post On successful task completion, ovphysx is unattached.
     *
     * @par Errors
-    * - OVPHYSX_API_ERROR for internal failures
+    * The call rejects invalid handles with OVPHYSX_API_INVALID_ARGUMENT.
+    * OVPHYSX_API_INVALID_STATE is retryable admission failure: attachment and
+    * write storage remain owned. It answers a call inside a log, runtime or
+    * object-change callback, a companion operation or native-access lease running
+    * at the time, pending companion previews during a recording, and a stopped
+    * worker or full queue. Finish companion work or the lease and retry. A companion
+    * operation submitted after an accepted detach reports busy until its lifecycle
+    * work finishes; the reservation is released before publishing the task outcome.
+    * Failures after teardown starts belong to the accepted task; collect them before
+    * deciding whether to retry or destroy the instance.
     */
-    OVPHYSX_API ovphysx_result_t ovphysx_detach_ovstage(ovphysx_handle_t handle);
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_detach_ovstage(ovphysx_instance_handle_t handle);
+
+    /**
+    * @brief Report whether this instance currently owns an attached stage.
+    *
+    * Does not wait for simulation or validate existing resources, including
+    * resources from an earlier attachment of the same stage. This synchronous
+    * metadata snapshot neither creates a task
+    * nor collects outcomes. Wait for a lifecycle task first when its final state
+    * is needed. A false snapshot during pending attach does not permit Stage
+    * destruction, and true does not establish readiness. Serialize all calls on
+    * an instance.
+    *
+    * @param instance_handle ovphysx instance handle.
+    * @param stage NULL to check for any attachment, or a caller-owned stage
+    *      pointer to compare with the current attachment. Never dereferenced.
+    * @param[out] out_attached True when a stage is attached and matches the
+    *      supplied candidate (if any); false when detached, different, or on failure.
+    *
+    * @par Errors
+    * - OVPHYSX_API_INVALID_ARGUMENT if out_attached is NULL or instance_handle is invalid
+    */
+    OVPHYSX_API ovphysx_result_t ovphysx_is_stage_attached(ovphysx_instance_handle_t instance_handle,
+                                                        const void* stage, bool* out_attached);
 
     /*--------------------------------------------------*/
     /* Physics output read (ovstage) */
@@ -559,310 +960,1096 @@ extern "C" {
      *
      * Mirrors the ovstage read idiom: the query is a handle (not a list). The
      * matched prims come back per group at read time as the interned
-     * ovstage_read_group_t::prims.list (resolve via @ref ovphysx_query_shared_dictionary
+     * ovstage_read_group_t::prims.list (resolve via the attached Stage's get_path_dictionary route
      * or feed straight into the ovstage write path). Discover the produced
-     * attributes / total prim count with @ref ovphysx_fetch_query_result. Pair every
+     * attributes / total prim count with the optional query result. Pair every
      * successful query with @ref ovphysx_release_query.
      *
-     * This read is ovstage-native and only meaningful when an ovstage Stage is
-     * attached (@ref ovphysx_attach_ovstage); under any other attach it returns 0
-     * objects.
+     * An ovstage Stage must be attached (@ref ovphysx_attach_ovstage).
+     *
+     * Query, read, write, fetch, commit, and release return task receipts. They are
+     * short calls (see "Stream ordered asynchronous execution" at the top of this
+     * header), apart from the commits named there: on an idle instance a call runs
+     * on the calling thread and returns a finished task; behind earlier work it is
+     * queued and returns at once. Either way the receipt reports admission only:
+     * wait for its task and check the task result before using outputs other than
+     * the handle, or before starting an operation outside instance order that
+     * depends on it. A query, read or write handle is written when the call is
+     * accepted, and later calls may name it at once: they run after its producer.
+     * Keep output slots, and the tensor data a call names, alive until task
+     * completion. Attribute arrays, strings and selections are not read after the
+     * call returns.
+     *
+     * A successful task makes host outputs ready. CUDA columns retain the event
+     * contract below; task completion does not replace their readiness event.
+     * Rejected submissions have no task and do not consume resources. Accepted
+     * release submissions transfer cleanup to the SDK: stop using the resource
+     * immediately, even if waiting later reports failure. The SDK retains or
+     * quarantines storage whose safe release could not be established.
+     *
+     * A handle created by this instance may be passed to later calls immediately,
+     * even while its producer is queued. Unknown handles, handles from another
+     * instance, and handles whose release was accepted return
+     * OVPHYSX_API_NOT_FOUND. Releasing an absent handle of this instance is a
+     * successful no-op.
+     *
+     * If a producer task fails, its handle remains known but unusable. Calls that
+     * name it fail their own tasks. Release failed handles to free their table
+     * entries.
+     *
+     * Short calls reject callback re-entry, a full queue, a stopped worker, and
+     * exhausted task or handle storage. If an earlier attach or detach failed,
+     * dependent calls fail their tasks until that lifecycle failure is collected.
      *
      * ## Reading output without reprocessing it (ordinal coupling)
      *
      * ovphysx never authors simulation output back into the attached Stage on its
-     * own — the application owns ordinal advancement and the write-back. The loop
+     * own. The application owns ordinal advancement and the write-back. The loop
      * that keeps physics from consuming its own output is:
      *
-     *   1. The app authors *control* edits (poses, targets, gravity, …) into
-     *      ovstage at ordinals it chooses, e.g. ordinal `c`, and seals them.
-     *   2. The app calls @ref ovphysx_update_from_ovstage with an
+     *   1. The application authors *control* edits (poses, targets, gravity, and so on)
+     *      into ovstage at ordinals it chooses, e.g. ordinal `c`, and seals them.
+     *   2. The application calls @ref ovphysx_update_from_ovstage with an
      *      `ovstage_ordinal_range_t` covering exactly those control ordinals (e.g.
      *      `{from, c, true}`) to drain them into the running sim, then @ref ovphysx_step.
-     *   3. The app reads the step's *output* with this API and writes it back into
-     *      ovstage at a SEPARATE, higher ordinal `p` (the physics-output ordinal).
+     *   3. The application reads the step's *output* with this API and writes it back
+     *      into ovstage at a SEPARATE, higher ordinal `p` (the physics-output ordinal).
      *      The group's `prims.list` + `attribute` token + `data.tensors` feed the
      *      ovstage write path with no repack and no string round-trip.
      *   4. The next frame's @ref ovphysx_update_from_ovstage range must cover the
-     *      app's new control ordinals but **exclude** the physics-output ordinals
-     *      `p`. Because physics never feeds `p` back into update_from_ovstage, it
-     *      never reprocesses its own writes.
+     *      application's new control ordinals but **exclude** the physics-output
+     *      ordinals `p`. Because physics never feeds `p` back into update_from_ovstage,
+     *      it never reprocesses its own writes.
      *
-     * In short: **app→physics edits flow through `ovphysx_update_from_ovstage`;
-     * physics→app output is written at ordinals that update_from_ovstage never
-     * covers.** See the ovstage usage guide for a worked example.
+     * In short: **application-to-physics edits flow through `ovphysx_update_from_ovstage`.
+     * Physics-to-application output is written at ordinals that update_from_ovstage
+     * never covers.** See the ovstage usage guide for a worked example.
      *
      * ## Query semantics: a reusable selector, evaluated lazily
      *
      * A query is a SELECTOR (object_type + scope), NOT a captured membership
-     * snapshot. Matched prims and column values are resolved lazily — the prim
-     * count at @ref ovphysx_fetch_query_result, the column data at @ref ovphysx_read
-     * — and each observes the most recently completed step (this call and the read
-     * both drain pending sim first). A step that lands between ovphysx_query and
-     * ovphysx_read does not make the handle stale: the read simply reflects the
-     * newer step. For OVPHYSX_SCOPE_ACTIVE that means "the active set of whatever
-     * step had last completed when ovphysx_read ran" — read before stepping again
-     * to capture a specific step's active set. The current output producer returns
-     * `layout_generation == 0`; rebuild cached queries and layouts after a known
+     * snapshot. The optional query result captures discovery at creation; later
+     * read and write sessions resolve membership again and report their own counts.
+     * Each operation observes every step submitted before it on the instance. A step
+     * that lands between ovphysx_query and ovphysx_read does not make the handle
+     * stale: the read simply reflects the newer step. OVPHYSX_SCOPE_ACTIVE uses the
+     * scene's most recent active-actor report where available: rigid bodies and
+     * articulation links use their own
+     * activity, vehicles and vehicle wheels use their chassis, and whole
+     * articulations use any active link. Without active-actor reporting, rigid bodies use current
+     * awake, non-kinematic state; links and whole articulations use articulation
+     * awake state; vehicles and wheels use chassis awake state. Deformables use
+     * current awake state. Particles, joints, tendons and deformable materials behave as ALL.
+     * Open a session before stepping again to capture the reported active set.
+     * The current output producer returns
+     * `layout_generation == 0`. Rebuild cached queries and layouts after a known
      * structural change rather than using it as an invalidation signal.
      *
-     * @param handle ovphysx instance handle.
-     * @param object_type Simulated type to select (@ref ovphysx_sim_object_type_t).
-     * @param scope @ref ovphysx_object_scope_t (all / active — active is single-frame).
-     * @param out_query [out] Receives the query handle. Nonzero on success — INCLUDING
-     *      an empty match (a valid query whose read reaches end-of-iteration
-     *      immediately and whose fetch_query_result reports total_prim_count == 0).
-     *      0 means FAILURE only.
-     * @return ovphysx_result_t.
+     * OVPHYSX_QUERY_TARGET_DEBUG_RENDER selects this instance's debug-render target, not a
+     * simulated object. It does not require an attached stage. Write the
+     * OVPHYSX_NAME_DEBUG_* settings and read point, line, and triangle position and
+     * color columns. Pass the address of the constant; do not build the name string
+     * by hand. Geometry is limited to the scenes of this instance. `scope` must be
+     * ALL or ACTIVE and is then ignored; it does not filter geometry. Filtering is
+     * the debug-render `scope` setting. @ref ovphysx_query_selection rejects this
+     * target as an invalid object type: prim and pattern selection do not apply.
      *
-     * @pre handle is valid; an ovstage Stage is attached.
-     * @post On success `*out_query` is non-zero and usable with ovphysx_read.
+     * @param handle ovphysx instance handle.
+     * @param object_type Query target (@ref ovphysx_query_target_t).
+     * @param scope @ref ovphysx_object_scope_t (all or the type-specific active set above).
+     *        Validated and ignored for OVPHYSX_QUERY_TARGET_DEBUG_RENDER.
+     * @param out_summary Optional discovery snapshot evaluated at creation. NULL skips
+     *      discovery work. For VEHICLE, readable attributes are the union supported by
+     *      the selected drive types; write-only controls are excluded. Each read group
+     *      carries its own applicable prim subset, and the read summary reports omissions.
+     *      The attributes array belongs to the query and stays valid
+     *      until accepted query release or instance destruction. Detach invalidates the query's attachment and dictionary use; a new attachment
+     *      does not revive them. query_result_id and all_handle are zero, not resources
+     *      accepted by OVStage release APIs. A debug-render query leaves this empty:
+     *      it has no prim set, and no dictionary when no stage is attached.
+     *      Retain input and output slots until task completion.
+     * @param out_query [out] Receives the query handle, nonzero, when the call is
+     *      accepted, before it returns; zero on rejection. A later call may name it
+     *      at once. An empty match is a valid query whose read reaches
+     *      end-of-iteration immediately and whose optional query result reports
+     *      total_prim_count == 0.
+     * @return Task receipt; query creation failures are reported by waiting.
+     *
+     * @pre handle is valid. An ovstage Stage is attached when the query runs (an
+     *      attach submitted earlier counts), except for OVPHYSX_QUERY_TARGET_DEBUG_RENDER.
+     * @post `*out_query` is nonzero once the call is accepted. After a failed task
+     *       it stays known but unusable until it is released or the instance is
+     *       destroyed: calls that name it fail their tasks, and its release succeeds.
      *
      * @par Errors
-     * - OVPHYSX_API_INVALID_ARGUMENT if out_query is null
-     * - OVPHYSX_API_ERROR if no ovstage is attached or the query could not be built
+     * Rejection (`receipt.status`, no task, `*out_query` zero):
+     * - OVPHYSX_API_INVALID_ARGUMENT if handle, object_type, or scope is invalid,
+     *   or out_query is null.
+     * - The rejections every short call shares (see above).
+     *
+     * After acceptance, `receipt.status` is OVPHYSX_API_SUCCESS, and
+     * @ref ovphysx_wait_task reports as OVPHYSX_API_ERROR, with the text
+     * "ovphysx_query (task <index>): <cause>": no attached ovstage Stage when the
+     * query runs (not for OVPHYSX_QUERY_TARGET_DEBUG_RENDER), an unavailable query
+     * backend, a failed attach or detach submitted before it, and query
+     * construction failures.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_query(ovphysx_handle_t handle,
-                                                      ovphysx_sim_object_type_t object_type,
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_query(ovphysx_instance_handle_t handle,
+                                                      ovphysx_query_target_t object_type,
                                                       ovphysx_object_scope_t scope,
-                                                      ovphysx_query_handle_t* out_query);
+                                                      ovphysx_query_handle_t* out_query,
+                                                      ovstage_query_result_t* out_summary);
 
     /**
-     * @brief Fetch a query's discovery summary (attributes + total prim count).
+     * @brief Open a query narrowed to a prim-set selection (ADR-0025).
      *
-     * Fills ovstage's own `ovstage_query_result_t`. Its `attributes` array lists the
-     * interned attribute tokens the matched objects produce (resolve via
-     * @ref ovphysx_query_shared_dictionary, or feed straight back into @ref ovphysx_read as
-     * `ovx_string_or_token_t` tokens); the array is owned by the query and valid
-     * until @ref ovphysx_release_query. `total_prim_count == 0` is the empty-match
-     * case.
+     * Like @ref ovphysx_query, but the objects of `object_type` are narrowed to `selection` -- an explicit
+     * list of native prim-path handles OR a glob pattern -- instead of a scope. The selection narrows BOTH
+     * the read and a write opened over the returned query -- narrowing the query narrows the write, with
+     * no separate write-side call. A glob matches prims through the same resolver a tensor binding uses; an
+     * explicit list names prims directly by the handles the caller resolved. Either way the query keeps the
+     * objects of `object_type` whose prim is selected, and an OVPHYSX_QUERY_TARGET_ARTICULATION query also keeps
+     * each articulation one of whose links or joints is selected, as an articulation tensor binding does.
+     * Other types are not widened: OVPHYSX_QUERY_TARGET_RIGID_BODY does not cover articulation links
+     * (OVPHYSX_QUERY_TARGET_ARTICULATION_LINK does), and a link, joint or tendon query keeps only the members
+     * whose own prim is selected.
      *
-     * @param handle ovphysx instance handle.
-     * @param query Query handle from @ref ovphysx_query.
-     * @param out_result [out] Receives the discovery summary.
-     * @return ovphysx_result_t.
+     * `selection->pattern` is an absolute path pattern (it starts with `/`), matched one path level per
+     * `/`-separated component: `*` and `?` match within one name, `**` spans any number of levels, and
+     * character classes and alternation pass through. The last component is searched at any depth below
+     * what the earlier components matched, unless it is a bare `*` or the pattern contains `**`. The
+     * complete rules, with examples, are on the "Path patterns" page of the ovphysx documentation
+     * (docs/read_write/path_patterns.md).
+     *
+     * A selected query has no scope: it always covers every selected object of the type (the
+     * OVPHYSX_SCOPE_ALL set), including objects the solver did not move last step. It therefore stays
+     * valid across steps until a structural change, and a write opened over it never skips a selected
+     * object for being asleep. For only the objects that moved, use @ref ovphysx_query with
+     * OVPHYSX_SCOPE_ACTIVE.
+     *
+     * OVPHYSX_QUERY_TARGET_DEBUG_RENDER is not a prim set. This call rejects it with
+     * OVPHYSX_API_INVALID_ARGUMENT and "invalid object type". Use @ref ovphysx_query
+     * for that instance target.
+     *
+     * `selection` is REQUIRED (non-NULL): the whole (type, scope) set is @ref ovphysx_query.
+     * `selection->prim_paths` are interned ovx_primpath_t handles (see @ref
+     * ovphysx_query_selection_t), NOT strings. prim_paths wins over pattern when both are set; they are
+     * never combined. A selection that resolves to no object of the queried type is a valid empty
+     * query -- the optional query result reports total_prim_count == 0 and the first
+     * @ref ovphysx_read fetch is end-of-iteration.
+     *
+     * @param handle       ovphysx instance handle.
+     * @param object_type  Object type to query (see @ref ovphysx_query).
+     * @param selection    Prim-set selection (must be non-NULL; NULL returns OVPHYSX_API_INVALID_ARGUMENT).
+     * @param out_query [out] Receives the query handle when the call is accepted, as on
+     *      @ref ovphysx_query.
+     * @param out_summary Optional creation-time discovery snapshot, as on ovphysx_query.
+     *      Retain output storage until task completion; the selection is not read after
+     *      the call returns.
+     * @return ovphysx_enqueue_result_t (an enqueue receipt; wait on it with @ref ovphysx_wait_task).
+     *
+     * @note Selection narrows both the read and the write for every writable object type; a selected
+     *   write that admits no prim of the queried type is a valid empty write, not an error.
      *
      * @par Errors
-     * - OVPHYSX_API_INVALID_ARGUMENT if out_result is null
-     * - OVPHYSX_API_ERROR for a bad query handle / no ovstage attached
+     * Rejection (`receipt.status`, no task):
+     * - OVPHYSX_API_INVALID_ARGUMENT if handle or object_type is invalid (including
+     *   OVPHYSX_QUERY_TARGET_DEBUG_RENDER), out_query or selection is
+     *   NULL, the selection provides neither prim_paths nor a pattern, prim_paths is NULL with a
+     *   non-zero prim_paths_count, prim_paths contains OVX_INVALID_PRIMPATH, or the pattern does not
+     *   start with `/`, contains an embedded NUL byte, or has a component exceeding the length limit.
+     * - The rejections every short call shares (see @ref ovphysx_query).
+     *
+     * After acceptance, `receipt.status` is OVPHYSX_API_SUCCESS, and @ref ovphysx_wait_task reports as
+     * OVPHYSX_API_ERROR, with the text "ovphysx_query_selection (task <index>): <cause>": no attached ovstage
+     * Stage when the query runs, an unavailable query backend, a failed attach or detach submitted before it,
+     * and query construction failures.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_fetch_query_result(ovphysx_handle_t handle,
-                                                            ovphysx_query_handle_t query,
-                                                            ovstage_query_result_t* out_result);
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_query_selection(ovphysx_instance_handle_t handle,
+                                                                 ovphysx_query_target_t object_type,
+                                                                 const ovphysx_query_selection_t* selection,
+                                                                 ovphysx_query_handle_t* out_query,
+                                                                 ovstage_query_result_t* out_summary);
 
     /**
-     * @brief Get the **shared** ovstage path dictionary backing a query.
+     * @brief Open a contact query: contact sensors with per-sensor filters (ADR-0044).
      *
-     * This is NOT an ovphysx-owned dictionary. The returned pointer is the attached
-     * ovstage source's own `path_dictionary_instance_t*` — the very dictionary that
-     * interned this query's `prim_list` handles and `attribute` tokens, AND the
-     * dictionary the ovstage write path interns into. Because read and write share
-     * it, a group's `attribute` token / `prim_list` handle can be fed straight back
-     * into the ovstage write path with no rebuild and no string round-trip; you only
-     * need this accessor when you want to resolve a token to a human-readable string
-     * or to intern a *derived* name (e.g. renaming output to "sim:<name>").
+     * A @ref OVPHYSX_QUERY_TARGET_CONTACT_SENSOR query whose rows are the bodies -- and, on CPU simulation
+     * or GPU dynamics with CPU readback, colliders carrying PhysxContactReportAPI -- the `selections`
+     * select, in selection order then match order, each paired with `filters_per_sensor` filter objects.
+     * Read it with @ref ovphysx_read like any query. The filters are
+     * what the filtered contact attributes are measured against; the unfiltered ones (net forces) read the
+     * same on this query as on @ref ovphysx_query.
      *
-     * The pointer is declared in `<ovx/path_dictionary/path_dictionary.h>` and
-     * surfaced here as an opaque `void*` (that header defines C++-only inline
-     * helpers, so it is deliberately not pulled into this C surface). Owned by the
-     * runtime; do not free. Returns NULL for a non-ovstage backend.
+     * Resolved once, when the query opens, with the contact binding's rules: a body already matched by an
+     * earlier selection is not repeated, and each filter selection must match one object (shared by every
+     * sensor of its selection) or exactly one object per sensor (paired by position). Like the
+     * contact-sensor type, a selected body is a row only while it reports contacts (it or its articulation
+     * carries PhysxContactReportAPI); on CPU simulation or GPU dynamics with CPU readback a selected
+     * collider carrying the schema is a row too, host-only (a DirectGPU scene has no separate child-collider
+     * rows), and a body row overlaps its collider rows, so do not sum net forces or count contacts across
+     * them. A contact query has no scope, and a selection
+     * matching nothing adds no rows.
      *
-     * @param handle ovphysx instance handle.
-     * @param query Query handle from @ref ovphysx_query.
-     * @param out_dictionary [out] Receives the opaque dictionary pointer (NULL if none).
-     * @return ovphysx_result_t.
+     * The schema on a separate child collider enables sensor selection, not reporting for its owning
+     * body. Enable reporting on the body, owning articulation link, or articulation root as well to avoid
+     * depending on reports from the other actor in each pair. The child remains a row but reads zero
+     * when neither actor reports matching contacts. Configure reporting settings on the reporting actor
+     * or articulation root. A standalone static collider is its own actor and enables reporting on CPU
+     * simulation and GPU dynamics with CPU readback; on DirectGPU its sensor row remains but reads zero force.
+     *
+     * @param handle             ovphysx instance handle.
+     * @param selections         `selection_count` sensor selections with their filters.
+     * @param selection_count    Number of sensor selections (at least 1).
+     * @param filters_per_sensor Filter selections per sensor selection (0 for none, at most 21845).
+     * @param out_query          [out] Receives the query handle when the call is accepted, as on
+     *      @ref ovphysx_query.
+     * @param out_summary        Optional creation-time discovery snapshot, as on @ref ovphysx_query.
+     *      Retain output slots until task completion; the selections and their input buffers are not read
+     *      after the call returns.
+     * @return ovphysx_enqueue_result_t (an enqueue receipt; wait on it with @ref ovphysx_wait_task).
      *
      * @par Errors
-     * - OVPHYSX_API_INVALID_ARGUMENT if out_dictionary is null
-     * - OVPHYSX_API_ERROR for a bad query handle / no ovstage attached
+     * - OVPHYSX_API_INVALID_ARGUMENT, before a task is created, if out_query or selections is NULL,
+     *   selection_count is 0, a selection's filters is NULL while filters_per_sensor is not 0,
+     *   filters_per_sensor exceeds 21845, or any selection is invalid as for @ref ovphysx_query_selection
+     * - The rejections every short call shares (see @ref ovphysx_query), before a task is created
+     * - OVPHYSX_API_ERROR, reported by @ref ovphysx_wait_task as "ovphysx_query_contacts (task <index>):
+     *   <cause>", for no attached ovstage Stage when the query runs, an unavailable query backend, a failed
+     *   attach or detach submitted before it, a filter selection whose match count is neither 1 nor the
+     *   selection's sensor count, or a sensor whose filters name one object twice; the message of the last
+     *   two names the selection, the filter and both counts
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_query_shared_dictionary(ovphysx_handle_t handle,
-                                                                 ovphysx_query_handle_t query,
-                                                                 void** out_dictionary);
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_query_contacts(ovphysx_instance_handle_t handle,
+                                                                const ovphysx_contact_sensor_selection_t* selections,
+                                                                uint32_t selection_count,
+                                                                uint32_t filters_per_sensor,
+                                                                ovphysx_query_handle_t* out_query,
+                                                                ovstage_query_result_t* out_summary);
+
 
     /**
      * @brief Read named output attributes for a query into typed column groups.
      *
      * Opens a read session over `query` for the requested attributes, each given as
-     * an `ovx_string_or_token_t` — a string name (see OVPHYSX_ATTR_*) OR an interned
-     * token (e.g. from @ref ovphysx_fetch_query_result, fed straight back with no
-     * token→string round-trip). Iterate the result with @ref ovphysx_fetch_read_next,
+     * an `ovx_token_or_string_t`: a string name (see OVPHYSX_ATTR_* in
+     * ovphysx_attributes.h) OR an interned token (e.g. from the optional query
+     * result, fed straight back with no token-to-string round-trip). Iterate
+     * the result with @ref ovphysx_fetch_read_next,
      * release each consumed group with @ref ovphysx_release_group, and release the
      * session with @ref ovphysx_release_read. Names not produced by the queried type
-     * are skipped.
+     * are skipped and reported in the optional summary. Duplicate canonical requests
+     * and unresolvable tokens fail the task. A non-NULL `string.ptr` takes precedence and
+     * the token is ignored; a NULL `string.ptr` selects the token.
+     * Already-known backend failures fail open without publishing a session.
      *
-     * ## Requested name vs. emitted `group.attribute`
+     * ## Requested name vs. emitted `group.columns[0].attribute`
      *
-     * The name you pass here is the SEMANTIC name you want (e.g. "position"). The
-     * resulting group's `attribute` token is the name actually EMITTED, which is the
-     * name that feeds the ovstage write path verbatim — and the two are not always
+     * The name passed here is the SEMANTIC name requested (e.g. "position"). The
+     * resulting group's column `attribute` token is the name actually EMITTED, which is the
+     * name that feeds the ovstage write path verbatim, and the two are not always
      * spelled identically. A single-prim "position"/"orientation" request on a
      * point-instancer is emitted as the instancer-array attribute
-     * "positions"/"orientations" (singular → plural) in INSTANCER-LOCAL space, since
+     * "positions"/"orientations" (singular to plural) in INSTANCER-LOCAL space, since
      * that is what writes back onto the instancer prim. Deformable/particle "points"
-     * are emitted mesh/set-local. Velocities stay world-space. So: request by intent,
-     * write back using `group.attribute` (+ `group.semantic` for the coordinate role)
-     * — do not assume the emitted token equals the requested string.
+     * are emitted mesh/set-local. Velocities stay world-space. Request by intent and
+     * write back using `columns[0].attribute` (+ `columns[0].semantic` for the coordinate role).
+     * Do not assume the emitted token equals the requested string.
+     *
+     * ## Device columns, and when they are ready
+     *
+     * On a DirectGPU scene, simulated state columns are **device-resident**: those tensors
+     * carry `kDLCUDA` and their `data` pointer is device memory, not host. That covers
+     * rigid bodies, point-instancer instances, articulation links, whole articulations
+     * and joint DOFs, and the point-set families (deformable bodies and particle sets,
+     * whose `points` and `velocities` are device columns). The list is illustrative, not
+     * exhaustive: residency is a property of the COLUMN, not of the type.
+     *
+     * Host columns persist alongside them (whole-articulation shape/material columns,
+     * deformable `restPoints` and element indices, per-shape properties), so ONE READ can
+     * contain both host and CUDA groups. A CPU scene emits host columns throughout.
+     *
+     * A GROUP, however, is device-UNIFORM: every tensor in it is on the same device. The
+     * group carries one device ordinal and one CUDA context for all of its tensors, and its
+     * single `cuda_sync` event describes that one device's work. There is no per-tensor
+     * completion metadata, so a mixed-device group could not state when its host and device
+     * halves were ready. Mixing therefore happens BETWEEN groups, never within one.
+     *
+     * Check `tensors[i].device.device_type`. Do not assume it, and do not infer it from the
+     * object type. Reading tensor 0's device is sufficient to classify a group because of
+     * the uniformity above.
+     *
+     * A device column is handed over **before its producing work has necessarily
+     * completed**. `group.columns[0].data.cuda_sync.wait_event` is a CUDA event the producer work
+     * signals, and `cuda_sync.stream` is 0 (the read never asks a consumer to drain a
+     * stream). A consumer on the stream the read was given, when that stream is in the
+     * scene's CUDA context -- for a zero `stream`, the legacy default/null stream in the
+     * producing CUDA context -- is already ordered after that work. A consumer using any
+     * other stream, including the read's own stream when it belongs to another context, must
+     * make that stream wait on `wait_event` first, or it may observe a partially
+     * written column: call CUDA's `cuStreamWaitEvent` or `cudaStreamWaitEvent` with
+     * the nonzero event. An event of 0 needs no wait. The event belongs to the read
+     * session and is valid until the session is released. Do not destroy it.
+     *
+     * ## The caller's stream, and capture
+     *
+     * A DirectGPU device group of rigid bodies, links, whole articulations, joints, tendons,
+     * point instancers, deformables or particle sets is gathered on the device, like a CUDA
+     * library call on `cuda_sync.stream`: after everything queued on it and after
+     * `cuda_sync.wait_event`, and everything queued on it afterwards runs after the gathers.
+     * The host never waits, except once after a rigid body is enabled or disabled, a centre
+     * of mass changes or a point instancer moves: the next read that picks up the change first
+     * waits for the device reads and commits still queued. Uploading a row list, which a read
+     * does only when its rows change, waits on the host for the copy, and so for the work
+     * queued on every blocking stream of the scene's CUDA context. The read's PhysX
+     * copies run after the work queued on `stream` before the read, and the next
+     * @ref ovphysx_step waits for those copies, so it also waits for that work. A zero `stream`
+     * gathers on the legacy default stream. A `stream` of another CUDA context than the
+     * scene's is waited for on the host, and the gathers then run on the scene's own stream.
+     * Every other group waits for `cuda_sync` on the host.
+     *
+     * A read over a held query keeps its device columns for the query's next read: once it is
+     * released, the next read with the same attributes and rows gathers into the same columns,
+     * after the gathers before it. A read of other attributes or rows, or over another query,
+     * may take them too once the query drops them. So before releasing a read, finish the work
+     * that consumes its columns, or queue it on the stream later reads are given. For the next
+     * read over the query with the same attributes and rows, a `cuda_sync.wait_event` recorded
+     * after that work is enough.
+     *
+     * So the read can be captured into a CUDA graph and replayed every step. A captured group's
+     * `cuda_sync` names no event, and each replay refreshes the same columns from the state
+     * current when it runs. A `cuda_sync.wait_event` passed during the capture must be recorded
+     * in that capture: a wait on an event recorded outside it invalidates the capture. Release
+     * reads and queries outside any capture: a release may wait on the host and free device
+     * memory, which invalidates a capture.
+     *
+     * **Before capturing:** read once outside the capture over the held query, with the same
+     * attributes and rows, and release that read. Then pass the capturing stream, and wait for
+     * this task before ending the capture.
+     *
+     * **Refused when** (before anything is queued; the capture stays valid):
+     * - the query holds no plan for the read: no released read with the same attributes and
+     *   rows, rows that changed since, or another open read over the query (a graph captures one
+     *   read per query);
+     * - it holds a host-resident or contact group;
+     * - its `stream` is of another CUDA context;
+     * - it would use the legacy default stream while a blocking stream of its context is being
+     *   captured;
+     * - the NVIDIA driver supports a CUDA version older than 12.5, which capture needs.
+     *
+     * **Capture again after:**
+     * - any change that invalidates a captured commit (see @ref ovphysx_commit_group); for a
+     *   point-instancer read, creating or removing any object, a material included;
+     * - a deformable body or particle set moves, or the set of kinematically driven deformable
+     *   bodies changes;
+     * - a gravity change, for centre-of-mass and inverse-dynamics columns.
+     *
+     * A replay does not detect these changes.
+     *
+     * **While replaying:**
+     * - keep the read open for as long as the graph is replayed. Releasing it does not wait,
+     *   unless another read over the query was released while it was open: it then waits on
+     *   the host for the last replay;
+     * - the query's next read waits for the last replay's gathers, not for the rest of the
+     *   graph: before a read on another stream than the replay's, finish the replay or pass a
+     *   `cuda_sync.wait_event` recorded after the launch;
+     * - replay only while no step is in flight, and finish each replay before the next
+     *   @ref ovphysx_step and before any change listed above: a replay after the views were
+     *   rebuilt may read freed memory;
+     * - finish each replay before destroying the graph: destroying it while a replay runs
+     *   can block the host until the replay ends;
+     * - centre-of-mass and inverse-dynamics columns may use the link poses of the last step or
+     *   kinematic refresh: after writing joint positions or root poses outside the graph, call
+     *   @ref ovphysx_update_articulations_kinematic outside any capture, on the stream the graph
+     *   is replayed on, before the replay;
+     * - an ACTIVE-scope read replays the membership it was captured with.
+     *
+     * Release order: release each group with @ref ovphysx_release_group once it has been
+     * read, then the session with @ref ovphysx_release_read. A device column's memory
+     * belongs to the session, so it must not be read after @ref ovphysx_release_read.
+     *
+     * ## Step-first for device-sourced types
+     *
+     * The covered types require at least one simulation step on a DirectGPU scene:
+     * PhysX sizes its GPU-side structures during that step and rejects direct-GPU
+     * reads until it has run. A pre-step read therefore emits **no groups** for those
+     * types, and @ref ovphysx_fetch_read_next reports end-of-iteration immediately. This
+     * is not an error. The optional read summary reports
+     * OVPHYSX_READ_OMISSION_NOT_READY for these omitted partitions. Step once before
+     * reading. Query and read summaries still count matching prim identities.
+     * Readiness is per scene: a multi-scene read can return groups for
+     * ready scene partitions while omitting an unready DirectGPU scene's partition.
+     * CPU articulation-root and articulation-joint records can likewise be discoverable
+     * while buffered attach work is still inserting the SDK articulation into its scene.
+     * Those pending partitions are omitted normally, then become readable after insertion.
+     *
+     * With an empty `cuda_sync`, the read may queue behind earlier work. With a
+     * stream or event, it waits for earlier work and runs on the calling thread.
      *
      * @param handle ovphysx instance handle.
      * @param query Query handle from @ref ovphysx_query.
-     * @param attributes Array of `attribute_count` `ovx_string_or_token_t` (string
+     * @param attributes Array of `attribute_count` `ovx_token_or_string_t` (string
      *      name or interned token per entry).
-     * @param attribute_count Number of attributes.
-     * @param out_read [out] Receives the read-session handle (0 on failure).
-     * @return ovphysx_result_t.
+     * @param attribute_count Number of attributes; zero opens an empty read session.
+     * @param cuda_sync The caller's producer handoff: the read observes everything queued on
+     *      `cuda_sync.stream` and after `cuda_sync.wait_event` (see "The caller's stream, and
+     *      capture"). Unlike ovstage's `ovstage_cuda_sync_t` ("0 = none"), `stream` is the
+     *      stream the read's device copies run on, as `ovstage_placement_t::stream`: a zero
+     *      `stream` is the legacy default stream.
+     * @param out_read [out] Receives a nonzero read-session handle when the call is
+     *      accepted, before it returns; zero when the call is rejected.
+     * @param out_summary Optional immutable open summary; NULL skips summary work.
+     *      Nested arrays remain valid until accepted read release or instance
+     *      destruction. They describe this open even after detach;
+     *      do not resolve their tokens through an invalidated attachment's dictionary.
+     *      Omission bits classify missing partitions; backend failure fails the task instead.
+     * @return Task receipt; read construction failures are reported by waiting.
      *
-     * @pre handle and query are valid.
-     * @post On success `*out_read` is non-zero.
+     * @pre handle and query are valid. Keep any out_summary slot alive until task
+     *      completion; the attributes and their strings are not read after the call
+     *      returns. The read observes every step submitted before it.
+     * @post `*out_read` is nonzero once the call is accepted. After a failed task it
+     *       stays known but unusable, as a query's does. CUDA data readiness still
+     *       requires the group's event handoff.
      *
      * @par Errors
-     * - OVPHYSX_API_INVALID_ARGUMENT if args are null
-     * - OVPHYSX_API_ERROR for internal failures
+     * Rejection (`receipt.status`, no task):
+     * - OVPHYSX_API_INVALID_ARGUMENT if handle is invalid, out_read is null,
+     *   attributes is null with a nonzero count, or a token-less attribute string
+     *   is null with a nonzero length.
+     * - OVPHYSX_API_NOT_FOUND if query is absent, released, or belongs to
+     *   another instance.
+     * - The rejections every short call shares (see @ref ovphysx_query).
+     *
+     * After acceptance, `receipt.status` is OVPHYSX_API_SUCCESS, and
+     * @ref ovphysx_wait_task reports as OVPHYSX_API_ERROR, with the text
+     * "ovphysx_read (task <index>): <cause>": an unavailable read backend, a query
+     * whose producer failed, a failed attach or detach submitted before it, and read
+     * construction failures.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_read(ovphysx_handle_t handle,
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_read(ovphysx_instance_handle_t handle,
                                                       ovphysx_query_handle_t query,
-                                                      const ovx_string_or_token_t* attributes,
+                                                      const ovx_token_or_string_t* attributes,
                                                       size_t attribute_count,
-                                                      ovphysx_read_handle_t* out_read);
+                                                      ovstage_cuda_sync_t cuda_sync,
+                                                      ovphysx_read_handle_t* out_read,
+                                                      ovphysx_read_result_t* out_summary);
 
     /**
      * @brief Fetch the next output column group from a read session.
      *
-     * On success points `*out_group` at the next `ovstage_read_group_t` and returns
-     * OVPHYSX_API_SUCCESS. Returns OVPHYSX_API_END_OF_ITERATION (NOT an error) once
-     * all groups have been consumed — `*out_group` is then NULL. Any other status is
-     * a real error (`*out_group` NULL).
+     * After successful task completion, `*out_group` points at the next
+     * `ovstage_read_group_t`, or is NULL at end of iteration. Each group carries one
+     * attribute column, `columns[0]` (`column_count == 1`). End of iteration is
+     * an ordinary successful task. A failed task leaves `*out_group` NULL and must
+     * not be treated as end of iteration. Keep out_group alive until completion.
      *
      * The group is **producer-owned** (the caller does not allocate it): the returned
      * `ovstage_read_group_t` pointer is a borrow valid until @ref ovphysx_release_group
      * is called for that group's `read_group_id`, or the session is released.
      *
-     * Group lifetime (authoritative): the struct AND its borrowed
-     * `data.tensors` / `data.index_map` / `data.mask` / `prims.list` stay valid until
-     * @ref ovphysx_release_group for that `read_group_id` (or @ref ovphysx_release_read,
-     * which releases all). Fetching further groups does NOT invalidate earlier ones,
-     * and an intervening @ref ovphysx_step does NOT invalidate a live group (the
-     * runtime gathers each column into session-owned storage at read time). Copy any
-     * tensor you need to outlive the group's release.
+     * Group lifetime (authoritative): the returned group struct and its stage-derived
+     * `prims.list` stay valid until @ref ovphysx_release_group for that `read_group_id`
+     * (or @ref ovphysx_release_read, which releases all). The column and its numeric
+     * storage are owned by the read session instead: the `columns[0]` descriptor, its
+     * `data.tensors`, every tensor's shape and data, `prims.index_map`, `data.index_map`,
+     * `data.mask`, and `data.cuda_sync.wait_event` stay valid until
+     * @ref ovphysx_release_read. Fetching further groups and an intervening
+     * @ref ovphysx_step do NOT invalidate either lifetime (the runtime gathers each
+     * column into session-owned storage at read time). Numeric snapshots also
+     * survive stage detach until session release or instance destruction. Detach
+     * invalidates the stage dictionary and its prim-list handles; do not resolve
+     * those handles after detaching.
+     *
+     * A device (`kDLCUDA`) column additionally has a readiness contract: it is handed
+     * over before its producing work has necessarily completed. Wait on
+     * `group.columns[0].data.cuda_sync.wait_event` before reading it from any stream other than the one
+     * the read was given in the scene's CUDA context, using CUDA's `cuStreamWaitEvent` or
+     * `cudaStreamWaitEvent`. See @ref ovphysx_read for the full rule. Validity and readiness
+     * are separate: the borrow above means the memory may still be read, the event means the
+     * values in it are final.
+     *
+     * A failure already known during gathering fails read creation. A later fetch
+     * can still fail, for example if the attachment was invalidated. Check task
+     * completion before interpreting a NULL group as the end of iteration.
+     * Already-fetched numeric snapshots retain their session lifetime.
      *
      * @param handle ovphysx instance handle.
      * @param read Read-session handle from @ref ovphysx_read.
      * @param out_group [out] Receives a borrowed `ovstage_read_group_t*` for the next
      *      group (NULL at end of iteration or on error).
-     * @return ovphysx_result_t: SUCCESS (group filled), END_OF_ITERATION (done), else error.
+     * @return Task receipt. After successful task completion, NULL means done.
      *
-     * @pre handle and read are valid; out_group is non-null.
+     * @pre handle and read are valid and out_group is non-null.
      *
      * @par Errors
-     * - OVPHYSX_API_INVALID_ARGUMENT if out_group is null
-     * - OVPHYSX_API_ERROR for a bad read handle
+     * Rejection (`receipt.status`, no task):
+     * - OVPHYSX_API_INVALID_ARGUMENT if handle is invalid or out_group is null.
+     * - OVPHYSX_API_NOT_FOUND if read is absent, released, or belongs to
+     *   another instance.
+     * - The rejections every short call shares (see @ref ovphysx_query).
+     *
+     * After acceptance, `receipt.status` is OVPHYSX_API_SUCCESS, and
+     * @ref ovphysx_wait_task reports as OVPHYSX_API_ERROR, with the text
+     * "ovphysx_fetch_read_next (task <index>): <cause>": an unavailable read backend,
+     * a read whose producer failed, a failed attach or detach submitted before it,
+     * and backend fetch failures. End of iteration is successful completion with a
+     * NULL group.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_fetch_read_next(ovphysx_handle_t handle,
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_fetch_read_next(ovphysx_instance_handle_t handle,
                                                          ovphysx_read_handle_t read,
                                                          const ovstage_read_group_t** out_group);
 
     /**
      * @brief Release one fetched group's borrowed storage.
      *
-     * Releases the column / prim storage pinned by @ref ovphysx_fetch_read_next for
-     * `group_id` (an `ovstage_read_group_t::read_group_id`). After this the group's
-     * tensors / index_map / prims.list must not be dereferenced.
+     * Releases the stage-derived prim-list storage pinned by
+     * @ref ovphysx_fetch_read_next for `group_id` (an
+     * `ovstage_read_group_t::read_group_id`). After this the group struct and
+     * `prims.list` must not be dereferenced. Tensor, prim-index-map, data-index-map,
+     * mask, and CUDA-event storage belongs to the read session and remains valid until
+     * @ref ovphysx_release_read.
      *
      * @param handle ovphysx instance handle.
      * @param read Read-session handle the group came from.
      * @param group_id The group's `ovstage_read_group_t::read_group_id`.
-     * @return ovphysx_result_t. Idempotent for an already-released / unknown id.
+     * @return Task receipt. Accepted release ends the group borrow immediately.
+     *         An already-released or unknown id, and a read that is unknown, released
+     *         or whose producer failed, are successful no-ops; a read of another
+     *         instance is rejected with OVPHYSX_API_NOT_FOUND. A short call (see
+     *         @ref ovphysx_query): it runs after the work submitted before it, and an
+     *         unavailable release backend fails its task.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_release_group(ovphysx_handle_t handle,
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_release_group(ovphysx_instance_handle_t handle,
                                                        ovphysx_read_handle_t read,
                                                        ovstage_read_group_id_t group_id);
 
     /**
      * @brief Release a read session (and every borrowed group it still owns).
+     *
+     * Finish all external CPU and CUDA consumers before submitting release or
+     * destroying the instance, or queue them on the stream later reads are given (see
+     * @ref ovphysx_read). The
+     * SDK reclaims device storage only after its own producing work; it has no
+     * completion token for work launched by the caller. Columns kept on a held query
+     * for its next read are ordered after that work on the device, without a host
+     * wait, unless another read over the query was released since this one opened: they
+     * are then freed after a host wait. Release reads outside any capture. For a read
+     * captured into a CUDA graph, the query's next read waits on the device for its
+     * last replay's gathers, not for the rest of the graph. Accepted release
+     * ends all session borrows and transfers cleanup responsibility to the SDK.
+     *
      * @param handle ovphysx instance handle.
      * @param read Read-session handle from @ref ovphysx_read.
-     * @return ovphysx_result_t. Idempotent for an already-released / unknown handle.
+     * @return Task receipt. The release is accepted when it is submitted, so a
+     *         later call that names the handle is rejected, and it runs after the
+     *         work submitted before it, also when the read is still queued. An absent
+     *         or released handle is a successful no-op for a valid instance, and so is
+     *         one whose producer failed; a handle of another instance is rejected with
+     *         OVPHYSX_API_NOT_FOUND. Wait to observe cleanup failures; do not retry
+     *         accepted releases.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_release_read(ovphysx_handle_t handle,
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_release_read(ovphysx_instance_handle_t handle,
                                                       ovphysx_read_handle_t read);
 
     /**
-     * @brief Release an output query.
+     * @brief Open a write session for an array of named attributes.
+     *
+     * The application-to-physics direction, the mirror of @ref ovphysx_read. It reuses
+     * that query verbatim: the session reaches exactly the set `query` matched. A commit
+     * writes every row of its group, or with @ref ovphysx_commit_group_masked the rows a
+     * per-commit mask selects; there is no index or prim-list parameter.
+     *
+     * Each fetched group identifies its original request index through
+     * ovphysx_fetched_write_group_t::attribute_index, even when attributes have
+     * identical tensor shapes. Attributes are planned in request order. Commit
+     * order is chosen by the caller and no transactional rollback is provided.
+     * All names are validated before publishing a session. Canonical duplicates,
+     * including string/token aliases, and unsupported/read-only writes fail the
+     * creation task. A valid request with no matching objects is an empty session.
+     * A non-NULL `string.ptr` takes precedence and the token is ignored. A token-only
+     * request (NULL `string.ptr`) must belong to the owning Stage dictionary; an
+     * unresolvable token fails the creation task.
+     *
+     * The write's attribute vocabulary is its own: a name accepted here need not be one
+     * @ref ovphysx_read emits, since write-only control inputs such as forces and
+     * wrenches have no read counterpart. Request attributes by semantic name; each
+     * fetched group's request index identifies that name even when its storage is
+     * an instancer array.
+     *
+     * ## Column residency
+     *
+     * A group's tensor is normally resident where the scene simulates: `kDLCUDA` on a
+     * DirectGPU scene, `kDLCPU` otherwise. Two families are `kDLCPU` on EVERY scene,
+     * because their destination is host memory rather than a device buffer: the
+     * articulation DOF properties (drive, limit, friction), and particle `points` /
+     * `velocities`, which land in the set's staging arrays for PhysX to upload at the
+     * next step. Check `tensors[i].device.device_type` and fill accordingly. Do not
+     * infer it from the scene. Handing a host pointer to a device column, or the
+     * reverse, faults asynchronously and is reported far from here.
+     *
+     * A session may be opened on a scene that has not yet stepped. CPU and
+     * GPU-with-readback apply a pre-step write; DirectGPU refuses at
+     * @ref ovphysx_commit_group, not here.
+     *
+     * On a DirectGPU scene, opening a session uploads its row lists and waits on the host
+     * for the copy, and so for the work queued on every blocking stream of the scene's CUDA
+     * context.
+     *
      * @param handle ovphysx instance handle.
      * @param query Query handle from @ref ovphysx_query.
-     * @return ovphysx_result_t. Idempotent for an already-released / unknown handle.
+     * @param attributes Nonempty array of string-or-token attributes.
+     * @param attribute_count Number of attributes.
+     * @param out_write [out] Receives the write-session handle, nonzero, when the call
+     *      is accepted, before it returns; zero on rejection.
+     * @param out_summary Optional immutable open summary; NULL skips summary work.
+     *      Nested arrays remain valid until accepted write release, stage detach
+     *      or instance destruction, whichever occurs first.
+     * @return Task receipt; write construction failures are reported by waiting.
+     *
+     * @pre handle and query are valid. Keep output slots alive until completion; the
+     *      attributes and their strings are not read after the call returns.
+     * @post `*out_write` is nonzero once the call is accepted. After a failed task it
+     *       stays known but unusable, as a query's does. A detach closes the write
+     *       sessions opened before it and retires their groups: a call submitted after
+     *       the detach that names a closed session fails its task ("input write
+     *       <handle> was closed when its stage was detached"), whether or not the
+     *       detach already ran, and its release succeeds. Finish external work
+     *       filling those groups before any such teardown.
+     *
+     * @par Errors
+     * Rejection (`receipt.status`, no task):
+     * - OVPHYSX_API_INVALID_ARGUMENT if handle is invalid, out_write or attributes is
+     *   null, attribute_count is zero, or a token-less string is null with a nonzero length.
+     * - OVPHYSX_API_NOT_FOUND if query is absent, released, or belongs to
+     *   another instance.
+     * - The rejections every short call shares (see @ref ovphysx_query).
+     *
+     * After acceptance, `receipt.status` is OVPHYSX_API_SUCCESS, and
+     * @ref ovphysx_wait_task reports as OVPHYSX_API_ERROR, with the text
+     * "ovphysx_write (task <index>): <cause>": an unavailable write backend, a query
+     * whose producer failed, a failed attach or detach submitted before it, and write
+     * construction failures, including unsupported attributes or scene pipelines.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_release_query(ovphysx_handle_t handle,
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_write(ovphysx_instance_handle_t handle,
+                                               ovphysx_query_handle_t query,
+                                               const ovx_token_or_string_t* attributes,
+                                               size_t attribute_count,
+                                               ovphysx_write_handle_t* out_write,
+                                               ovphysx_write_result_t* out_summary);
+
+    /**
+     * @brief Fetch the next writable group from a write session.
+     *
+     * After successful task completion, `out_group->group` points at the next
+     * `ovstage_map_group_t`, or is NULL at end of iteration. End of iteration is
+     * an ordinary successful task. A failed task leaves `out_group->group` NULL and must
+     * not be treated as end of iteration. Keep out_group alive until completion.
+     *
+     * The group is **producer-owned** (the caller does not allocate it) and handed back
+     * as a `const` borrow. `const` is correct even on the write path: the group is a
+     * DESCRIPTOR the caller reads, describing BUFFERS the caller fills through
+     * `data.tensors[i].data`, which `const` permits since it does not propagate through
+     * pointer members. No field of the struct is the caller's to assign, and tensor
+     * shape, dtype and device are dictated by the implementation.
+     *
+     * Group storage stays valid until that group is committed or its write session
+     * is released, independent of further fetches. Detach and instance
+     * destruction retire write sessions. An intervening @ref ovphysx_step does not
+     * invalidate a live group. A later write over the same query may hand out the same
+     * device storage again for the same attribute, scene and row count. A DirectGPU
+     * device group then names, in `data.cuda_sync.wait_event`, the event the commit that
+     * last used that storage recorded: make the stream filling the group wait on it, before
+     * beginning the capture when the fill is captured -- a capture cannot wait on an event
+     * recorded outside it.
+     *
+     * @param handle ovphysx instance handle.
+     * @param write Write-session handle from @ref ovphysx_write.
+     * @param out_group [out] Receives the borrowed group and original request index.
+     *      EOF is group == NULL and attribute_index == SIZE_MAX after successful
+     *      task completion. Failed completion is never EOF.
+     * @return Task receipt. After successful task completion, NULL means done.
+     *
+     * @pre handle and write are valid and out_group is non-null.
+     *
+     * @par Errors
+     * Rejection (`receipt.status`, no task):
+     * - OVPHYSX_API_INVALID_ARGUMENT if handle is invalid or out_group is null.
+     * - OVPHYSX_API_NOT_FOUND if write is absent, released, or belongs to
+     *   another instance.
+     * - The rejections every short call shares (see @ref ovphysx_query).
+     *
+     * After acceptance, `receipt.status` is OVPHYSX_API_SUCCESS, and
+     * @ref ovphysx_wait_task reports as OVPHYSX_API_ERROR, with the text
+     * "ovphysx_fetch_write_next (task <index>): <cause>": an unavailable write backend,
+     * a write whose producer failed or that a detach closed, a failed attach or detach
+     * submitted before it, and backend fetch failures. End of iteration is successful
+     * completion with a NULL group.
+     */
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_fetch_write_next(ovphysx_instance_handle_t handle,
+                                                          ovphysx_write_handle_t write,
+                                                          ovphysx_fetched_write_group_t* out_group);
+
+    /**
+     * @brief Commit a filled group, transferring ownership of its data to physics.
+     *
+     * The caller must have filled EVERY mapped entry, so a partially filled group
+     * publishes whatever its unfilled entries contain. To write a subset of the rows,
+     * commit with @ref ovphysx_commit_group_masked, or query fewer prims. A live group
+     * belonging to this session is spent
+     * when accepted for publication, including when publication fails. Stop using
+     * its mapped pointers once the submission is accepted. A rejected submission
+     * leaves ownership with the caller. An invalid, foreign, or already-spent
+     * pointer fails the task without publishing or consuming another session's group.
+     * Dereferencing them is undefined behavior rather than a checked error, since a raw
+     * `data.tensors[i].data` access makes no API call the runtime could reject.
+     *
+     * ## Committed by pointer, not by id
+     *
+     * `ovstage_map_group_t` carries no `write_group_id` (the read's `read_group_id` has
+     * no twin on it), so the borrowed pointer IS the commit identity. This is the one
+     * place this API differs from @ref ovphysx_release_group, which takes an id. Group
+     * addresses are unique for the session's life and never recycled between groups,
+     * which is what lets an already-committed group be told apart from a live one.
+     *
+     * ## Synchronization
+     *
+     * `write_done_sync` is ovstage's `{stream, wait_event}` handoff of producer
+     * completion. How it is honored depends on where the group is applied:
+     *
+     * - A **DirectGPU device group** -- rigid-body pose, velocity, force and wrench, link
+     *   force and wrench, articulation root, joint state and drive, tendon and
+     *   point-instancer columns -- is ordered on the device, like a CUDA library call on
+     *   `stream`: its work runs after everything queued on `stream` and after
+     *   `wait_event`, and everything queued on `stream` afterwards runs after it. The
+     *   host never waits, except once after a rigid body is enabled or disabled, a centre
+     *   of mass changes or a point instancer moves: the next call that picks up the change
+     *   first waits for the device commits still queued. So the commit can be captured
+     *   into a CUDA graph: pass the capturing stream, wait for this task before ending the
+     *   capture, and keep the write session open for as long as the graph is replayed
+     *   (releasing it ends replay). Replay only while no step is in flight, and finish
+     *   each replay before the next @ref ovphysx_step. Capture again after prims are added
+     *   or removed, physics APIs are applied or removed, an edit makes physics re-create an
+     *   object, the scene is reset or replaced, any rigid body is enabled or disabled, the
+     *   centre of mass of a body whose wrench the graph writes changes, or a point instancer
+     *   whose instances the graph writes, or one of its ancestors, moves: a replay does not
+     *   detect them and writes wrong values or to the wrong bodies. Finish each replay before
+     *   such a change. A zero
+     *   `stream` orders the work on the legacy default stream. A `stream` of another
+     *   CUDA context than the scene's is waited for on the host instead, and the work
+     *   then runs on the scene's own stream: Warp and PyTorch streams share the scene's
+     *   context only when the instance was created on an explicit CUDA device
+     *   (`active_cuda_gpus`). A fault in the caller's own producer work is not detected
+     *   here; it surfaces at the next synchronization.
+     * - **Every other group** is applied on the host. A non-zero `wait_event` and a
+     *   non-zero `stream` are both waited for on the host before the data is consumed.
+     *   Only `{0, 0}` asserts nothing is outstanding. A host-resident group does NOT
+     *   imply `{0, 0}`, since the caller may have staged on its own stream. Such a group
+     *   is refused at admission on a stream being captured, before anything is read: the
+     *   group stays live, to commit outside the capture.
+     *
+     * While a blocking stream of a CUDA context is being captured, that context's legacy
+     * default stream cannot be used: it synchronizes with the capturing stream, so CUDA
+     * refuses work on it, and an attempt would invalidate the capture. A commit given it
+     * -- `stream` `1`, or a zero `stream` for a group in device memory -- is refused at
+     * admission, before anything is read: the capture stays valid and the group stays
+     * live.
+     *
+     * CUDA graph capture needs an NVIDIA driver for CUDA 12.5 or newer. On an older driver, a
+     * commit on a stream being captured is refused at admission the same way.
+     *
+     * Context-relative default-stream sentinels refer to the producer context current
+     * when this call is made. Invalid stream, event or context combinations fail the
+     * task. If producer completion cannot be proven, the SDK retains the affected
+     * storage for safe cleanup; the group remains spent. A commit with nothing
+     * outstanding (`{0, 0}`) of a session that never handed out device memory is a
+     * short call (see @ref ovphysx_query). Every other commit runs on the calling
+     * thread once earlier work on the instance has finished, and enqueues its device
+     * work during the call. Successful task completion confirms the CPU mutation or
+     * GPU submission; GPU execution may continue through the backend event chain.
+     * It does NOT warm up a scene that has not stepped. Device modes differ:
+     * on CPU and on GPU-with-readback a pre-step write **commits and is applied**; on
+     * DirectGPU (`eENABLE_DIRECT_GPU_API`) commit is **refused** until a first step has
+     * sized the GPU scatter view. Call @ref ovphysx_warmup or @ref ovphysx_step for a
+     * recipe that works on every mode. The write never steps on the caller's behalf.
+     *
+     * @param handle ovphysx instance handle.
+     * @param write Write-session handle the group came from.
+     * @param group The borrowed group from @ref ovphysx_fetch_write_next.
+     * @param write_done_sync CUDA handoff. `{0, 0}` when nothing is outstanding.
+     *      Keep every supplied stream and event alive until task completion, and
+     *      make the producer context current when using a context-relative stream.
+     * @return Task receipt; backend refusal or mutation failure is reported by waiting.
+     *
+     * @par Errors
+     * Rejection (`receipt.status`, no task):
+     * - OVPHYSX_API_INVALID_ARGUMENT if handle is invalid or group is null. For a commit
+     *   that runs on the calling thread (a CUDA handoff, or a session that handed out
+     *   device memory), also when the group is applied on the host and
+     *   `write_done_sync.stream` is being captured into a CUDA graph, the commit would
+     *   use the legacy default stream while a blocking stream of its context is being
+     *   captured, the driver cannot tell whether `write_done_sync.stream` is being
+     *   captured, or `write_done_sync.stream` is being captured on a driver older than
+     *   CUDA 12.5. The group stays live.
+     * - OVPHYSX_API_NOT_FOUND if write is absent, released, or belongs to
+     *   another instance.
+     * - The rejections every short call shares (see @ref ovphysx_query); a commit that
+     *   runs on the calling thread has them too, apart from the full queue.
+     *
+     * After acceptance, `receipt.status` is OVPHYSX_API_SUCCESS, and
+     * @ref ovphysx_wait_task reports as OVPHYSX_API_ERROR, with the text
+     * "ovphysx_commit_group (task <index>): <cause>": an unavailable write backend, a
+     * write whose producer failed or that a detach closed, a failed attach or detach
+     * submitted before it, an invalid, foreign, or already-spent group, an unstepped
+     * DirectGPU scene, or a publication failure.
+     * CPU and GPU-with-readback permit pre-step commits. Committing a spent group
+     * fails rather than claiming data was published again.
+     */
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_commit_group(ovphysx_instance_handle_t handle,
+                                                      ovphysx_write_handle_t write,
+                                                      const ovstage_map_group_t* group,
+                                                      ovstage_cuda_sync_t write_done_sync);
+
+    /**
+     * @brief Commit only the rows of a group a mask selects.
+     *
+     * Behaves as @ref ovphysx_commit_group, except that only the rows `row_mask` selects
+     * are written; the column's other entries need not be filled. The counterpart of the
+     * deprecated @ref ovphysx_write_tensor_binding_masked for the session write.
+     *
+     * `row_mask` is a contiguous 1-D bool or uint8 tensor with one entry per row of the
+     * group, nonzero selecting the row. A group's rows are the leading dimension of its
+     * tensor -- one per DOF for an articulation-joint group, so a mask selects DOFs -- or
+     * its tensors when it carries one per prim (deformable-body groups); a point-instancer
+     * group's rows are its instances. Character controller,
+     * vehicle and particle groups take no mask. The mask lives where the group does: on
+     * the group's CUDA device, or in host memory for a host-resident group. A device group
+     * reads its mask on the device when the commit runs, so a captured commit reads the
+     * mask's current contents at every replay.
+     *
+     * Keep the mask valid until the commit has read it: for a DirectGPU device group, until
+     * the work queued on the commit's stream has run -- task completion means only that it
+     * was submitted -- and, when the commit is captured into a CUDA graph, for as long as
+     * the graph may be replayed. A host group has read it once its task completes.
+     *
+     * A masked commit is never a short call: it always runs on the calling thread once
+     * earlier work on the instance has finished, where the runtime checks the mask
+     * against the group before anything is read. A mask it refuses rejects the call
+     * the same way whether or not the instance was busy, and the group stays live.
+     *
+     * An unselected row keeps its value, with one exception: PhysX cannot read an
+     * applied load back, so an unselected rigid-body or link `force` or `wrench` row
+     * applies none. On a DirectGPU scene that also replaces a load another write set
+     * on that row earlier in the same step; elsewhere loads add up. On a DirectGPU scene
+     * an articulation root, joint or tendon commit also writes its unselected articulations
+     * back with their current values: until the next step they read zero link accelerations
+     * and incoming joint forces, and a root whose centre of mass is offset can drift
+     * slightly with each such commit.
+     *
+     * @param handle ovphysx instance handle.
+     * @param write Write-session handle the group came from.
+     * @param group The borrowed group from @ref ovphysx_fetch_write_next.
+     * @param row_mask One entry per row, nonzero selecting the row.
+     * @param write_done_sync CUDA handoff, as for @ref ovphysx_commit_group; the mask's
+     *      producer is part of it.
+     * @return Task receipt; backend refusal or mutation failure is reported by waiting.
+     *
+     * @par Errors
+     * Rejection (`receipt.status`, no task):
+     * - OVPHYSX_API_INVALID_ARGUMENT if handle is invalid, group or row_mask is null,
+     *   row_mask is not a 1-D bool or uint8 tensor, its length, layout or device does
+     *   not match the group, the group is a character controller, vehicle or particle
+     *   group, the group is applied on the host and `write_done_sync.stream` is being
+     *   captured, the commit would use the legacy default stream while a blocking
+     *   stream of its context is being captured, or the driver cannot tell whether
+     *   `write_done_sync.stream` is being captured. The group stays live.
+     * - OVPHYSX_API_NOT_FOUND if write is absent, released, or belongs to
+     *   another instance.
+     * - The rejections every short call shares (see @ref ovphysx_query), apart from
+     *   the full queue.
+     *
+     * Every other failure is reported as for @ref ovphysx_commit_group.
+     */
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_commit_group_masked(ovphysx_instance_handle_t handle,
+                                                             ovphysx_write_handle_t write,
+                                                             const ovstage_map_group_t* group,
+                                                             const DLTensor* row_mask,
+                                                             ovstage_cuda_sync_t write_done_sync);
+
+    /**
+     * @brief Release a write session, discarding anything uncommitted.
+     *
+     * Uncommitted groups are discarded. Finish all external CPU and CUDA work that
+     * fills those groups before submitting release: this call takes no producer
+     * completion token. Committed groups are not rolled back; the SDK waits for its
+     * own device work before reclaiming their storage. For a commit captured into a
+     * CUDA graph, that covers the replays launched before the release: never replay
+     * such a graph after its session is released. Once release is accepted,
+     * all session borrows end and cleanup belongs to the SDK, including after failure.
+     *
+     * @param handle ovphysx instance handle.
+     * @param write Write-session handle from @ref ovphysx_write.
+     * @return Task receipt. Accepted and run as for @ref ovphysx_release_read; a
+     *         session that a detach closed, or whose producer failed, is released too.
+     *         An absent or released handle is a successful no-op for a valid instance; a handle of
+     *         another instance is rejected with OVPHYSX_API_NOT_FOUND. Wait to observe
+     *         cleanup failures; do not retry accepted releases.
+     */
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_release_write(ovphysx_instance_handle_t handle,
+                                                       ovphysx_write_handle_t write);
+
+    /**
+     * @brief Ask whether an attribute can be written on an object type, and how.
+     *
+     * The programmatic answer to a question that is otherwise only documented in prose,
+     * keyed on the SAME (object type, attribute) the write path takes (@ref ovphysx_write
+     * resolves the object type through its query and names the attribute). This reports the
+     * API's supported read/write vocabulary. Its scene-independent classification
+     * table is maintained separately and tested against runtime session admission.
+     *
+     * Scene-independent: writability is a property of the write API, not of any live scene,
+     * so this needs no instance, query or step. A name the object type does not accept comes
+     * back OVPHYSX_WRITABILITY_UNCLASSIFIED, and @ref ovphysx_write rejects it. Such a name
+     * is a gap to close, never an invitation to try the write anyway.
+     *
+     * @param object_type Object type the attribute would be written on (@ref ovphysx_query's
+     *   selector), e.g. OVPHYSX_QUERY_TARGET_RIGID_BODY.
+     * @param attribute Attribute name (see the OVPHYSX_ATTR_* macros in
+     *   ovphysx_attributes.h), as the string field of an
+     *   `ovx_token_or_string_t`. STRING-ONLY: an interned-token-only key is rejected, because
+     *   resolving a token needs a path dictionary this scene-free query does not have.
+     * @param out_writability [out] Receives the classification.
+     * @return ovphysx_result_t.
+     *
+     * @par Errors
+     * - OVPHYSX_API_INVALID_ARGUMENT if out_writability or attribute is null, if attribute
+     *   carries no string name (a token-only key), or if object_type is outside
+     *   @ref ovphysx_query_target_t (so an unknown type is distinguishable from a valid type
+     *   that does not accept the name, which returns OVPHYSX_WRITABILITY_UNCLASSIFIED)
+     */
+    OVPHYSX_API ovphysx_result_t ovphysx_writability(ovphysx_query_target_t object_type,
+                                                     const ovx_token_or_string_t* attribute,
+                                                     ovphysx_writability_t* out_writability);
+
+    /**
+     * @brief Release an output query.
+     *
+     * Release it outside any CUDA graph capture: it frees the device columns the query
+     * keeps, after a host wait for their last use.
+     *
+     * @param handle ovphysx instance handle.
+     * @param query Query handle from @ref ovphysx_query.
+     * @return Task receipt. Accepted and run as for @ref ovphysx_release_read; a
+     *         read or write submitted after the release that names the query is
+     *         rejected. An absent or released handle is a successful no-op for a valid
+     *         instance, and so is one whose producer failed; a handle of another
+     *         instance is rejected with OVPHYSX_API_NOT_FOUND. Wait to observe cleanup
+     *         failures; do not retry accepted releases.
+     */
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_release_query(ovphysx_instance_handle_t handle,
                                                        ovphysx_query_handle_t query);
 
     /**
     * @brief Clone the subtree under the source path to one or more target paths in the
     * internal physics representation (USD untouched).
     * The source path must exist in the stage.
-    * The target paths must not already exist in the stage.
+    * The target paths must not already have runtime physics objects.
     *
-    * Clones are created in the internal representation only (USD file will not be modified)
+    * Clones are created in the internal representation only (the USD file is not modified)
     * and immediately participate in physics simulation. Backed by the PhysX SDK replicator, so
     * cloned articulations are real articulations. Optimized for RL mass replication (1000s of
     * instances). This is the clone entrypoint for both standalone callers and callers using an
     * ovstage Stage (@ref ovphysx_attach_ovstage).
+    * If other consumers need stage copies too, complete the attach first, then
+    * call ovstage_clone() separately for the same source and targets.
+    * Use a dedicated ordinal, seal it, and exclude it from every
+    * @ref ovphysx_update_from_ovstage range. Forwarding
+    * that ordinal can ingest the copied physics data as new scene objects;
+    * it does not invoke the PhysX replicator.
     *
     * @note Cross-environment collision isolation uses PhysX environment ids under GPU dynamics +
     *       GPU broadphase, controlled by `/ovphysx/clone/useEnvIds` (default on, per-process). The
-    *       source holds env id 0 and clones get 1..N, so co-located clones (NULL parent_transforms)
-    *       are isolated from the source too. USD collision groups/filtering authored before cloning
-    *       still work for finer control. Pass `env_ids` when one logical environment is assembled
-    *       from several clone calls, so its objects share an id.
+    *       source holds env id 0 and clones get positive ids, so co-located clones (NULL anchor_transforms)
+    *       are isolated from the source too. Environment ids do not isolate clones in CPU mode:
+    *       co-located CPU clones share one collision space, so use spatially disjoint
+    *       anchor_transforms. The runtime emits a warning through the Carbonite log stream when
+    *       env ids are requested but GPU dynamics or GPU broadphase is unavailable. Register
+    *       ovphysx_set_log_callback() to receive it programmatically. USD collision
+    *       groups/filtering authored before cloning still work for finer control. Pass `env_ids`
+    *       when one logical environment is assembled from several clone calls, so its objects
+    *       share an id.
     *
     * @param handle PhysX instance handle
     * @param source_path_in_usd Path to the source subtree to clone (must exist)
-    * @param target_paths Array of target paths to clone to (must not exist)
+    * @param target_paths Array of target paths with no existing runtime physics objects
     * @param num_target_paths Number of target paths to clone to
-    * @param parent_transforms World pose of each copy's parent. Flat [num_target_paths x 7]
-    *        floats: (px, py, pz, qx, qy, qz, qw), quaternion imaginary-first
-    *        (OVPHYSX_TENSOR_RIGID_BODY_POSE_F32, identity = (0,0,0,1)). Each body keeps its pose
-    *        relative to the source's parent (world = parent_transforms[i] *
-    *        inverse(source_parent) * source_body). Pass NULL to co-locate every copy on the source.
+    * @param anchor_transforms Absolute world pose of each target subtree root. Entry i anchors
+    *        the exact subtree at target_paths[i]. Flat [num_target_paths x 7] floats:
+    *        (px, py, pz, qx, qy, qz, qw), quaternion
+    *        imaginary-first (OVPHYSX_TENSOR_RIGID_BODY_POSE_F32, identity = (0,0,0,1)).
+    *        Descendants keep their poses relative to the source subtree root
+    *        (target_object_world = anchor_transforms[i] * inverse(source_root_world) *
+    *        source_object_world). Pass NULL to co-locate every copy on the source. Co-location is
+    *        collision-isolated only under GPU dynamics + GPU broadphase. Use spatially disjoint
+    *        transforms in CPU mode.
     * @param env_ids Optional logical environment id per target ([num_target_paths] uint32).
     *        Stable across calls: a shared id maps to one runtime environment (clones sharing it
     *        collide, isolated from others). Ids must be < 0x00FFFFFF (runtime id is env_ids[i] + 1).
-    *        Pass NULL for automatic per-call numbering.
+    *        Pass NULL for automatic numbering from a per-attachment base. A later explicit
+    *        id can reuse an earlier automatic id without warning or error: on a fresh
+    *        attachment with env-id filtering active, one automatic target gets runtime id 1
+    *        and a later explicit id 0 also maps to 1. Reversing the calls gives the automatic
+    *        target id 2 instead. Choose one ID strategy for an attachment; use explicit ids
+    *        consistently when controlling grouping across calls.
     *
-    * @return ovphysx_enqueue_result_t with status and operation index for the clone. On failure,
+    * @return Admission status and task identity. Rejection has zero identity;
+    * accepted execution failure is reported by a wait. On rejection,
     *         call ovphysx_get_last_error() on the same thread for the error message.
     *
-    * @note Replication executes inline. On success, the returned operation index is already
-    *       complete; ovphysx_wait_op() remains valid and returns immediately.
+    * @note The call queues the replication as a job on the instance's worker thread
+    *       and returns without running it or waiting for it; the worker runs it after
+    *       every earlier job, and may even finish it before the call returns. An
+    *       instance without a worker thread (see
+    *       OVPHYSX_GLOBAL_CONFIG_ASYNC_EXECUTION) runs it on the calling thread
+    *       before the call returns. Collect its outcome with ovphysx_wait_task() or
+    *       ovphysx_wait_all().
     *
-    * @pre handle must be valid; an ovstage source is attached via @ref ovphysx_attach_ovstage.
-    * @pre source_path_in_usd must exist; target_paths must be valid, unique, and disjoint --
-    *      a target that reuses, contains, or is contained by another target or an earlier
-    *      clone's target on this attach is rejected (it would create duplicate actors).
-    * @pre Must be called **before** the first ovphysx_step() / ovphysx_step_sync() /
-    *      ovphysx_step_n_sync() call. Violating this is rejected with
-    *      OVPHYSX_API_INVALID_ARGUMENT in both CPU and GPU mode.
-    * @pre Must also be called **before** warmup_gpu(), but this precondition is
-    *      currently GPU-only: in hard CPU mode warmup_gpu() is a no-op, so
-    *      clone-after-warmup still succeeds on CPU today. Cloning after GPU
-    *      warmup reallocates GPU buffers and would corrupt already-initialised
-    *      state, hence the rejection on GPU.
-    * @post Cloned physics objects are live when this call returns successfully.
+    * @pre handle must be valid.
+    * @pre source_path_in_usd must exist and target_paths must be valid and unique.
+    * @pre Must be called **before** ovphysx_warmup() or the first simulation step,
+    *      in submission order. Multiple ovphysx_clone() calls per attach are allowed
+    *      in CPU and GPU mode while all of them precede warmup / first step. To clone
+    *      after that point, use ovphysx_detach_ovstage() and reattach the source stage
+    *      first. On GPU, cloning later would reallocate DirectGPU buffers and corrupt
+    *      initialized state.
+    * @post Cloned physics objects are live when the accepted task succeeds.
     *
     * @par Side Effects
     * Adds live PhysX objects keyed by each target path. No USD or runtime-stage prims are authored.
     *
     * @par Ownership
-    * The target_paths array is read during the call; caller retains ownership.
+    * The call copies source_path_in_usd, the target_paths array and its strings,
+    * anchor_transforms and env_ids before it returns. The caller retains ownership
+    * and may free or overwrite them as soon as the call returns.
     *
     * @par Errors
-    * - OVPHYSX_API_INVALID_ARGUMENT for invalid or duplicate targets, or a call
-    *   after GPU warmup / the first step
-    * - OVPHYSX_API_ERROR if no ovstage is attached or the clone fails
+    * Rejected at submission, with zero identity and nothing queued:
+    * - OVPHYSX_API_INVALID_ARGUMENT for invalid arguments: an empty source, a null
+    *   or empty target list, an empty target, an embedded NUL, a target equal to
+    *   the source or repeated in the call, or an env id out of range
+    * - OVPHYSX_API_NOT_FOUND for an invalid handle
+    * - OVPHYSX_API_ERROR if the runtime clone interface is unavailable
+    * - OVPHYSX_API_INVALID_STATE inside a log, runtime or object-change callback,
+    *   or when the instance's worker is stopped or its queue is full
+    *
+    * Reported by the task wait: no attached ovstage, a call after warmup / the first
+    * step, a target already cloned on this attach, and clone failures such as a
+    * missing source or an occupied target.
     *
     * @code
     * #include <ovphysx/ovphysx.h>
     *
-    * static ovphysx_enqueue_result_t clone_two_environments(ovphysx_handle_t handle)
+    * static ovphysx_enqueue_result_t clone_two_environments(ovphysx_instance_handle_t handle)
     * {
     *     ovphysx_string_t targets[2] = {
     *         ovphysx_cstr("/World/env1"),
@@ -876,11 +2063,11 @@ extern "C" {
     * @endcode
     */
     OVPHYSX_API ovphysx_enqueue_result_t ovphysx_clone(
-        ovphysx_handle_t handle,
+        ovphysx_instance_handle_t handle,
         ovphysx_string_t source_path_in_usd,
         ovphysx_string_t* target_paths,
         uint32_t num_target_paths,
-        const float* parent_transforms,
+        const float* anchor_transforms,
         const uint32_t* env_ids
     );
 
@@ -893,1111 +2080,194 @@ extern "C" {
     /** @addtogroup ovphysx_simulation */
     /** @{ */
 
-    /*
+    /**
     * Enqueue an asynchronous physics simulation step.
-    * The simulation time is tracked internally; each step advances it by step_dt.
+    * The instance's worker thread runs the whole step after every earlier job: it
+    * simulates and fetches the results, so the step completes without a wait, and its
+    * pre-step and post-step events and callbacks run on the worker, or on a thread
+    * that waits for the step without a deadline before the worker started it (see
+    * ovphysx_wait_task()), which then runs it itself. The call runs no part of the
+    * step and normally does not wait for earlier work or for the step; the worker may even
+    * finish the step before the call returns. An instance without a worker thread
+    * (see OVPHYSX_GLOBAL_CONFIG_ASYNC_EXECUTION) runs the whole step, callbacks
+    * included, on the calling thread before the call returns. Collect its outcome with
+    * ovphysx_wait_task() or ovphysx_wait_all().
+    * The simulation time is tracked internally. Each step advances it by step_dt.
+    * The timestep is passed through without clamping or substepping. The caller
+    * is responsible for choosing a timestep appropriate for the simulation.
+    * A buffered OmniPVD receiver request first waits for earlier work on every
+    * instance, without collecting outcomes, and applies selection before this
+    * step is submitted. Empty control polls do not wait for queued work.
     * @param handle ovphysx instance
-    * @param step_dt Simulation timestep in seconds
-    * @return ovphysx_enqueue_result_t with status, error, and operation index
+    * @param step_dt Finite, nonnegative simulation timestep in seconds
+    * @return ovphysx_enqueue_result_t with admission status and instance/task identity
     *
     * @pre handle must be a valid instance handle.
     * @post Simulation advances by step_dt when the op completes.
     *
     * @par Side Effects
-    * Mutates physics state; may trigger internal events and callbacks.
+    * Mutates physics state and may trigger internal events and callbacks.
     *
     * @par Threading
     * Must not be called concurrently on the same instance without external synchronization.
     *
     * @par Errors
     * - OVPHYSX_API_INVALID_ARGUMENT for invalid inputs
-    * - OVPHYSX_API_ERROR for internal failures
+    * - OVPHYSX_API_ERROR for an invalid handle or internal failures
+    * - OVPHYSX_API_INVALID_STATE inside a log, runtime or object-change callback,
+    *   or when the instance's worker is stopped or its queue is full
     *
-    * @code
-    * ovphysx_enqueue_result_t r = ovphysx_step(handle, 1.0f / 60.0f);
-    * @endcode
+    * Failures during execution are reported by the task wait: an instance without
+    * an attached Stage when the step runs ("No stage attached"; an attach submitted
+    * earlier counts, so attach then step needs no wait in between), PhysX
+    * CUDA-context failures, with a retained CUDA diagnostic even when logging is
+    * disabled, and a simulation time that would overflow.
+    *
+     * @code{.c}
+     * #include <ovphysx/ovphysx.h>
+     *
+     * static ovphysx_enqueue_result_t step_one_frame(ovphysx_instance_handle_t handle)
+     * {
+     *     return ovphysx_step(handle, 1.0f / 60.0f);
+     * }
+     * @endcode
     */
-    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_step(ovphysx_handle_t handle,
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_step(ovphysx_instance_handle_t handle,
                                                               float step_dt);
 
     /**
      * @brief Synchronous step: simulate one physics timestep and wait for
      * completion in a single call.
      *
-     * Functionally equivalent to ovphysx_step() followed by ovphysx_wait_op()
-     * on the returned operation index, but bypasses the async event machinery
-     * entirely (mutex acquisitions, operation map insert/lookup/cleanup).
-     * This is a measurable performance improvement for the common synchronous
-     * use case: in IsaacLab RL training at 4096 environments, step_sync saves
-     * ~0.2 ms per substep compared to step() + wait_op(), recovering roughly
-     * 5-6% of total throughput.
+     * This step does not create a task receipt. Earlier asynchronous work is
+     * completed first, without collecting its outcomes. Those receipts remain
+     * available to ovphysx_wait_task() or ovphysx_wait_all().
+     * Buffered OmniPVD receiver requests use the shared safe point before this
+     * call takes its instance lane; earlier task outcomes remain uncollected.
      *
-     * Use this whenever you step and immediately wait for results (i.e. you do
-     * not overlap GPU simulation with CPU work between dispatch and fetch).
+     * Use this whenever the caller steps and immediately waits for results,
+     * that is, does not overlap GPU simulation with CPU work between dispatch
+     * and fetch.
      *
-     * The simulation time is tracked internally; each step advances it by
+     * The simulation time is tracked internally. Each step advances it by
      * step_dt.
      *
      * @param handle  Physics instance handle.
-     * @param step_dt  Timestep [s].
+     * @param step_dt  Finite, nonnegative timestep [s], passed through as in ovphysx_step().
      * @return ovphysx_result_t with OVPHYSX_API_SUCCESS on success.
+     * A PhysX CUDA-context error returns OVPHYSX_API_ERROR; retrieve its
+     * diagnostic with ovphysx_get_last_error(), even when logging is disabled.
+     * A recoverable capacity-overflow report alone does not fail the call.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_step_sync(ovphysx_handle_t handle,
+    OVPHYSX_API ovphysx_result_t ovphysx_step_sync(ovphysx_instance_handle_t handle,
                                                             float step_dt);
 
     /**
-     * Run n_steps consecutive physics steps in a single C call.
-     * Step i is executed with duration step_dt at the internally-tracked
-     * simulation time + i * step_dt.  This saves (n_steps-1) ctypes
-     * round-trips for workloads that use decimation (one RL step =
-     * multiple physics steps).  The internal counter advances by
-     * n_steps * step_dt.
+     * Explicitly run the warmup step (optional, synchronous).
      *
-     * @param handle       Physics instance handle.
-     * @param n_steps      Number of steps to run (must be > 0).
-     * @param step_dt      Duration of each step [s].
-     * @return ovphysx_result_t with OVPHYSX_API_SUCCESS on success.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_step_n_sync(ovphysx_handle_t handle,
-                                                              int32_t n_steps,
-                                                              float step_dt);
-
-    /**
-     * Recompute articulation link transforms from the current articulation
-     * generalized coordinates without running a normal simulation step.
+     * On first use, a real simulation step with a minimal timestep (~1ns) is run to
+     * initialize PhysX structures and disable per-step Fabric sync overhead. This is
+     * done automatically by legacy tensor-binding reads (auto-warmup). Session
+     * reads through ovphysx_read() do not auto-warm; call this explicitly to control
+     * when the latency occurs.
      *
-     * This is a synchronous kinematic forward-kinematics update. It is useful
-     * after writing articulation DOF positions through TensorBindingsAPI and
-     * before reading link pose tensors in the same frame.
+     * Works in both CPU and GPU mode. In GPU mode, this also populates DirectGPU buffers.
      *
-     * GPU MODE WARNING: On the first GPU kinematic update after loading USD, an
-     * automatic warmup simulation step may be performed to initialize PhysX
-     * DirectGPU buffers. See @ref ovphysx_gpu_tensor_auto_warmup_note
-     * "GPU tensor auto-warmup note".
+     * IMPORTANT: The warmup advances simulation state (positions may change
+     * infinitesimally). It is NOT a "dry run". For deterministic initial conditions,
+     * call this before reading initial tensor state.
      *
-     * Once GPU warmup is complete, the FK refresh itself does not run collision
-     * detection, integration, solver work, or contact generation.
+     * This function is idempotent. Calling it multiple times has no effect after
+     * the first successful call (per stage). Warmup state resets when the stage
+     * changes through detach and attach.
      *
-     * @param handle Physics instance handle.
-     * @return ovphysx_result_t with OVPHYSX_API_SUCCESS on success.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_update_articulations_kinematic(ovphysx_handle_t handle);
-
-    /** @} */
-
-
-    /*--------------------------------------------------*/
-    /* Tensor Binding API                                */
-    /*--------------------------------------------------*/
-
-    /** @addtogroup ovphysx_tensor_binding */
-    /** @{ */
-
-    /*
-     * The Tensor Binding API provides efficient bulk access to physics simulation data.
-     * It maps physics-object path patterns to typed tensor views, including authored USD objects
-     * and runtime-only clones. This enables same-device zero-copy data exchange and transparent
-     * cross-device staging with tensors (PyTorch, NumPy, etc.) via DLPack.
-     * 
-     * DLPack compatibility:
-     *   We vendor the official DLPack header (see dlpack/dlpack.h from github.com/dmlc/dlpack).
-     *   When constructing DLTensor structs for read/write calls:
-     *   - strides may be NULL to indicate C-contiguous layout, OR
-     *     you may set explicit C-contiguous strides. Both are accepted.
-     *   - Non-contiguous tensors (e.g. transposed views, sliced views with gaps) are
-     *     NOT supported and will be rejected. You can fix this by e.g. calling .contiguous()
-     *     on PyTorch tensors first.
-     *   - Supported dtypes: float32, int32, uint32, uint8, bool (kDLBool bits=8).
-     *   - Supported devices: kDLCPU, kDLCUDAHost, kDLCUDA, and kDLCUDAManaged.
-     *     CPU/CUDA device mismatches are handled by transparent staging when CUDA is available.
-     *
-     * Works in both GPU mode and CPU mode.
-     * Process-wide CPU-only mode (ovphysx_set_cpu_mode(true) or OVPHYSX_DISABLE_GPU is set)
-     * rejects kDLCUDA and kDLCUDAManaged tensors with OVPHYSX_API_DEVICE_MISMATCH
-     * before accessing CUDA. kDLCPU and kDLCUDAHost remain host-accessible.
-     * 
-     * GPU MODE NOTE: GPU tensor reads require at least one simulation step() after loading USD.
-     * This is a PhysX DirectGPU API requirement. Without a warmup step, reads may fail
-     * or return stale data. CPU mode does not have this requirement.
-     * 
-     * Typical workflow (GPU mode):
-     *   1. ovphysx_create_instance() (GPU is the default; call ovphysx_set_cpu_mode(true)
-     *      before creating any instance for process-wide CPU-only mode)
-     *   2. ovphysx_attach_ovstage() at the initial ordinal; use
-     *      ovphysx_update_from_ovstage() only for later authored ordinals
-     *   3. ovphysx_create_tensor_binding() for each tensor type needed
-     *   4. Optional: ovphysx_warmup_gpu() to control when GPU warmup happens
-     *      (otherwise it will happen automatically on first tensor read)
-     *   5. Main loop: read/write tensors, step, wait
-     * 
-     * Pattern matching:
-     *   Patterns use USD-style path glob syntax over realized physics objects:
-     *   - Exact path: "/World/robot" - matches one object
-     *   - Wildcard:   "/World/robot*" - matches robot1, robot2, robotArm, etc.
-     *   - Nested:     "/World/env[N]/robot" with [N] as wildcard - matches /World/env0/robot, etc.
-     */
-
-    /**
-     * Create a tensor binding for bulk data access (synchronous).
-     * 
-     * A tensor binding connects a physics-object path pattern (e.g., "/World/robot*") to a
-     * tensor type (e.g., OVPHYSX_TENSOR_RIGID_BODY_POSE_F32), enabling efficient
-     * bulk read/write of physics data for all matching objects. Runtime-only clone
-     * paths are eligible even when no USD prim is authored at the path.
-     * 
-     * If the pattern matches zero physics objects, the binding is still created successfully
-     * with element_count = 0. This lets callers treat optional scene content as
-     * an empty current result instead of an error. Empty bindings do not update
-     * when matching physics objects are added or recreated; destroy the old binding and
-     * create a new one after topology changes.
-     *
-     * Binding lifetime is tied to the currently realized physics objects. The
-     * application owns the stage lifecycle: if it will call ovphysx_reset_stage(),
-     * remove USD data containing bound objects, or otherwise replace/reparse the
-     * stage so those objects are destroyed and recreated, cached bindings should
-     * be destroyed before the lifecycle operation when practical. If a stale
-     * binding survives, only destroy it; do not read or write through it. Create
-     * replacement bindings after the operation completes. ovphysx_step(),
-     * ovphysx_step_sync(), and ovphysx_step_n_sync() do not invalidate bindings.
-     * 
-     * @param handle Instance handle
-     * @param desc Binding descriptor with pattern and tensor_type
-     * @param out_binding_handle [out] Binding handle on success
-     * @return ovphysx_result_t (synchronous - completes before returning)
-     *
-     * @pre handle, desc, and out_binding_handle must be valid.
-     * @post Binding handle owns native resources until explicitly destroyed via
-     *       ovphysx_destroy_tensor_binding(), or until the parent instance is
-     *       destroyed. Stage reset or bound-object removal invalidates the
-     *       underlying TensorAPI view; destroy stale bindings and create
-     *       replacements after the lifecycle operation completes.
-     *
-     * @par Diagnostics
-     * Pattern bindings quiet expected TensorAPI no-match diagnostics on the
-     * simulation view used to create that binding. Explicit prim_paths keep the
-     * default error-level no-match diagnostics for typo detection. For
-     * programmatic partial-miss checks with explicit prim_paths, compare the
-     * requested paths with ovphysx_tensor_binding_get_prim_paths().
-     *
-     * @par Threading
-     * Do not create bindings concurrently with stage mutation.
-     *
-     * @par Side Effects
-     * Allocates internal binding resources.
-     *
-     * @par Errors
-     * - OVPHYSX_API_INVALID_ARGUMENT for invalid inputs
-     * - OVPHYSX_API_ERROR for internal failures
-     *
-     * @code
-     * #include <ovphysx/ovphysx.h>
-     *
-     * static ovphysx_result_t create_pose_binding(
-     *     ovphysx_handle_t handle,
-     *     ovphysx_tensor_binding_handle_t* out_binding)
-     * {
-     *     ovphysx_tensor_binding_desc_t desc = {
-     *         .pattern = OVPHYSX_LITERAL("/World/robot*"),
-     *         .tensor_type = OVPHYSX_TENSOR_RIGID_BODY_POSE_F32,
-     *     };
-     *     return ovphysx_create_tensor_binding(handle, &desc, out_binding);
-     * }
-     * @endcode
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_create_tensor_binding(
-        ovphysx_handle_t handle,
-        const ovphysx_tensor_binding_desc_t* desc,
-        ovphysx_tensor_binding_handle_t* out_binding_handle);
-
-    /**
-     * Destroy a tensor binding and release associated resources (synchronous).
-     * 
-     * @param handle Instance handle
-     * @param binding_handle Binding to destroy
-     * @return ovphysx_result_t
-     *
-     * @pre handle and binding_handle must be valid.
-     * @post Binding handle is invalid after call.
-     *
-     * @par Side Effects
-     * Releases internal resources.
-     *
-     * @par Errors
-     * - OVPHYSX_API_NOT_FOUND if binding handle is unknown
-     * - OVPHYSX_API_ERROR for internal failures
-     *
-     * @code
-     * ovphysx_destroy_tensor_binding(handle, binding);
-     * @endcode
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_destroy_tensor_binding(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle);
-
-    /**
-     * Get complete tensor specification for a binding (preferred).
-     * 
-     * Returns dtype, ndim, and shape needed to allocate a compatible DLTensor.
-     * This is the preferred API for constructing DLTensors correctly.
-     * 
-     * NOTE: ovphysx_tensor_spec_t stores shape in a fixed-size int64[4] for a stable C ABI.
-     * Only the first ndim entries are meaningful; the remaining entries are always set to 0.
-     *
-     * See ovphysx_tensor_type_t documentation for shapes, dtype, and layouts per tensor type.
-     * Layout is always row-major contiguous (C-order). Most bindings are float32;
-     * OVPHYSX_TENSOR_DEFORMABLE_SIM_ELEMENT_INDICES_S32 is int32.
-     * 
-     * @param handle Instance handle
-     * @param binding_handle Tensor binding
-     * @param out_spec [out] Full tensor specification
-     * @return ovphysx_result_t
-     *
-     * @pre handle, binding_handle, and out_spec must be valid.
-     * @post out_spec is populated with dtype/shape for the binding.
-     *
-     * @par Side Effects
-     * None.
-     *
-     * @par Errors
-     * - OVPHYSX_API_NOT_FOUND if binding handle is unknown
-     * - OVPHYSX_API_ERROR for internal failures
-     *
-     * @code
-     * ovphysx_tensor_spec_t spec;
-     * ovphysx_get_tensor_binding_spec(handle, binding, &spec);
-     * @endcode
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_get_tensor_binding_spec(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        ovphysx_tensor_spec_t* out_spec);
-
-    /**
-     * @anchor ovphysx_gpu_tensor_auto_warmup_note
-     * @par GPU tensor auto-warmup note
-     * In GPU mode, the first tensor read or write after loading USD may perform an
-     * automatic warmup simulation step to initialize PhysX DirectGPU buffers.
-     *
-     * The warmup is a real physics step that advances simulation time by a minimal
-     * timestep (~1ns). Physics state may change infinitesimally; this is not a dry run.
-     *
-     * For deterministic behavior, explicitly control warmup timing by loading USD,
-     * waiting for completion, then calling ovphysx_warmup_gpu() before the first
-     * tensor read or write. If you want the first observed state change to happen
-     * under your chosen timestep instead, call ovphysx_step() explicitly with that dt.
-     *
-     * Because warmup is a real simulation step, a true "pre-warmup" GPU tensor state
-     * cannot be observed. Calling ovphysx_warmup_gpu() explicitly only makes the timing
-     * of that unavoidable step predictable.
-     */
-
-    /**
-     * Read data from simulation into a user-provided DLTensor (synchronous).
-     * 
-     * GPU MODE WARNING: On the first GPU tensor read after loading USD, an automatic
-     * warmup simulation step may be performed to initialize PhysX DirectGPU buffers.
-     * See @ref ovphysx_gpu_tensor_auto_warmup_note "GPU tensor auto-warmup note".
-     * 
-     * DLTensor requirements:
-     *   - MUST be pre-allocated with correct shape (use ovphysx_get_tensor_binding_spec())
-     *   - dtype must match ovphysx_get_tensor_binding_spec()
-     *   - device must be supported; CPU/CUDA mismatches are staged when CUDA is available,
-     *     while cross-GPU ordinal mismatches and CUDA tensors in process-wide CPU-only mode
-     *     return OVPHYSX_API_DEVICE_MISMATCH
-     *   - layout must be contiguous row-major (C-order)
-     * 
-     * This is a blocking call that completes before returning.
-     * 
-     * @param handle Instance handle
-     * @param binding_handle Tensor binding
-     * @param dst_tensor Pre-allocated DLTensor with shape from ovphysx_get_tensor_binding_spec()
-     * @return ovphysx_result_t
-     *
-     * @pre handle and binding_handle must be valid.
-     * @pre dst_tensor must be pre-allocated, match the spec's dtype/shape, and use a supported device.
-     * @post dst_tensor is filled with simulation data on success.
-     *
-     * @par Side Effects
-     * May trigger GPU warmup on first read in GPU mode.
-     *
-     * @par Ownership
-     * Caller owns dst_tensor memory.
-     *
-     * @par Errors
-     * - OVPHYSX_API_DEVICE_MISMATCH if tensor device is incompatible
-     * - OVPHYSX_API_INVALID_ARGUMENT for invalid inputs
-     * - OVPHYSX_API_NOT_FOUND if the binding is unknown or was invalidated by a stage change
-     * - OVPHYSX_API_ERROR for internal failures
-     *
-     * @code
-     * ovphysx_read_tensor_binding(handle, binding, &tensor);
-     * @endcode
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_read_tensor_binding(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        DLTensor* dst_tensor);
-
-    /**
-     * Explicitly initialize GPU buffers (optional, synchronous).
-     * 
-     * In GPU mode, PhysX DirectGPU buffers need one simulation step to initialize.
-     * This is normally done automatically on the first tensor read (auto-warmup).
-     * 
-     * IMPORTANT: The warmup performs a real physics simulation step with a minimal
-     * timestep (~1ns). While the effect is negligible, this means:
-     *   - Simulation state is advanced (positions may change infinitesimally)
-     *   - This is NOT a "dry run" - it mutates physics state
-     *   - For deterministic initial conditions, call this before reading initial state
-     * 
-     * Call this function explicitly if you want to:
-     *   - Control exactly when the warmup latency occurs
-     *   - Avoid a latency spike on the first tensor read
-     *   - Verify GPU initialization succeeded before starting your main loop
-     *   - Ensure deterministic behavior by controlling when state mutation happens
-     * 
-     * This function is idempotent - calling it multiple times has no effect after
-     * the first successful call (per stage). In CPU mode, this is a no-op.
-     * 
-     * Note: Warmup state is reset when the stage changes (e.g., after
-     * ovphysx_reset_stage() or loading a new USD file). The next tensor read
-     * will trigger warmup again.
-     * 
      * @param handle Instance handle
      * @return ovphysx_result_t
      *
      * @pre handle must be valid.
-     * @post GPU warmup completed for the active stage (if in GPU mode).
+     * @post Warmup completed for the active stage.
      *
      * @par Side Effects
-     * Advances simulation by a minimal timestep in GPU mode.
+     * Advances simulation by a minimal timestep on first call. Disables per-step
+     * Fabric sync (enabling direct TensorAPI mode).
      *
      * @par Errors
-     * - OVPHYSX_API_GPU_NOT_AVAILABLE if GPU initialization fails
      * - OVPHYSX_API_ERROR for internal failures
      *
-     * @code
-     * ovphysx_warmup_gpu(handle);
-     * @endcode
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_warmup_gpu(ovphysx_handle_t handle);
-
-    /**
-     * Write data from a user-provided DLTensor into the simulation (synchronous).
-     * 
-     * Not all tensor types are writable:
-     * - RIGID_BODY_FORCE_F32, RIGID_BODY_WRENCH_F32, ARTICULATION_LINK_WRENCH_F32 are WRITE-ONLY
-     *   (external control inputs applied each step; reading them returns an error).
-     * - RIGID_BODY_ACCELERATION_F32, RIGID_BODY_INV_MASS_F32, RIGID_BODY_INV_INERTIA_F32
-     *   are READ-ONLY.
-     * - ARTICULATION_LINK_POSE_F32, ARTICULATION_LINK_VELOCITY_F32, ARTICULATION_LINK_ACCELERATION_F32
-     *   are READ-ONLY (no setter for individual link state).
-     * - Dynamics query tensors (JACOBIAN, MASS_MATRIX, CORIOLIS_AND_CENTRIFUGAL_FORCE, GRAVITY_FORCE,
-     *   LINK_INCOMING_JOINT_FORCE, DOF_PROJECTED_JOINT_FORCE, BODY_INV_MASS, BODY_INV_INERTIA)
-     *   are READ-ONLY.
-     * - DEFORMABLE_REST_NODAL_POSITION_F32 and DEFORMABLE_SIM_ELEMENT_INDICES_S32
-     *   are READ-ONLY.
-     * - DOF_ACTUATION_FORCE_F32 is read-write (not write-only).
-     * See ovphysx_tensor_type_t documentation for shapes, layouts, and read/write semantics.
-     *
-     * GPU MODE WARNING: On the first GPU tensor write after loading USD, an automatic
-     * warmup simulation step may be performed to initialize PhysX DirectGPU buffers.
-     * See @ref ovphysx_gpu_tensor_auto_warmup_note "GPU tensor auto-warmup note".
-     * 
-     * This is a blocking call that completes before returning.
-     * 
-     * @param handle Instance handle
-     * @param binding_handle Tensor binding
-     * @param src_tensor User tensor with data to write (must match ovphysx_get_tensor_binding_spec())
-     * @param index_tensor Optional int32[K] indices for subset write. NULL = write all.
-     *   - When index_tensor != NULL: src_tensor must still have full shape [N, ...] matching the binding spec.
-     *     Only the rows specified by index_tensor are written; other rows in src_tensor are ignored.
-     *   - Indices are 0-based into the first dimension N of the binding, and must satisfy 0 <= idx < N.
-     *   - K (index count) must satisfy K <= N.
-     * @return ovphysx_result_t
-     *
-     * @pre handle and binding_handle must be valid.
-     * @pre src_tensor must match the spec's dtype/shape and use a supported device. CPU/CUDA
-     *      mismatches are staged when CUDA is available; cross-GPU ordinal mismatches and CUDA
-     *      tensors in process-wide CPU-only mode return OVPHYSX_API_DEVICE_MISMATCH.
-     * @post Simulation state is updated with new values.
-     *
-     * @par Side Effects
-     * Writes control or state data into the simulation.
-     *
-     * @par Ownership
-     * Caller owns src_tensor and index_tensor memory.
-     *
-     * @par Errors
-     * - OVPHYSX_API_DEVICE_MISMATCH if tensor device is incompatible
-     * - OVPHYSX_API_INVALID_ARGUMENT for invalid inputs
-     * - OVPHYSX_API_NOT_FOUND if the binding is unknown or was invalidated by a stage change
-     * - OVPHYSX_API_ERROR for internal failures
-     *
-     * @code
-     * ovphysx_write_tensor_binding(handle, binding, &tensor, NULL);
-     * @endcode
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_write_tensor_binding(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        const DLTensor* src_tensor,
-        const DLTensor* index_tensor);
-
-    /**
-     * Write data from a user-provided DLTensor into the simulation using a binary mask (synchronous).
-     *
-     * Only elements where mask[i] != 0 are written; other elements are left unchanged.
-     * This is the mask-based alternative to indexed writes via ovphysx_write_tensor_binding.
-     *
-     * GPU MODE WARNING: On the first GPU tensor write after loading USD, an automatic
-     * warmup simulation step may be performed to initialize PhysX DirectGPU buffers.
-     * See @ref ovphysx_gpu_tensor_auto_warmup_note "GPU tensor auto-warmup note".
-     *
-     * @note There is intentionally no corresponding read_masked function. Reads always return
-     *   the full [N,...] tensor via ovphysx_read_tensor_binding(); callers that need a subset
-     *   can index the result on the host/device side. This write-only mask design matches
-     *   other reinforcement-learning physics APIs (e.g. Newton's selectionAPI) where masks
-     *   are used to selectively apply actions but observations are always returned in full.
-     *
-     * This is a blocking call that completes before returning.
-     *
-     * @param handle Instance handle
-     * @param binding_handle Tensor binding
-     * @param src_tensor User tensor with data to write. Must be full shape [N, ...] matching
-     *   the dtype and shape from ovphysx_get_tensor_binding_spec().
-     * @param mask_tensor Binary mask selecting which elements to update. Must be 1D with shape [N]
-     *   where N matches the binding's first dimension. Dtype must be bool (kDLBool, bits=8) or
-     *   uint8 (kDLUInt, bits=8).
-     * @return ovphysx_result_t
-     *
-     * @pre handle and binding_handle must be valid.
-     * @pre src_tensor must match the dtype/shape of the binding spec and use a supported device.
-     * @pre mask_tensor must be 1D uint8/bool with length N on a supported device. CPU/CUDA
-     *      mismatches are staged when CUDA is available; cross-GPU ordinal mismatches and CUDA
-     *      tensors in process-wide CPU-only mode return OVPHYSX_API_DEVICE_MISMATCH.
-     * @post Simulation state is updated for masked elements only.
-     *
-     * @par Side Effects
-     * Writes control or state data into the simulation for selected elements.
-     *
-     * @par Ownership
-     * Caller owns src_tensor and mask_tensor memory.
-     *
-     * @par Errors
-     * - OVPHYSX_API_DEVICE_MISMATCH if tensor device is incompatible
-     * - OVPHYSX_API_INVALID_ARGUMENT for invalid inputs
-     * - OVPHYSX_API_NOT_FOUND if the binding is unknown or was invalidated by a stage change
-     * - OVPHYSX_API_ERROR for internal failures
-     *
-     * @code
-     * ovphysx_write_tensor_binding_masked(handle, binding, &tensor, &mask);
-     * @endcode
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_write_tensor_binding_masked(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        const DLTensor* src_tensor,
-        const DLTensor* mask_tensor);
-
-    /** @} */
-
-    /*--------------------------------------------------*/
-    /* Articulation metadata queries                     */
-    /*--------------------------------------------------*/
-
-    /** @addtogroup ovphysx_tensor_binding */
-    /** @{ */
-
-    /**
-     * @brief Get all scalar topology metadata for an articulation binding in one call.
-     *
-     * Fills out_metadata with dof_count, body_count, joint_count, fixed_tendon_count,
-     * spatial_tendon_count, and is_fixed_base.  All values are stable for the binding
-     * lifetime; cache the result if calling more than once.
-     *
-     * **Homogeneous topology requirement**: all articulations covered by this binding
-     * must have the same topology (same dof_count, body_count, joint_count, etc.).
-     * This is a fundamental constraint of the native tensor backend -- tensor shapes are fixed at
-     * binding creation time.  If you need to work with articulations of different sizes
-     * (e.g. a 7-DOF arm and a 30-DOF humanoid), create a separate binding for each.
-     *
-     * For name arrays (DOF names, body names, joint names) use the corresponding
-     * ovphysx_articulation_get_*_names functions.
-     *
-     * @param handle          Instance handle
-     * @param binding_handle  Tensor binding (must be an articulation binding)
-     * @param out_metadata    [out] Caller-allocated struct to fill
-     * @return ovphysx_result_t
-     *
-     * @code
-     * ovphysx_articulation_metadata_t meta;
-     * ovphysx_get_articulation_metadata(handle, binding, &meta);
-     * printf("DOFs: %d  Links: %d\n", meta.dof_count, meta.body_count);
-     * @endcode
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_get_articulation_metadata(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        ovphysx_articulation_metadata_t* out_metadata);
-
-    /**
-     * @brief Get DOF names for the articulation.
-     *
-     * String pointers remain valid until the binding is destroyed.
-     *
-     * @param handle Instance handle
-     * @param binding_handle Tensor binding (must be an articulation binding)
-     * @param out_names [out] Array of ovphysx_string_t to fill
-     * @param max_names Capacity of out_names array; set to metadata.dof_count
-     *   (from ovphysx_get_articulation_metadata()) to receive all names.
-     * @param out_count [out] Actual number of names written
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_articulation_get_dof_names(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        ovphysx_string_t* out_names,
-        uint32_t max_names,
-        uint32_t* out_count);
-
-    /**
-     * @brief Get body (link) names for the articulation.
-     *
-     * String pointers remain valid until the binding is destroyed.
-     *
-     * @param handle Instance handle
-     * @param binding_handle Tensor binding (must be an articulation binding)
-     * @param out_names [out] Array of ovphysx_string_t to fill
-     * @param max_names Capacity of out_names array; set to metadata.body_count
-     *   (from ovphysx_get_articulation_metadata()) to receive all names.
-     * @param out_count [out] Actual number of names written
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_articulation_get_body_names(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        ovphysx_string_t* out_names,
-        uint32_t max_names,
-        uint32_t* out_count);
-
-    /**
-     * @brief Get joint names for the articulation.
-     *
-     * String pointers remain valid until the binding is destroyed.
-     *
-     * @param handle Instance handle
-     * @param binding_handle Tensor binding (must be an articulation binding)
-     * @param out_names [out] Array of ovphysx_string_t to fill
-     * @param max_names Capacity of out_names array; set to metadata.joint_count
-     *   (from ovphysx_get_articulation_metadata()) to receive all names.
-     * @param out_count [out] Actual number of names written
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_articulation_get_joint_names(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        ovphysx_string_t* out_names,
-        uint32_t max_names,
-        uint32_t* out_count);
-
-    /**
-     * @brief Get resolved physics-object paths for a tensor binding.
-     *
-     * The returned array order matches row order for every `RIGID_BODY_*`
-     * tensor read/write on the same binding. For `ARTICULATION_*` tensor
-     * bindings, the returned paths are articulation root object paths in the
-     * binding's first-dimension row order. ovphysx owns the returned string
-     * storage; string pointers remain valid until the binding is destroyed.
-     *
-     * @param handle Instance handle
-     * @param binding_handle Tensor binding
-     * @param out_paths [out] Array of ovphysx_string_t to fill
-     * @param max_paths Capacity of out_paths array; must be at least binding
-     *   count to receive all paths.
-     * @param out_count [out] Actual number of paths written
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_tensor_binding_get_prim_paths(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        ovphysx_string_t* out_paths,
-        uint32_t max_paths,
-        uint32_t* out_count);
-
-    /** @} */
-
-    /*--------------------------------------------------*/
-    /* Contact binding API                               */
-    /*--------------------------------------------------*/
-
-    /**
-     * @defgroup ovphysx_contact_binding Contact bindings
-     *
-     * Read-only APIs for querying **aggregate contact force tensors** between
-     * sensor and filter bodies. Returns DLPack tensors shaped `[S, 3]` (net
-     * forces) or `[S, F, 3]` (force matrix), suitable for RL rewards, safety
-     * limits, or force monitoring. GPU-compatible.
-     *
-     * For tensorized **per-contact-point geometry** (position, normal,
-     * separation, force, and friction), use ovphysx_read_contact_data() and
-     * ovphysx_read_friction_data(). Use ovphysx_get_contact_report() when you
-     * need event headers or raw actor-pair report records.
-     *
-     * A **sensor** is a set of rigid bodies identified by a physics-object path
-     * pattern that you pass to ovphysx_create_contact_binding(). A **filter**
-     * is a second set of bodies whose contacts with each sensor you want to
-     * measure. Both patterns can resolve authored USD objects and runtime-only
-     * clones.
-     *
-     * Contact reporting is opt-in: every authored USD prim matched by a sensor
-     * pattern must have `PhysxContactReportAPI` applied, on the prim named as the
-     * sensor itself (not a parent body or child collider).  A matched prim
-     * without the schema is dropped from the binding, and if that leaves no
-     * sensors the call fails.  Filter prims need no extra schema, and
-     * runtime-only clones inherit contact reporting from the source actor.
-     *
-     * **Lifecycle and read timing**
-     *
-     * A contact binding must be created *before* the first simulation step whose
-     * contacts you want to observe.  After creation it registers sensors inside
-     * the PhysX contact-report callback; no contact data exists until at least
-     * one `ovphysx_step()`, `ovphysx_step_sync()`, or `ovphysx_step_n_sync()`
-     * call has completed.
-     *
-     * - Call contact binding read functions *after* a stepping call completes.
-     * - Reads reflect the contacts accumulated during the **last completed
-     *   simulation step**.
-     * - Calling a read function before any simulation step returns all-zero
-     *   output tensors (no contacts have been reported yet).
-     * - The `dt` for impulse-to-force conversion (`force = impulse / dt`) is
-     *   automatically taken from the last successful `ovphysx_step()`,
-     *   `ovphysx_step_sync()`, or `ovphysx_step_n_sync()` call; you do not need
-     *   to pass it explicitly.
-     *
-     * **Why a separate binding type (not tensor binding)**
-     *
-     * Contact data has a fundamentally different shape and semantics from
-     * articulation/rigid-body tensors:
-     * - Shape is `[S, F, 3]` (sensor x filter x xyz), determined at binding
-     *   creation time for aggregate force matrices, plus flat detailed contact
-     *   buffers indexed by `[S, F]` count/start-index tensors.
-     * - Contact binding is read-only; there is no write path.
-     * - Internally it uses the PhysX contact-report callback rather than
-     *   DirectGPU buffers, so sharing a handle type with tensor binding would
-     *   misrepresent the lifetime and threading model.
-     */
-
-    /** @addtogroup ovphysx_contact_binding */
-    /** @{ */
-
-    /**
-     * @brief Create a contact binding for aggregate and detailed contact reads.
-     *
-     * @param handle Instance handle
-     * @param sensor_patterns Array of physics-object path patterns matching sensor bodies
-     * @param sensor_patterns_count Number of sensor patterns
-     * @param filter_patterns Flat array of filter object-path patterns. All sensors must
-     *   have the same number of filters. Total length = sensor_patterns_count * filters_per_sensor.
-     *   Pass NULL with filters_per_sensor=0 for unfiltered contacts.
-     * @param filters_per_sensor Number of filter patterns per sensor (same for all sensors)
-     * @param max_contact_data_count Maximum entries in raw or detailed
-     *   contact/friction flat-buffer reads. Set this to a positive value before
-     *   using ovphysx_read_contact_data(), ovphysx_read_friction_data(), or
-     *   ovphysx_read_raw_contact_data(). Filtered detailed reads also require
-     *   filters_per_sensor > 0. Aggregate net-force reads do not need detailed
-     *   contact capacity or filters.
-     * @param out_handle [out] Contact binding handle
-     * @return ovphysx_result_t
-     *
-     * @post Binding handle is valid until explicitly destroyed via ovphysx_destroy_contact_binding(),
-     *       or until the parent instance is destroyed.
-     *
-     * @code
+     * @code{.c}
      * #include <ovphysx/ovphysx.h>
      *
-     * static ovphysx_result_t create_filtered_contact_binding(
-     *     ovphysx_handle_t handle,
-     *     ovphysx_contact_binding_handle_t* out_binding)
+     * static ovphysx_result_t warm_up_instance(ovphysx_instance_handle_t handle)
      * {
-     *     ovphysx_string_t sensors[] = {
-     *         ovphysx_cstr("/World/robot_0/ee"),
-     *     };
-     *     ovphysx_string_t filters[] = {
-     *         ovphysx_cstr("/World/obstacles/box"),
-     *     };
-     *     return ovphysx_create_contact_binding(
-     *         handle, sensors, 1, filters, 1, 256, out_binding);
+     *     return ovphysx_warmup(handle);
      * }
      * @endcode
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_create_contact_binding(
-        ovphysx_handle_t handle,
-        const ovphysx_string_t* sensor_patterns,
-        uint32_t sensor_patterns_count,
-        const ovphysx_string_t* filter_patterns,
-        uint32_t filters_per_sensor,
-        uint32_t max_contact_data_count,
-        ovphysx_contact_binding_handle_t* out_handle);
+    OVPHYSX_API ovphysx_result_t ovphysx_warmup(ovphysx_instance_handle_t handle);
 
     /**
-     * @brief Destroy a contact binding.
+     * Recompute articulation link transforms and/or velocities for the whole
+     * articulations selected by a physics-output query, without running a normal
+     * simulation step. The query must select OVPHYSX_QUERY_TARGET_ARTICULATION. A query from
+     * @ref ovphysx_query_selection updates only the articulations its selection names,
+     * through their root, a link or a joint; every other articulation is left unchanged.
      *
-     * @param handle Instance handle
-     * @param contact_handle Contact binding to destroy
-     * @return ovphysx_result_t
+     * The update runs on the calling thread once earlier work on the instance has
+     * finished, and its task has finished when the call returns: successful task
+     * completion confirms the CPU update or the GPU submission. It is
+     * useful after writing articulation root or DOF state (through the session write
+     * API, @ref ovphysx_write, or the deprecated tensor bindings) and before reading link
+     * state in the same frame. The refresh does not run collision detection,
+     * integration, solver work or contact generation.
+     *
+     * On a DirectGPU scene the refresh is ordered on the device like a stream-ordered
+     * commit (see @ref ovphysx_commit_group): after everything queued on
+     * `cuda_sync.stream` and after `cuda_sync.wait_event`, with everything queued on
+     * `cuda_sync.stream` afterwards running after it, and no host wait. It can therefore
+     * be captured into a CUDA graph after the writes it follows -- a replayed root or
+     * joint state write needs it, since the step does not refresh what a replay wrote.
+     * A selected query must have refreshed once outside the capture, which uploads its
+     * articulation list. Refresh any root or joint state written outside the capture before
+     * beginning it: a captured refresh takes over the refresh those writes wait for, which
+     * only a launch of the graph runs. Reads of link state are ordered after the refresh by
+     * the engine.
+     * A DirectGPU scene that has not stepped is refused: like a write, the refresh never
+     * steps on the caller's behalf. A CPU scene refreshes on the host at once and is
+     * refused on a capturing stream. As for a commit, the legacy default stream --
+     * `stream` `1`, or a zero `stream` on a DirectGPU scene -- is refused while a blocking
+     * stream of its context is being captured, before anything is queued. A stream of
+     * another CUDA context than the scene's is waited for on the host instead, as for a
+     * commit, and refused the same way, since the refresh then runs on the scene's legacy
+     * default stream. On a driver older than CUDA 12.5, which capture needs, a refresh on a
+     * capturing stream is refused before anything is queued.
+     *
+     * @param handle Physics instance handle.
+     * @param query Live query owned by @p handle and selecting
+     *        OVPHYSX_QUERY_TARGET_ARTICULATION. Membership is evaluated when the task
+     *        executes.
+     * @param flags Bitwise OR of @ref ovphysx_articulation_kinematic_flag_t.
+     *        Zero is a successful no-op after validating the query.
+     *        Non-DirectGPU scenes honor the component mask. DirectGPU's native
+     *        refresh may update both components for either supported nonzero mask.
+     * @param cuda_sync The caller's stream and event the refresh is ordered after;
+     *        `{0, 0}` orders it on the legacy default stream.
+     * @return Task receipt. Rejected with no task: unsupported flags
+     *         (OVPHYSX_API_INVALID_ARGUMENT); a query that is unknown, released or of
+     *         another instance (OVPHYSX_API_NOT_FOUND); a query that does not select live
+     *         whole articulations (OVPHYSX_API_INVALID_ARGUMENT); a call inside a log,
+     *         runtime or object-change callback or on the instance's own worker thread
+     *         (OVPHYSX_API_INVALID_STATE). A query whose producer failed, a failed attach
+     *         or detach submitted before it, lazy attach, an unstepped DirectGPU scene and
+     *         backend failures are reported by waiting for the accepted task.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_destroy_contact_binding(
-        ovphysx_handle_t handle,
-        ovphysx_contact_binding_handle_t contact_handle);
-
-    /**
-     * @brief Query contact view dimensions.
-     *
-     * @param handle Instance handle
-     * @param contact_handle Contact binding
-     * @param out_sensor_count [out] Number of sensor bodies matched
-     * @param out_filter_count [out] Number of filter bodies per sensor
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_get_contact_binding_spec(
-        ovphysx_handle_t handle,
-        ovphysx_contact_binding_handle_t contact_handle,
-        int32_t* out_sensor_count,
-        int32_t* out_filter_count);
-
-    /**
-     * @brief Get resolved sensor physics-object paths for a contact binding.
-     *
-     * The returned array order matches row order for contact binding reads.
-     * ovphysx owns the returned string storage; string pointers remain valid
-     * until the binding is destroyed.
-     *
-     * @param handle Instance handle
-     * @param contact_handle Contact binding
-     * @param out_paths [out] Array of ovphysx_string_t to fill
-     * @param max_paths Capacity of out_paths array; must be at least
-     *   sensor_count to receive all sensor paths.
-     * @param out_count [out] Actual number of paths written
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_contact_binding_get_sensor_paths(
-        ovphysx_handle_t handle,
-        ovphysx_contact_binding_handle_t contact_handle,
-        ovphysx_string_t* out_paths,
-        uint32_t max_paths,
-        uint32_t* out_count);
-
-    /**
-     * @brief Get resolved filter physics-object paths for a contact binding.
-     *
-     * Paths are returned in row-major `[sensor, filter]` order with total
-     * count `sensor_count * filter_count`. ovphysx owns the returned string
-     * storage; string pointers remain valid until the binding is destroyed.
-     *
-     * @param handle Instance handle
-     * @param contact_handle Contact binding
-     * @param out_paths [out] Array of ovphysx_string_t to fill
-     * @param max_paths Capacity of out_paths array; must be at least
-     *   sensor_count * filter_count to receive all filter paths.
-     * @param out_count [out] Actual number of paths written
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_contact_binding_get_filter_paths(
-        ovphysx_handle_t handle,
-        ovphysx_contact_binding_handle_t contact_handle,
-        ovphysx_string_t* out_paths,
-        uint32_t max_paths,
-        uint32_t* out_count);
-
-    /**
-     * @brief Query raw and detailed contact/friction flat-buffer capacity.
-     *
-     * This is the C dimension for `ovphysx_read_contact_data()`,
-     * `ovphysx_read_friction_data()`, and `ovphysx_read_raw_contact_data()`
-     * flat buffers. Allocate force/separation buffers as `[C, 1]` and
-     * point/normal/friction buffers as `[C, 3]`. Filtered reads use `[S, F]`
-     * count/start-index buffers; raw reads use `[S]` count/start-index buffers
-     * and `[C]` actor IDs. `S` and `F` come from
-     * `ovphysx_get_contact_binding_spec()`.
-     *
-     * @param handle Instance handle
-     * @param contact_handle Contact binding
-     * @param out_max_contact_data_count [out] Raw or detailed contact/friction flat-buffer capacity
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_get_contact_binding_capacity(
-        ovphysx_handle_t handle,
-        ovphysx_contact_binding_handle_t contact_handle,
-        uint32_t* out_max_contact_data_count);
-
-    /**
-     * @brief Read net contact forces. dst shape: [S, 3] where S = sensor_count.
-     *
-     * The dt for impulse-to-force conversion is taken automatically from the
-     * last successful ovphysx_step(), ovphysx_step_sync(), or
-     * ovphysx_step_n_sync() call.
-     *
-     * @param handle Instance handle
-     * @param contact_handle Contact binding
-     * @param dst_tensor Pre-allocated DLTensor with shape [S, 3]
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_read_contact_net_forces(
-        ovphysx_handle_t handle,
-        ovphysx_contact_binding_handle_t contact_handle,
-        DLTensor* dst_tensor);
-
-    /**
-     * @brief Read contact force matrix. dst shape: [S, F, 3].
-     *
-     * The dt for impulse-to-force conversion is taken automatically from the
-     * last successful ovphysx_step(), ovphysx_step_sync(), or
-     * ovphysx_step_n_sync() call.
-     *
-     * @param handle Instance handle
-     * @param contact_handle Contact binding
-     * @param dst_tensor Pre-allocated DLTensor with shape [S, F, 3]
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_read_contact_force_matrix(
-        ovphysx_handle_t handle,
-        ovphysx_contact_binding_handle_t contact_handle,
-        DLTensor* dst_tensor);
-
-    /**
-     * @brief Read detailed contact data into flat buffers.
-     *
-     * Required shapes:
-     * - contact_force_tensor: `[C, 1]` float32
-     * - contact_point_tensor: `[C, 3]` float32
-     * - contact_normal_tensor: `[C, 3]` float32
-     * - contact_separation_tensor: `[C, 1]` float32
-     * - contact_count_tensor: `[S, F]` int32 or uint32
-     * - contact_start_indices_tensor: `[S, F]` int32 or uint32
-     *
-     * `C` is `ovphysx_get_contact_binding_capacity()`, `S` is sensor_count,
-     * and `F` is filter_count. For each `(sensor, filter)` pair, the valid
-     * detailed contact slice is:
-     * `start = start_indices[s, f]`, `count = counts[s, f]`,
-     * `data[start : start + count]`.
-     * `C` and `F` must be positive; pass a positive max_contact_data_count
-     * and filters_per_sensor > 0 when creating the binding. Count and
-     * start-index tensors may be int32 or uint32.
-     *
-     * If the required number of entries exceeds `C`, this function returns
-     * `OVPHYSX_API_BUFFER_TOO_SMALL`. The payload tensors must not be used,
-     * but the count and start-index tensors contain the full required layout.
-     * Set `max_contact_data_count` to the maximum element of
-     * `start_indices + counts` when recreating the binding for subsequent
-     * simulation steps. Recreating a binding does not recover the overflowing
-     * step's payload.
-     *
-     * Contact force magnitudes use the timestep from the last successful
-     * ovphysx_step(), ovphysx_step_sync(), or ovphysx_step_n_sync() call.
-     *
-     * @param handle Instance handle
-     * @param contact_handle Contact binding
-     * @param contact_force_tensor Pre-allocated contact normal force magnitudes
-     * @param contact_point_tensor Pre-allocated world-frame contact points
-     * @param contact_normal_tensor Pre-allocated world-frame contact normals
-     * @param contact_separation_tensor Pre-allocated contact separations
-     * @param contact_count_tensor Pre-allocated count matrix
-     * @param contact_start_indices_tensor Pre-allocated start-index matrix
-     * @return ovphysx_result_t. Returns `OVPHYSX_API_BUFFER_TOO_SMALL` when
-     *   `C` cannot hold all entries.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_read_contact_data(
-        ovphysx_handle_t handle,
-        ovphysx_contact_binding_handle_t contact_handle,
-        DLTensor* contact_force_tensor,
-        DLTensor* contact_point_tensor,
-        DLTensor* contact_normal_tensor,
-        DLTensor* contact_separation_tensor,
-        DLTensor* contact_count_tensor,
-        DLTensor* contact_start_indices_tensor);
-
-    /**
-     * @brief Read detailed friction data into flat buffers.
-     *
-     * Required shapes:
-     * - friction_force_tensor: `[C, 3]` float32
-     * - friction_point_tensor: `[C, 3]` float32
-     * - contact_count_tensor: `[S, F]` int32 or uint32
-     * - contact_start_indices_tensor: `[S, F]` int32 or uint32
-     *
-     * `C`, `S`, and `F` have the same meanings as in
-     * `ovphysx_read_contact_data()`. For each `(sensor, filter)` pair, use the
-     * count/start-index tensors to index valid entries in the flat friction
-     * buffers. `C` and `F` must be positive; pass a positive
-     * max_contact_data_count and filters_per_sensor > 0 when creating the
-     * binding. Count and start-index tensors may be int32 or uint32.
-     *
-     * If the required number of entries exceeds `C`, this function returns
-     * `OVPHYSX_API_BUFFER_TOO_SMALL`. The payload tensors must not be used,
-     * but the count and start-index tensors contain the full required layout.
-     * Set `max_contact_data_count` to the maximum element of
-     * `start_indices + counts` when recreating the binding for subsequent
-     * simulation steps. Recreating a binding does not recover the overflowing
-     * step's payload.
-     *
-     * Friction forces use the timestep from the last successful
-     * ovphysx_step(), ovphysx_step_sync(), or ovphysx_step_n_sync() call.
-     *
-     * @param handle Instance handle
-     * @param contact_handle Contact binding
-     * @param friction_force_tensor Pre-allocated world-frame friction forces
-     * @param friction_point_tensor Pre-allocated world-frame friction points
-     * @param contact_count_tensor Pre-allocated count matrix
-     * @param contact_start_indices_tensor Pre-allocated start-index matrix
-     * @return ovphysx_result_t. Returns `OVPHYSX_API_BUFFER_TOO_SMALL` when
-     *   `C` cannot hold all entries.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_read_friction_data(
-        ovphysx_handle_t handle,
-        ovphysx_contact_binding_handle_t contact_handle,
-        DLTensor* friction_force_tensor,
-        DLTensor* friction_point_tensor,
-        DLTensor* contact_count_tensor,
-        DLTensor* contact_start_indices_tensor);
-
-    /**
-     * @brief Read raw (unfiltered) contact data for a contact binding.
-     *
-     * Filter-less variant of @ref ovphysx_read_contact_data : returns every
-     * contact involving each sensor body regardless of which other actor it
-     * collided with, plus a per-contact "other actor ID" lookup so callers
-     * can identify the contacting body via
-     * @ref ovphysx_contact_binding_get_other_actor_paths_from_ids.
-     *
-     * Required shapes (C = max_contact_data_count, S = sensor_count):
-     * - contact_force_tensor:        `[C, 1]` float32 — contact normal force magnitude
-     * - contact_point_tensor:        `[C, 3]` float32 — contact point in world frame
-     * - contact_normal_tensor:       `[C, 3]` float32 — contact normal in world frame
-     * - contact_separation_tensor:   `[C, 1]` float32 — signed separation
-     * - contact_count_tensor:        `[S]` int32/uint32 — number of contacts per sensor
-     * - contact_start_indices_tensor:`[S]` int32/uint32 — flat-buffer start index per sensor
-     * - other_actor_ids_tensor:      `[C]` int64/uint64 — opaque actor id for each contact
-     *
-     * The contact binding must be created with `max_contact_data_count > 0`.
-     * No filter dimension is required; `filters_per_sensor` may be zero. The
-     * dt for impulse-to-force conversion is taken automatically from the last
-     * successful ovphysx_step(), ovphysx_step_sync(), or
-     * ovphysx_step_n_sync() call.
-     *
-     * If the required number of entries exceeds `C`, this function returns
-     * `OVPHYSX_API_BUFFER_TOO_SMALL`. The payload tensors, including
-     * `other_actor_ids_tensor`, must not be used, but the count and
-     * start-index tensors contain the full required layout. Set
-     * `max_contact_data_count` to the maximum element of
-     * `start_indices + counts` when recreating the binding for subsequent
-     * simulation steps. Recreating a binding does not recover the overflowing
-     * step's payload.
-     *
-     * @param handle Instance handle
-     * @param contact_handle Contact binding
-     * @param contact_force_tensor Pre-allocated contact normal force magnitudes
-     * @param contact_point_tensor Pre-allocated world-frame contact points
-     * @param contact_normal_tensor Pre-allocated world-frame contact normals
-     * @param contact_separation_tensor Pre-allocated contact separations
-     * @param contact_count_tensor Pre-allocated per-sensor counts
-     * @param contact_start_indices_tensor Pre-allocated per-sensor start indices
-     * @param other_actor_ids_tensor Pre-allocated per-contact actor IDs
-     * @return ovphysx_result_t. Returns `OVPHYSX_API_BUFFER_TOO_SMALL` when
-     *   `C` cannot hold all entries.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_read_raw_contact_data(
-        ovphysx_handle_t handle,
-        ovphysx_contact_binding_handle_t contact_handle,
-        DLTensor* contact_force_tensor,
-        DLTensor* contact_point_tensor,
-        DLTensor* contact_normal_tensor,
-        DLTensor* contact_separation_tensor,
-        DLTensor* contact_count_tensor,
-        DLTensor* contact_start_indices_tensor,
-        DLTensor* other_actor_ids_tensor);
-
-    /**
-     * @brief Resolve actor IDs from @ref ovphysx_read_raw_contact_data to physics-object paths.
-     *
-     * Given a tensor of opaque actor IDs (the `other_actor_ids_tensor`
-     * returned by @ref ovphysx_read_raw_contact_data), fills `out_paths` with
-     * the corresponding physics-object paths in the same order. IDs whose actors
-     * cannot be resolved (e.g. removed since the step) yield empty paths.
-     *
-     * @param handle Instance handle
-     * @param contact_handle Contact binding
-     * @param ids_tensor Input tensor of actor IDs (`[N]` int64/uint64)
-     * @param out_paths [out] Array of @ref ovphysx_string_t to fill. ovphysx
-     *   owns the returned string storage; pointers remain valid until the
-     *   next call to this function on the same binding (which replaces the
-     *   cache) or until the binding is destroyed.
-     * @param max_paths Capacity of `out_paths` array.
-     * @param out_count [out] Actual number of paths written.
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_contact_binding_get_other_actor_paths_from_ids(
-        ovphysx_handle_t handle,
-        ovphysx_contact_binding_handle_t contact_handle,
-        DLTensor* ids_tensor,
-        ovphysx_string_t* out_paths,
-        uint32_t max_paths,
-        uint32_t* out_count);
-
-    /**
-     * @brief Get raw contact report data for the current simulation step.
-     *
-     * Returns **per-contact-point event data** -- position, normal, impulse,
-     * and separation for every contact point this step. Use this for custom
-     * contact sensors, collision debugging, or per-point force analysis.
-     *
-     * For **aggregate force tensors** (net forces or force matrices between
-     * sensor/filter body sets, delivered as DLPack tensors), see the Contact
-     * Binding API: ovphysx_create_contact_binding().
-     *
-     * The header array describes contact pairs (which actors/colliders are
-     * in contact); each header references a slice of the contact data array
-     * containing per-contact-point information (position, normal, impulse,
-     * separation).
-     *
-     * Prims involved in contacts must have `PhysxContactReportAPI` applied
-     * in the USD stage for contacts to be reported.
-     *
-     * **Ownership:** The caller does NOT own the returned arrays. They are
-     * read-only views into internal simulation buffers.  Copy any data you
-     * need to keep beyond the current step.
-     *
-     * **Pointer lifetime / invalidation:** The returned pointers are valid
-     * only until the next call that advances or tears down the simulation.
-     * The following operations invalidate both arrays:
-     *   - ovphysx_step() (the next simulation step overwrites the buffers)
-     *   - ovphysx_reset_stage()
-     *   - ovphysx_destroy_instance()
-     *
-     * @param handle Instance handle.
-     * @param[out] out_event_headers Receives a pointer to the contact event
-     *        header array (read-only, valid until next step).
-     * @param[out] out_num_event_headers Number of headers in the array.
-     * @param[out] out_contact_data Receives a pointer to the contact point
-     *        array (read-only, valid until next step).
-     * @param[out] out_num_contact_data Number of contact point entries.
-     * @param[out] out_friction_anchors Optional. If non-NULL, receives a pointer
-     *        to the friction anchor array. Each anchor has position[3] and
-     *        impulse[3] in world space. Pass NULL to skip.
-     * @param[out] out_num_friction_anchors Optional. If non-NULL, receives the
-     *        friction anchor count. Pass NULL to skip.
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_get_contact_report(
-        ovphysx_handle_t handle,
-        const ovphysx_contact_event_header_t** out_event_headers,
-        uint32_t* out_num_event_headers,
-        const ovphysx_contact_point_t** out_contact_data,
-        uint32_t* out_num_contact_data,
-        const ovphysx_friction_anchor_t** out_friction_anchors,
-        uint32_t* out_num_friction_anchors);
+    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_update_articulations_kinematic(
+        ovphysx_instance_handle_t handle,
+        ovphysx_query_handle_t query,
+        uint32_t flags,
+        ovstage_cuda_sync_t cuda_sync);
 
     /** @} */
+
 
     /*--------------------------------------------------*/
     /* PhysX object interop                             */
@@ -2007,211 +2277,73 @@ extern "C" {
     /** @{ */
 
     /**
-     * Get a raw PhysX SDK object pointer by USD prim path and type.
+     * Native PhysX addresses are the read-only `physxPointer` column
+     * (`OVPHYSX_ATTR_PHYSX_POINTER`). Query the matching `ovphysx_query_target_t`
+     * and read that attribute. There is no dedicated pointer lookup.
      *
-     * Returns the underlying PhysX object as an opaque `void*`. The caller
-     * must cast to the appropriate PhysX C++ type (see ovphysx_physx_type_t).
-     *
-     * A single function covers all PhysX object types -- no per-type variants
-     * are needed.
-     *
-     * @param handle   ovphysx instance handle.
-     * @param prim_path USD prim path (ovphysx_string_t; e.g. "/World/physicsScene",
-     *        "/World/Cube", "/World/articulation"). Embedded NUL bytes are rejected.
-     * @param physx_type Which PhysX object type to look up at that path. See
-     *        ovphysx_physx_type_t for the mapping to PhysX C++ types.
-     * @param[out] out_ptr Receives the PhysX pointer (NULL if not found).
-     * @return ovphysx_result_t with status and error info.
-     *
-     * @pre A USD stage must be loaded and at least one simulation step
-     *      completed (so PhysX objects exist). prim_path must be a valid
-     *      absolute USD path.
-     *
-     * **Pointer lifetime:** Returned pointers are valid until the next call to
-     * ovphysx_reset_stage() or ovphysx_destroy(). Calls to
-     * ovphysx_step() do NOT invalidate existing pointers.
-     * Do not call `release()` on returned pointers -- ovphysx owns them.
-     *
-     * **Thread safety:** PhysX APIs on returned pointers must only be called
-     * between simulation steps -- specifically after wait_op() completes for
-     * the preceding step and before the next ovphysx_step() call. Calling
-     * PhysX APIs while a step is in-flight is a data race.
-     *
-     * **Shapes:** PxShape objects are reachable from a PxRigidActor pointer
-     * via `PxRigidActor::getShapes()`. You can also query them directly with
-     * `OVPHYSX_PHYSX_TYPE_SHAPE`.
-     *
-     * **PhysX SDK headers:** Casting the returned pointer requires the PhysX
-     * SDK C++ headers (e.g. `PxScene.h`, `PxRigidDynamic.h`).  The ovphysx
-     * SDK ships these headers under `include/physx/`; `find_package(ovphysx)`
-     * sets `ovphysx_PHYSX_INCLUDE_DIR` to point there. No PhysX library
-     * linking is needed.  ovphysx bundles PhysX 5.x -- obtain matching
-     * headers from the open-source repository at
-     * https://github.com/NVIDIA-Omniverse/PhysX (same repo that contains
-     * ovphysx).  Use the headers from the same commit/release as the ovphysx
-     * build to ensure ABI compatibility.
-     *
-     * @code
-     * void* scene = NULL;
-     * ovphysx_result_t r = ovphysx_get_physx_ptr(
-     *     handle, OVPHYSX_LITERAL("/World/physicsScene"),
-     *     OVPHYSX_PHYSX_TYPE_SCENE, &scene);
-     * if (r.status == OVPHYSX_API_SUCCESS && scene) {
-     *     // Cast: physx::PxScene* pxScene = static_cast<physx::PxScene*>(scene);
-     * }
-     * @endcode
+     * Structural changes (adding, removing or re-inserting objects in a scene
+     * ovphysx manages, moving them between scenes, attaching or detaching shapes)
+     * through a native PhysX pointer are not recommended. ovphysx cannot detect such
+     * changes; after one, its reads and writes are not guaranteed to work until the
+     * stage is detached and re-attached (a call may fail, read or write the wrong
+     * object without error, or crash). To change the structure and keep reads and
+     * writes working, use ovstage and ovphysx_update_from_ovstage(), ovphysx_clone(),
+     * or detach and re-attach.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_get_physx_ptr(
-        ovphysx_handle_t handle,
-        ovphysx_string_t prim_path,
-        ovphysx_physx_type_t physx_type,
-        void** out_ptr);
-
-    /**
-     * @brief Classify an authored USD prim by its high-level TensorAPI object type.
-     *
-     * Returns the umbrella's view of what kind of simulation object lives at
-     * `prim_path`: rigid body, articulation, articulation link, articulation
-     * root link, articulation joint, or invalid. Unresolved paths yield
-     * `OVPHYSX_OBJECT_TYPE_INVALID` with `OVPHYSX_API_SUCCESS` (the call
-     * itself didn't fail, the path just isn't a known simulation object).
-     *
-     * @param handle Instance handle (must have a stage attached)
-     * @param prim_path Authored USD prim path (embedded NUL bytes are rejected)
-     * @param[out] out_type Receives the object type
-     * @return OVPHYSX_API_SUCCESS on success, or OVPHYSX_API_ERROR if no
-     *         stage is attached or the TensorAPI simulation view cannot be
-     *         created.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_get_object_type(
-        ovphysx_handle_t handle,
-        ovphysx_string_t prim_path,
-        ovphysx_object_type_t* out_type);
-
-    /**
-     * @brief Force kinematic propagation of root + DOF state into link buffers
-     *        for every articulation in the binding, without running a sim step.
-     *
-     * Mirrors PhysX SDK's
-     * `physx::PxArticulationReducedCoordinate::updateKinematic`. The
-     * umbrella's `SimulationView.update_articulations_kinematic()` calls this
-     * after writing dof-positions / root-transforms to flush the new state
-     * into the link buffer so the next read-back of link transforms reflects
-     * the writes without simulating.
-     *
-     * @param handle Instance handle
-     * @param binding_handle Articulation tensor binding identifying the set of
-     *        articulations to update.
-     * @param flags Bitwise OR of @ref ovphysx_articulation_kinematic_flag_t
-     *        values. Pass `OVPHYSX_ARTICULATION_KINEMATIC_POSITION` to
-     *        propagate positions only, OR with VELOCITY to propagate both.
-     * @return OVPHYSX_API_SUCCESS on success, OVPHYSX_API_INVALID_ARGUMENT if
-     *         the binding is not an articulation binding, OVPHYSX_API_ERROR on
-     *         engine failure or if one or more articulations in the binding
-     *         could not be resolved (e.g. removed from the live stage).
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_articulation_update_kinematic(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        uint32_t flags);
-
-    /**
-     * Wake rigid bodies in a binding.
-     *
-     * Mirrors PhysX SDK's `physx::PxRigidDynamic::wakeUp`. Bodies that
-     * still have `physx::PxActorFlag::eDISABLE_SIMULATION` set are
-     * silently skipped (the engine refuses to wake disabled actors).
-     *
-     * Typical pair: clear @ref OVPHYSX_TENSOR_RIGID_BODY_DISABLE_SIMULATION_BOOL
-     * on an actor (re-add to simulation), then call this to bring the
-     * actor active for the next simulate -- otherwise it sits in the
-     * sleep state PhysX placed it in when the flag was first set.
-     *
-     * @param handle Instance handle
-     * @param binding_handle Rigid body tensor binding identifying the set
-     *        of bodies in scope.
-     * @param indices Optional int32 DLTensor of indices into the binding,
-     *        or NULL to wake every body in the binding.
-     * @return OVPHYSX_API_SUCCESS, OVPHYSX_API_INVALID_ARGUMENT if the
-     *         binding is not a rigid-body binding, OVPHYSX_API_NOT_FOUND
-     *         if the binding has been invalidated by a stage change,
-     *         OVPHYSX_API_ERROR on engine failure.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_rigid_body_view_wake_up(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        const DLTensor* indices);
-
-    /**
-     * Force rigid bodies in a binding to sleep.
-     *
-     * Mirrors PhysX SDK's `physx::PxRigidDynamic::putToSleep`. Sets the
-     * sleep state on each body so it is excluded from the next solve unless
-     * woken by a contact or an explicit @ref ovphysx_rigid_body_view_wake_up
-     * call. Bodies that have `physx::PxActorFlag::eDISABLE_SIMULATION` set
-     * are silently skipped.
-     *
-     * @param handle Instance handle
-     * @param binding_handle Rigid body tensor binding identifying the set
-     *        of bodies in scope.
-     * @param indices Optional int32 DLTensor of indices into the binding,
-     *        or NULL to put every body in the binding to sleep.
-     * @return OVPHYSX_API_SUCCESS, OVPHYSX_API_INVALID_ARGUMENT if the
-     *         binding is not a rigid-body binding, OVPHYSX_API_NOT_FOUND
-     *         if the binding has been invalidated by a stage change,
-     *         OVPHYSX_API_ERROR on engine failure.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_rigid_body_view_sleep(
-        ovphysx_handle_t handle,
-        ovphysx_tensor_binding_handle_t binding_handle,
-        const DLTensor* indices);
 
     /**
      * Subscribe to PhysX object create/destroy notifications.
      *
-     * Pair with ovphysx_get_physx_ptr() to manage the lifetime of cached PhysX
+     * Pair with a `physxPointer` read to manage the lifetime of cached PhysX
      * SDK pointers. On a destruction notification the caller MUST drop the
-     * cached pointer before returning from the callback. On a creation
-     * notification the caller should mark the prim path as dirty in their own
-     * cache and call ovphysx_get_physx_ptr() to fetch the new pointer ONLY
+     * cached pointer before returning from the callback; it is unusable after
+     * that return. On a bulk teardown the caller MUST drop every cached pointer
+     * before returning from the all-objects callback. On a creation
+     * notification the caller should mark the prim path as dirty in its own
+     * cache and read `physxPointer` for the new address ONLY
      * after the triggering synchronous call returns, or after
-     * ovphysx_wait_op() returns for async work -- never from inside the
+     * ovphysx_wait_task() returns for async work, never from inside the
      * callback itself (see Threading below).
      *
-     * Subscriptions are PROCESS-GLOBAL, not per-instance. A single subscription
-     * receives events from every ovphysx instance in the process. Multi-instance
-     * callers that need to filter by stage must do so on their side -- the
-     * prim_path delivered to the callback is the only identifier available.
-     * The handle parameter is intentionally absent.
+     * Subscriptions are per-instance. Callbacks fire only while this handle's
+     * own attachment is live. A peer instance does not receive this
+     * instance's events, and cannot unsubscribe this instance's subscription.
      *
      * Lifecycle: callbacks fire for changes that occur during simulation and
-     * ovphysx_reset_stage()'s bulk teardown. The initial object population from
-     * ovstage attach/update is NOT notified -- the caller already has that state
-     * from setup.
-     *
-     * Known limitation: ovphysx_clone() does NOT currently fire
-     * object_created notifications. Pointer caches that need to track cloned
-     * objects must be refreshed after ovphysx_wait_op() returns on the
-     * clone operation, not via this subscription. ovphysx_reset_stage() (and the
-     * all-objects-destroyed callback) is the supported path for bulk pointer
-     * invalidation.
+     * ovphysx_detach_ovstage()'s bulk teardown. The initial object population from
+     * ovstage attach/update is NOT notified, since the caller already has that
+     * state from setup. ovphysx_clone() does NOT fire object_created
+     * notifications. Pointer caches that need to track cloned objects must be
+     * refreshed after ovphysx_wait_task() returns on the clone operation.
+     * These notifications stay callbacks; they are not query or read records.
      *
      * Threading: callbacks may fire from internal worker threads. Do NOT call
-     * other ovphysx APIs from inside a callback -- defer that until the
-     * triggering synchronous call returns, or until ovphysx_wait_op() returns
+     * other ovphysx APIs from inside a callback. Defer that until the
+     * triggering synchronous call returns, or until ovphysx_wait_task() returns
      * for async work. See the docstring on ovphysx_object_change_callbacks_t
      * for the full contract.
+     * A callback that waits for an ovphysx call on another thread can deadlock
+     * if any thread meanwhile attaches, detaches or destroys an instance,
+     * starts, stops or queries a recording, or makes the first step, query or binding of an instance whose stage has not been parsed yet.
      *
      * Failure modes:
      * - OVPHYSX_API_INVALID_ARGUMENT if callbacks or out_subscription is NULL,
      *   or if every callback function pointer in the struct is NULL.
      * - OVPHYSX_API_ERROR if the physics runtime is not available (e.g. no
      *   ovphysx instance has been created yet).
+     * - OVPHYSX_API_INVALID_STATE for runtime or application log callback
+     *   reentry; rejection occurs before blocking runtime admission.
+     * Null callback/output arguments and an empty callback set are validated
+     * before callback rejection. Rejection precedes instance lookup.
+     *
+     * Finishes the instance's pending execution without collecting its task
+     * receipts, then retains shared admission through native registration.
      *
      * On failure, *out_subscription is set to OVPHYSX_INVALID_SUBSCRIPTION_ID.
      *
+     * @param[in]  handle            Instance that owns the subscription.
      * @param[in]  callbacks         Pointer to the callback set. The struct is
-     *                               copied internally; the caller does not need
+     *                               copied internally, so the caller does not need
      *                               to keep it alive after this call returns.
      * @param[out] out_subscription  Receives the subscription ID on success.
      *                               Pass this to ovphysx_unsubscribe_object_changes()
@@ -2219,6 +2351,7 @@ extern "C" {
      * @return OVPHYSX_API_SUCCESS on success, or an error status.
      */
     OVPHYSX_API ovphysx_result_t ovphysx_subscribe_object_changes(
+        ovphysx_instance_handle_t handle,
         const ovphysx_object_change_callbacks_t* callbacks,
         ovphysx_subscription_id_t* out_subscription);
 
@@ -2226,239 +2359,166 @@ extern "C" {
      * Unsubscribe from PhysX object change notifications.
      *
      * Stops delivery of further notifications for the given subscription ID.
-     * After this call returns the subscription ID is consumed and must not be
-     * reused.
+     * OVPHYSX_API_SUCCESS does not return while one of this subscription's
+     * callbacks is still running. After that return the subscription ID is
+     * consumed and must not be reused, and user_data will not be touched again
+     * by this subscription.
+     *
+     * Calling this from inside any object-change callback returns
+     * OVPHYSX_API_INVALID_STATE and leaves the subscription active. That
+     * check follows the Carbonite task when the callback is running as one,
+     * and the native thread otherwise. Another task on the same worker is
+     * not inside the callback. The dispatch snapshot retains every subscriber
+     * until that callback returns, so waiting would deadlock. Unsubscribe
+     * again after it returns.
      *
      * Idempotency: passing an already-unsubscribed or unknown subscription ID
-     * returns OVPHYSX_API_NOT_FOUND. OVPHYSX_INVALID_SUBSCRIPTION_ID is
-     * rejected with OVPHYSX_API_INVALID_ARGUMENT.
+     * returns OVPHYSX_API_NOT_FOUND. A subscription owned by another instance
+     * also returns OVPHYSX_API_NOT_FOUND and leaves that subscription active.
+     * OVPHYSX_INVALID_SUBSCRIPTION_ID is rejected with OVPHYSX_API_INVALID_ARGUMENT.
+     * NOT_FOUND is not a drain barrier: only SUCCESS means in-flight callbacks
+     * for that subscription have finished.
      *
+     * @param handle       Instance that owns the subscription.
      * @param subscription Subscription ID returned from
      *                     ovphysx_subscribe_object_changes().
      * @return OVPHYSX_API_SUCCESS on success, or an error status.
      */
     OVPHYSX_API ovphysx_result_t ovphysx_unsubscribe_object_changes(
+        ovphysx_instance_handle_t handle,
         ovphysx_subscription_id_t subscription);
 
     /** @} */
 
     /*--------------------------------------------------*/
-    /* Scene queries                                    */
-    /*--------------------------------------------------*/
-
-    /**
-     * @defgroup ovphysx_scene_query Scene queries
-     *
-     * Raycast, sweep, and overlap queries against the physics scene.
-     *
-     * All three functions follow the same output pattern: hit results are
-     * written to an **internal buffer** owned by the ovphysx instance. The
-     * returned pointer is valid until the next scene query call on the same
-     * instance (any of the three functions). This avoids two-call patterns
-     * and is simple for language bindings.
-     *
-     * Path fields in the hit struct (collision, rigid_body, material) are
-     * uint64-encoded SdfPaths matching ovphysx's internal path encoding. Use
-     * the same encoding when comparing hit results against known prim paths.
-     *
-     * @pre A USD stage must be loaded and at least one simulation step
-     *      completed for the scene to contain queryable objects.
-     *
-     * **Thread safety:** Scene query functions must only be called between
-     * simulation steps -- after `wait_op()` completes and before the next
-     * `ovphysx_step()`.
-     */
-
-    /** @addtogroup ovphysx_scene_query */
-    /** @{ */
-
-    /**
-     * @brief Cast a ray and return hits.
-     *
-     * @param handle     Instance handle.
-     * @param origin     Ray origin (world space, 3 floats).
-     * @param direction  Normalized ray direction (3 floats).
-     * @param distance   Maximum ray distance. Must be >= 0.
-     * @param both_sides If true, test both sides of mesh triangles.
-     * @param mode       CLOSEST (0 or 1 hit), ANY (0 or 1), or ALL.
-     * @param[out] out_hits   Receives pointer to internal hit array.
-     * @param[out] out_count  Number of hits in the array.
-     * @return ovphysx_result_t
-     *
-     * @code
-     * const ovphysx_scene_query_hit_t* hits = NULL;
-     * uint32_t count = 0;
-     * float origin[3] = {0, 10, 0};
-     * float dir[3]    = {0, -1, 0};
-     * ovphysx_raycast(handle, origin, dir, 100.0f, false,
-     *                 OVPHYSX_SCENE_QUERY_MODE_CLOSEST, &hits, &count);
-     * if (count > 0) {
-     *     printf("Hit at distance %f\n", hits[0].distance);
-     * }
-     * @endcode
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_raycast(
-        ovphysx_handle_t handle,
-        const float origin[3],
-        const float direction[3],
-        float distance,
-        bool both_sides,
-        ovphysx_scene_query_mode_t mode,
-        const ovphysx_scene_query_hit_t** out_hits,
-        uint32_t* out_count);
-
-    /**
-     * @brief Sweep a geometry shape along a direction and return hits.
-     *
-     * @param handle     Instance handle.
-     * @param geometry   Geometry descriptor (sphere, box, or arbitrary shape).
-     * @param direction  Normalized sweep direction (3 floats).
-     * @param distance   Maximum sweep distance. Must be >= 0.
-     * @param both_sides If true, test both sides of mesh triangles.
-     * @param mode       CLOSEST (0 or 1 hit), ANY (0 or 1), or ALL.
-     * @param[out] out_hits   Receives pointer to internal hit array.
-     * @param[out] out_count  Number of hits in the array.
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_sweep(
-        ovphysx_handle_t handle,
-        const ovphysx_scene_query_geometry_desc_t* geometry,
-        const float direction[3],
-        float distance,
-        bool both_sides,
-        ovphysx_scene_query_mode_t mode,
-        const ovphysx_scene_query_hit_t** out_hits,
-        uint32_t* out_count);
-
-    /**
-     * @brief Test geometry overlap against objects in the scene.
-     *
-     * Overlap queries do not have a direction or distance. Location fields
-     * in the hit struct (normal, position, distance, face_index, material)
-     * are zeroed -- only object identity (collision, rigid_body, proto_index)
-     * is populated.
-     *
-     * @param handle     Instance handle.
-     * @param geometry   Geometry descriptor (sphere, box, or arbitrary shape).
-     * @param mode       ANY (0 or 1 result) or ALL. CLOSEST is treated as ALL.
-     * @param[out] out_hits   Receives pointer to internal hit array.
-     * @param[out] out_count  Number of hits (or overlaps) in the array.
-     * @return ovphysx_result_t
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_overlap(
-        ovphysx_handle_t handle,
-        const ovphysx_scene_query_geometry_desc_t* geometry,
-        ovphysx_scene_query_mode_t mode,
-        const ovphysx_scene_query_hit_t** out_hits,
-        uint32_t* out_count);
-
-    /** @} */
-
-    /*--------------------------------------------------*/
-    /* Stream operations */
+    /* Task completion */
     /*--------------------------------------------------*/
 
     /** @addtogroup ovphysx_stream */
     /** @{ */
 
-    /*
-    * Enqueue a user-provided task into the stream.
-    * The task runs in stream order, allowing custom synchronization or processing.
-    * 
-    * Example use cases:
-    * - Synchronizing with external systems
-    * - Custom data processing between physics steps
-    * - Inserting callbacks for debugging or profiling
-    * 
-    * IMPORTANT: user_data lifetime must be managed by the user and remain valid
-    * until the task executes. Use CUDA events or wait_op to synchronize.
-    * 
-    * @param handle Physics handle
-    * @param desc Task description with callback and user data
-    * @return ovphysx_enqueue_result_t with status, error, and operation index
-    *
-    * @pre handle and desc must be valid. desc->callback must not be NULL.
-    * @post Task is executed in stream order once enqueued.
-    *
-    * @par Side Effects
-    * Executes user callback on the internal execution context.
-    *
-    * @par Threading
-    * Callback may execute on an internal worker thread; avoid blocking or taking locks that can deadlock.
-    *
-    * @par Ownership
-    * Caller must keep desc->user_data valid until the task executes.
-    *
-    * @par Errors
-    * - OVPHYSX_API_INVALID_ARGUMENT for invalid inputs
-    * - OVPHYSX_API_ERROR for internal failures
-    *
-    * @code
-    * ovphysx_enqueue_result_t r = ovphysx_add_user_task(handle, &task_desc);
-    * @endcode
-    */
-    OVPHYSX_API ovphysx_enqueue_result_t ovphysx_add_user_task(ovphysx_handle_t handle,
-                                                                       const ovphysx_user_task_desc_t* desc);
+    /**
+     * @brief Collect the terminal outcome of one accepted task.
+     *
+     * Reports and acknowledges only the given task, including when earlier work must
+     * finish to preserve execution ordering. Uncollected failures of other tasks
+     * remain available to their own wait or ovphysx_wait_all(). A terminal outcome
+     * is single-use; another wait returns NOT_FOUND. Timeout leaves the unfinished
+     * task retryable and returns its receipt in pending_task.
+     *
+     * The timeout bounds waiting for outcome publication. Zero polls readiness;
+     * OVPHYSX_TIMEOUT_INFINITE waits until the outcome is published. Such a wait
+     * on a native thread (not inside a Carbonite task) may run, on that thread and
+     * in submission order, unstarted queued work through its target when the worker
+     * lane is available, unless a CUDA graph capture of a blocking stream holds the
+     * legacy default stream of the thread's current CUDA context: it then starts no
+     * work. Work it runs completes as on the worker, including its callbacks. Any
+     * other wait never runs or finishes work: queued work completes
+     * on the worker thread, so a finite wait ends at its deadline and reports an
+     * outcome published by then.
+     *
+     * @param handle Owning instance. Validated before other arguments.
+     * @param task Copyable task receipt returned by a successful call.
+     * @param timeout_ns Readiness timeout in nanoseconds.
+     * @param[out] out_wait_result Non-null zero-initialized result. Nonempty reuse
+     *   is rejected without overwriting it. Destroy after processing.
+     * @return SUCCESS for successful completion, ERROR for an execution or
+     *   internal failure, TIMEOUT for unfinished work with its receipt in
+     *   pending_task, INVALID_ARGUMENT for a
+     *   zero/rejected/wrong-instance receipt or invalid output, NOT_FOUND for an
+     *   invalid instance or a never-issued/already-collected task, INVALID_STATE
+     *   without waiting or collecting inside a log, runtime or object-change
+     *   callback, whose triggering work the wait could depend on.
+     *
+     * @par Ownership
+     * Failed receipts and borrowed messages belong to out_wait_result until
+     * ovphysx_destroy_wait_task_result(). Do not modify the returned fields,
+     * free error_tasks separately, or shallow-copy the result.
+     * Allocation failure leaves an empty destructible output and terminal
+     * outcomes uncollected, so callers can retry.
+     *
+     * @par Threading
+     * Calls on one instance must be externally serialized, including waits and
+     * error lookup. Serialized calls may move between threads.
+     *
+     * @code{.c}
+     * #include <ovphysx/ovphysx.h>
+     *
+     * static ovphysx_result_t collect_task(
+     *     ovphysx_instance_handle_t handle, ovphysx_enqueue_result_t task)
+     * {
+     *     ovphysx_wait_task_result_t result = {0};
+     *     ovphysx_result_t status = ovphysx_wait_task(
+     *         handle, task, OVPHYSX_TIMEOUT_INFINITE, &result);
+     *     ovphysx_destroy_wait_task_result(&result);
+     *     return status;
+     * }
+     * @endcode
+     */
+    OVPHYSX_API ovphysx_result_t ovphysx_wait_task(
+        ovphysx_instance_handle_t handle, ovphysx_enqueue_result_t task,
+        ovphysx_timeout_t timeout_ns, ovphysx_wait_task_result_t* out_wait_result);
 
-    /* 
-    * Wait for completion of all operations up to and including the specified operation index.
-    * This operation is synchronous and will block until the operations are completed or the timeout has passed.
-    * Passing 0 as the timeout makes the operation a non-blocking poll.
-    * The out structure returns any errors observed since the last wait call and, on timeout, lowest_pending_op_index is set to the lowest pending operation index (or 0 if all complete).
-    * The caller owns out_wait_result and must free it via ovphysx_destroy_wait_result().
-    * For each failed op index, call ovphysx_get_last_op_error(op_index) to retrieve the error string.
-    *
-    * SINGLE-USE SEMANTICS:
-    *   Each op_index is single-use. Once a wait reports completion or operation failure, the op_index is
-    *   consumed and its resources are released. Attempting to wait on the same op_index again will return
-    *   OVPHYSX_API_NOT_FOUND. A wait processes unconsumed indices in order through the requested index,
-    *   consuming every completed or failed index it reaches. An index completed by internal stream
-    *   synchronization may be acknowledged once with wait_op(); that acknowledgement consumes it.
-    *
-    * SPECIAL VALUES:
-    *   - OVPHYSX_OP_INDEX_ALL: Wait for all pending operations (useful for shutdown/sync points).
-    *
-    * THREAD SAFETY:
-    *   - Calls on one instance, including waits for OVPHYSX_OP_INDEX_ALL, must be externally serialized.
-    *   - Waiting on a specific op_index from multiple threads concurrently is UNDEFINED BEHAVIOR.
-    *   - Each op_index should be waited on by exactly one thread.
-    *
-    * @param handle ovphysx handle
-    * @param op_index Operation index to wait for, or OVPHYSX_OP_INDEX_ALL to wait for all operations submitted up to this point
-    * @param timeout_ns Timeout in nanoseconds (0 for non-blocking poll)
-    * @param out_wait_result [out] Wait result information (errors and active operation indices)
-    * @return ovphysx_result_t with status:
-    *         OVPHYSX_API_SUCCESS if the operations were waited for successfully,
-    *         OVPHYSX_API_ERROR if one or more operations failed or the wait failed internally,
-    *         OVPHYSX_API_NOT_FOUND if the handle is invalid or the op_index was consumed or never existed,
-    *         OVPHYSX_API_TIMEOUT if not all operations completed within the timeout.
-    *
-    * @pre handle and out_wait_result must be valid.
-    * @post On success, all operations up to op_index have completed.
-    *
-    * @par Side Effects
-    * Consumes each completed or failed operation reached by the wait. An operation that remains pending
-    * when the wait times out is not consumed.
-    *
-    * @par Ownership
-    * Caller owns out_wait_result and must free it via ovphysx_destroy_wait_result().
-    * For each failed op index, call ovphysx_get_last_op_error(op_index) to get the error string.
-    *
-    * @par Errors
-    * - OVPHYSX_API_NOT_FOUND if op_index is invalid or already consumed
-    * - OVPHYSX_API_TIMEOUT if timeout elapses
-    * - OVPHYSX_API_ERROR if one or more operations fail or the wait fails internally
-    *
-    * @code
-    * ovphysx_op_wait_result_t wait_result = {0};
-    * ovphysx_wait_op(handle, op_index, UINT64_MAX, &wait_result);
-    * ovphysx_destroy_wait_result(&wait_result);
-    * @endcode
-    */
-    OVPHYSX_API ovphysx_result_t ovphysx_wait_op(ovphysx_handle_t handle,
-                                                         ovphysx_op_index_t op_index,
-                                                         uint64_t timeout_ns,
-                                                         ovphysx_op_wait_result_t* out_wait_result);
+    /**
+     * @brief Collect uncollected tasks accepted at call entry, in submission order.
+     *
+     * Uses one readiness deadline for the entire call. Stops at the earliest
+     * unfinished task when that deadline expires; later outcomes stay uncollected.
+     * Earlier completed failures are returned in error_tasks even on TIMEOUT, which
+     * takes precedence over ERROR. Successful terminal outcomes are collected too.
+     * A discarded original receipt does not discard its failure. Empty and repeated
+     * wait-all calls succeed when no uncollected task remains.
+     *
+     * Validation, ownership and timeout rules match ovphysx_wait_task(). The cutoff
+     * is captured before timed waiting; no runtime admission is acquired. TIMEOUT
+     * always returns the earliest unfinished task within the cutoff in a nonzero
+     * pending_task. An all-zero pending_task means no task remains pending within
+     * the cutoff.
+     */
+    OVPHYSX_API ovphysx_result_t ovphysx_wait_all(
+        ovphysx_instance_handle_t handle, ovphysx_timeout_t timeout_ns,
+        ovphysx_wait_task_result_t* out_wait_result);
+
+    /**
+     * @brief Report the state of an issued task without waiting or collecting it.
+     *
+     * The query never runs or finishes work and never acknowledges an outcome: a
+     * finished task keeps reporting SUCCEEDED or FAILED until ovphysx_wait_task() or
+     * ovphysx_wait_all() collects it, and reports NOT_FOUND afterwards. A job queued
+     * on the instance's worker thread, such as a step, reports PENDING until the
+     * worker starts it and RUNNING until its outcome is published; work that ran on
+     * the calling thread is finished when its call returns.
+     *
+     * @param handle Owning instance.
+     * @param task Copyable task receipt returned by a successful call.
+     * @param[out] out_status Receives the task state. Set to
+     *   OVPHYSX_TASK_STATUS_NOT_FOUND on every failure.
+     * @return SUCCESS when out_status was written, including NOT_FOUND for a
+     *   never-issued or already-collected task; INVALID_ARGUMENT for a null
+     *   out_status or a zero/rejected/wrong-instance receipt; NOT_FOUND for an
+     *   invalid instance.
+     *
+     * @par Threading
+     * Calls on one instance must be externally serialized, as for waits. That includes a
+     * callback: one that queries its instance's tasks while another thread waits on that
+     * instance races the wait's collection.
+     *
+     * @code{.c}
+     * #include <ovphysx/ovphysx.h>
+     * #include <stdbool.h>
+     *
+     * static bool task_finished(ovphysx_instance_handle_t handle, ovphysx_enqueue_result_t task)
+     * {
+     *     ovphysx_task_status_t status = OVPHYSX_TASK_STATUS_NOT_FOUND;
+     *     if (ovphysx_query_task_status(handle, task, &status).status != OVPHYSX_API_SUCCESS)
+     *         return false;
+     *     return status == OVPHYSX_TASK_STATUS_SUCCEEDED || status == OVPHYSX_TASK_STATUS_FAILED;
+     * }
+     * @endcode
+     */
+    OVPHYSX_API ovphysx_result_t ovphysx_query_task_status(
+        ovphysx_instance_handle_t handle, ovphysx_enqueue_result_t task,
+        ovphysx_task_status_t* out_status);
 
     /** @} */
 
@@ -2473,63 +2533,55 @@ extern "C" {
      * @brief Query the error string for the last failed API call on the calling thread.
      *
      * The returned string is valid until the next ovphysx API call on the same thread.
-     * Returns {NULL, 0} if the last call succeeded.
+     * Returns a stable empty string if the last call succeeded.
      *
-     * @return ovphysx_string_t with the error message, or {NULL, 0} on success.
+     * @return Error message, or {"", 0} on success. ptr is always non-NULL and
+     *         ptr[length] is '\0'.
      *
      * @par Threading
-     * Thread-local storage; safe to call from any thread.
+     * Thread-local storage. Safe to call from any thread.
      *
-     * @code
-     * ovphysx_result_t r = ovphysx_create_instance(&args, &handle);
-     * if (r.status != OVPHYSX_API_SUCCESS) {
-     *     ovphysx_string_t err = ovphysx_get_last_error();
-     *     if (err.ptr)
-     *         fprintf(stderr, "Error: %.*s\n", (int)err.length, err.ptr);
+     * @code{.c}
+     * #include <ovphysx/ovphysx.h>
+     * #include <stdio.h>
+     *
+     * int main(void)
+     * {
+     *     ovphysx_result_t result = ovphysx_initialize();
+     *     if (result.status != OVPHYSX_API_SUCCESS) {
+     *         ovphysx_string_t error = ovphysx_get_last_error();
+     *         if (error.length != 0)
+     *             fprintf(stderr, "Error: %.*s\n", (int)error.length, error.ptr);
+     *         return 1;
+     *     }
+     *     return ovphysx_shutdown().status == OVPHYSX_API_SUCCESS ? 0 : 1;
      * }
      * @endcode
      */
     OVPHYSX_API ovphysx_string_t ovphysx_get_last_error(void);
 
     /**
-     * @brief Query the error string for a specific failed op_index from the last wait_op call.
+     * @brief Borrow a collected task's error from its live wait-result.
      *
-     * After ovphysx_wait_op() reports failed operations via error_op_indices,
-     * call this function for each failed op_index to retrieve the error message.
-     * The returned string is valid until the next ovphysx_wait_op() call on the same thread.
-     *
-     * @param op_index The failed operation index (from ovphysx_op_wait_result_t.error_op_indices).
-     * @return ovphysx_string_t with the error message, or {NULL, 0} if op_index has no error.
-     *
-     * @par Threading
-     * Thread-local storage; safe to call from any thread.
-     *
-     * @code
-     * for (size_t i = 0; i < wait_result.num_errors; ++i) {
-     *     ovphysx_string_t err = ovphysx_get_last_op_error(wait_result.error_op_indices[i]);
-     *     fprintf(stderr, "Op %llu failed: %.*s\n",
-     *             wait_result.error_op_indices[i], (int)err.length, err.ptr);
-     * }
-     * @endcode
+     * Lookup is read-only and never acknowledges work. A missing retained cause
+     * returns {"", 0}. An invalid instance or zero/rejected/wrong-instance receipt
+     * also sets the immediate diagnostic retrieved by ovphysx_get_last_error().
+     * The string survives unrelated waits and instance destruction until the
+     * owning wait-result is destroyed. A fresh lookup requires a live instance.
+     * ptr is always non-NULL and ptr[length] is '\0'.
      */
-    OVPHYSX_API ovphysx_string_t ovphysx_get_last_op_error(ovphysx_op_index_t op_index);
+    OVPHYSX_API ovphysx_string_t ovphysx_get_last_task_error(
+        ovphysx_instance_handle_t handle, ovphysx_enqueue_result_t task);
 
     /**
-     * @brief Free the error_op_indices array in an ovphysx_op_wait_result_t.
+     * @brief Release wait-result storage and zero every field.
      *
-     * Call this after processing the wait result to release the dynamically
-     * allocated error_op_indices array.
-     *
-     * @param result Pointer to the wait result to clean up (NULL-safe).
-     *
-     * @pre Safe to call with NULL or already-cleaned result.
-     * @post result->error_op_indices is NULL and num_errors is 0.
-     *
-     * @code
-     * ovphysx_destroy_wait_result(&wait_result);
-     * @endcode
+     * Accepts NULL and already-cleaned results. Safe after instance teardown;
+     * retained messages and receipts own no simulation or CUDA resources.
+     * A non-NULL result must be zero-initialized or produced by a task wait with
+     * its returned fields unchanged. Never free error_tasks separately.
      */
-    OVPHYSX_API void ovphysx_destroy_wait_result(ovphysx_op_wait_result_t* result);
+    OVPHYSX_API void ovphysx_destroy_wait_task_result(ovphysx_wait_task_result_t* result);
 
     /** @} */
 
@@ -2540,389 +2592,88 @@ extern "C" {
 
     /**
      * @defgroup ovphysx_logging Logging configuration
-     * Configure global log level and register log callbacks.
+     * Configure the process-scoped ovphysx library source log level and the single
+     * application log callback.
      *
-     * By default, ovphysx logs to the Carbonite console at WARNING level.
-     * Use ovphysx_set_log_level() to change the threshold and
-     * ovphysx_register_log_callback() to receive messages programmatically.
+     * By default, libovphysx logs to the Carbonite console at WARNING level.
+     * Set OVPHYSX_GLOBAL_CONFIG_LOG_LEVEL to change the threshold and use
+     * ovphysx_set_log_callback() to receive messages programmatically.
      */
 
     /** @addtogroup ovphysx_logging */
     /** @{ */
 
     /**
-     * @brief Set the global log level threshold.
+     * @brief Set or disable the application log callback.
      *
-     * Messages below this level are suppressed for all outputs (console and
-     * registered callbacks). Callable at any time. If called before instance
-     * creation, the level is stored and applied when Carbonite initializes.
+     * One callback may be registered. Calling again publishes the replacement
+     * for newly accepted messages, then waits for the prior registration's
+     * in-flight invocations before returning. Passing NULL for @p callback
+     * immediately stops accepting delivery and drains the prior registration.
+     * Once set, the callback pointer and resources reachable through
+     * @p user_data must remain valid until a later replacing or disabling call,
+     * or a successful ovphysx_shutdown(), returns. This includes shutdown with
+     * live handles retained only for explicit destruction. During replacement,
+     * accepted invocations of the old registration may overlap invocations of
+     * the newly published registration. Invocations within each registration
+     * remain serialized.
+     * @p min_severity applies to every record in the observed process log
+     * stream. Records from the library-owned `omni_physx_sdk`, `omni.physx`,
+     * and `ovphysx_internal` sources are also subject to the source threshold
+     * configured by OVPHYSX_GLOBAL_CONFIG_LOG_LEVEL. OVPHYSX_LOG_DEFAULT uses
+     * WARNING.
      *
-     * @par Threading
-     * Thread-safe. Uses atomic storage internally.
+     * @p channel_filter is optional. It is a comma-separated list of
+     * `channel=level` rules. ASCII whitespace around entries, channels, and
+     * levels is ignored, and level names are case-insensitive. A rule matches
+     * any channel beginning with its raw prefix. Rules are considered in
+     * declaration order. The longest matching prefix wins, and a later rule
+     * wins ties between equal-length matching prefixes. An empty filter
+     * uses @p min_severity for every channel.
      *
-     * @param level Log level threshold (ovphysx_log_level_t). Default: OVPHYSX_LOG_WARNING.
-     *              Must be between OVPHYSX_LOG_VERBOSE and OVPHYSX_LOG_NONE inclusive.
-     * @return ovphysx_result_t with OVPHYSX_API_SUCCESS on success, or
-     *         OVPHYSX_API_INVALID_ARGUMENT if the level was out of range
-     *         (no state change is applied).
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_set_log_level(uint32_t level);
-
-    /**
-     * @brief Get the current global log level threshold.
-     *
-     * @par Threading
-     * Thread-safe. Uses atomic load internally.
-     *
-     * @return The current log level (ovphysx_log_level_t).
-     */
-    OVPHYSX_API uint32_t ovphysx_get_log_level(void);
-
-    /**
-     * @brief Enable or disable Carbonite's built-in console log output.
-     *
-     * By default, Carbonite logs to the console (stdout/stderr). When custom
-     * callbacks are registered via ovphysx_register_log_callback(), both the
-     * built-in console output and the custom callbacks receive messages,
-     * which may cause duplicate output if the callback also writes to the
-     * console.
-     *
-     * Call this function with @c false to suppress the built-in console
-     * output while keeping custom callbacks active. Call with @c true to
-     * re-enable it.
-     *
-     * This function is independent of callback registration and the global
-     * log level -- it only controls the built-in console logger.
-     *
-     * Callable at any time. If called before Carbonite initializes, the
-     * preference is stored and applied during initialization.
-     *
-     * @par Threading
-     * Thread-safe. Uses atomic storage internally.
-     *
-     * @param enable @c true to enable (default), @c false to disable.
-     * @return ovphysx_result_t with OVPHYSX_API_SUCCESS.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_enable_default_log_output(bool enable);
-
-    /**
-     * @brief Register a log callback.
-     *
-     * Multiple callbacks may be registered simultaneously. Each receives all
-     * messages at or above the global log level threshold. The caller must
-     * ensure @p fn and any resources referenced by @p user_data remain valid
-     * until ovphysx_unregister_log_callback() is called. If the callback and
-     * its resources naturally outlive the process (e.g. a static function
-     * with no user_data), calling ovphysx_unregister_log_callback() is not
-     * required.
-     *
-     * Registering the same @p fn and @p user_data pair twice returns
-     * OVPHYSX_API_INVALID_ARGUMENT. Use different @p user_data values to
-     * register the same function pointer multiple times.
-     *
-     * @note The callback may be invoked from any thread. The implementation
-     *       is thread-safe, but the callback itself must also be thread-safe.
-     * @note Must not be called from within a log callback. Returns
+     * @note The callback may be invoked from any thread, but invocations for
+     *       the active registration are serialized.
+     * @note Do not synchronously wait for work that may log into this same
+     *       registration. Native execution/admission calls, including recording
+     *       start and stop, reject callback reentry with INVALID_STATE
+     *       before blocking.
+     * @note The callback observes Carbonite's process log stream. The channel
+     *       parameter identifies the emitting source for application filtering.
+     * @note Must not be called from within the callback. Returns
      *       OVPHYSX_API_ERROR if called during callback dispatch.
+     * @note An OVPHYSX_API_ERROR after valid arguments may be reported after
+     *       the replacement was published. Conservatively keep @p callback and
+     *       @p user_data alive until a later successful replace, disable, or
+     *       shutdown drains the slot.
      *
-     * @param fn        Callback function pointer (must not be NULL).
-     * @param user_data Opaque pointer forwarded to every callback invocation (may be NULL).
+     * @param min_severity Minimum delivered severity.
+     * @param channel_filter Optional non-owning filter view, copied by the call.
+     * @param callback Callback function, or NULL to disable.
+     * @param user_data Opaque pointer forwarded to every callback invocation.
      * @return ovphysx_result_t with status.
+     * @post Invalid arguments leave the prior registration unchanged.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_register_log_callback(ovphysx_log_fn fn, void* user_data);
+    OVPHYSX_API ovphysx_result_t ovphysx_set_log_callback(
+        ovphysx_log_level_t min_severity,
+        const ovphysx_string_t* channel_filter,
+        ovphysx_log_callback_t callback,
+        void* user_data);
 
     /**
-     * @brief Unregister a previously registered log callback.
+     * @brief Wait for application-callback deliveries accepted before this call.
      *
-     * Both @p fn and @p user_data must match the values passed to
-     * ovphysx_register_log_callback(). After this function returns, the
-     * callback is guaranteed to not be running on any thread and will never
-     * be invoked again. The caller may safely destroy the callback context.
+     * This is an exact barrier for records already handed to ovphysx by
+     * Carbonite. If the host enabled Carbonite asynchronous logging, records
+     * still buffered upstream have not yet been accepted and are outside this
+     * barrier. Successful ovphysx_shutdown() flushes that upstream buffer before
+     * disabling and draining the callback.
      *
-     * @note Must not be called from within a log callback. Returns
-     *       OVPHYSX_API_ERROR if called during callback dispatch.
-     *
-     * @param fn        Callback function pointer.
-     * @param user_data Opaque pointer that was passed during registration (may be NULL).
-     * @return ovphysx_result_t with OVPHYSX_API_SUCCESS if found and removed.
+     * @param timeout_ns Maximum wait in nanoseconds. OVPHYSX_TIMEOUT_POLL polls.
+     *        OVPHYSX_TIMEOUT_INFINITE waits indefinitely.
+     * @return OVPHYSX_API_SUCCESS when drained, OVPHYSX_API_TIMEOUT on timeout,
+     *         or OVPHYSX_API_ERROR when called from a log callback.
      */
-    OVPHYSX_API ovphysx_result_t ovphysx_unregister_log_callback(ovphysx_log_fn fn, void* user_data);
-
-    /** @} */
-
-    /*=========================================================================
-     * SDF shape evaluation
-     *=========================================================================*/
-
-    /**
-     * Create an SDF shape view for shapes matching the given pattern.
-     *
-     * The view evaluates the signed distance field of PhysX collision shapes
-     * at caller-supplied query points. Requires a GPU instance; CPU SDF
-     * evaluation is not yet implemented and create will fail for CPU instances.
-     *
-     * The returned handle must be released with ovphysx_destroy_sdf_view when
-     * no longer needed. The handle is invalidated when the attached USD stage
-     * changes (ovphysx_reset_stage, ovphysx_detach_ovstage, or loading a new
-     * stage) or when the instance is destroyed (via ovphysx_destroy) even if
-     * ovphysx_destroy_sdf_view is not called explicitly. After invalidation,
-     * evaluate/get calls return OVPHYSX_API_NOT_FOUND; recreate the view after
-     * re-attaching a stage.
-     *
-     * Thread safety: safe to call concurrently with other ovphysx API functions
-     * on the same handle, but not concurrently with ovphysx_destroy on the
-     * same handle.
-     *
-     * @param handle            Instance handle.
-     * @param pattern           USD-style path glob selecting SDF-enabled collision
-     *                          shapes, including runtime-only clones (e.g. "/World/Mesh*").
-     *                          Must match at least one shape or the call returns an error.
-     * @param max_query_points  Number of query points per shape per evaluate
-     *                          call. Query tensors passed to ovphysx_evaluate_sdf
-     *                          must have Q == this value (second dimension).
-     *                          Must be > 0.
-     * @param out_handle        Receives the new SDF view handle on success.
-     *                          Set to 0 on failure.
-     * @return OVPHYSX_API_SUCCESS or an error code.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_create_sdf_view(
-        ovphysx_handle_t handle,
-        ovphysx_string_t pattern,
-        uint32_t max_query_points,
-        ovphysx_sdf_view_handle_t* out_handle);
-
-    /**
-     * Return the number of shapes in the SDF view (N, first dimension of query tensors).
-     *
-     * @param handle        Instance handle.
-     * @param sdf_handle    SDF view handle from ovphysx_create_sdf_view.
-     * @param out_count     Receives the shape count on success.
-     * @return OVPHYSX_API_SUCCESS, OVPHYSX_API_INVALID_ARGUMENT if out_count is NULL,
-     *         OVPHYSX_API_NOT_FOUND if sdf_handle is not valid.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_sdf_view_get_count(
-        ovphysx_handle_t handle,
-        ovphysx_sdf_view_handle_t sdf_handle,
-        uint32_t* out_count);
-
-    /**
-     * Return the max_query_points value this view was created with (Q, second dimension).
-     *
-     * @param handle               Instance handle.
-     * @param sdf_handle           SDF view handle from ovphysx_create_sdf_view.
-     * @param out_max_query_points Receives the max query points on success.
-     * @return OVPHYSX_API_SUCCESS, OVPHYSX_API_INVALID_ARGUMENT if out_max_query_points is NULL,
-     *         OVPHYSX_API_NOT_FOUND if sdf_handle is not valid.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_sdf_view_get_max_query_points(
-        ovphysx_handle_t handle,
-        ovphysx_sdf_view_handle_t sdf_handle,
-        uint32_t* out_max_query_points);
-
-    /**
-     * Evaluate the SDF at query points and write distances + gradients.
-     *
-     * DLTensor requirements:
-     *   query_points:
-     *     - shape: [N, Q, 3] where N = shape count, Q == max_query_points
-     *     - dtype: float32
-     *     - device: GPU (kDLCUDA)
-     *   out_distances_and_gradients:
-     *     - shape: [N, Q, 4] -- component layout: (grad.x, grad.y, grad.z, distance)
-     *     - dtype: float32
-     *     - device: same as query_points
-     *     - must be pre-allocated with the correct shape
-     *
-     * @param handle                        Instance handle.
-     * @param sdf_handle                    SDF view handle from ovphysx_create_sdf_view.
-     * @param query_points                  Query point tensor [N, Q, 3].
-     * @param out_distances_and_gradients   Output tensor [N, Q, 4].
-     * @return OVPHYSX_API_SUCCESS or an error code.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_evaluate_sdf(
-        ovphysx_handle_t handle,
-        ovphysx_sdf_view_handle_t sdf_handle,
-        const DLTensor* query_points,
-        DLTensor* out_distances_and_gradients);
-
-    /**
-     * Destroy an SDF view and release its resources.
-     *
-     * Idempotent: returns OVPHYSX_API_SUCCESS if the view was already
-     * destroyed or removed by stage reset/detach cleanup. After this call
-     * the handle is invalid and must not be used for evaluate/read paths.
-     *
-     * @param handle        Instance handle.
-     * @param sdf_handle    SDF view handle from ovphysx_create_sdf_view.
-     * @return OVPHYSX_API_SUCCESS, or OVPHYSX_API_ERROR on invalid instance handle.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_destroy_sdf_view(
-        ovphysx_handle_t handle,
-        ovphysx_sdf_view_handle_t sdf_handle);
-
-    /**
-     * @defgroup debugrender Debug render buffer
-     * @brief Generate physics debug geometry (points / lines / triangles) and read
-     *        it back. OvPhysX has no built-in viewer: the set_* calls choose what is
-     *        generated, the get_* calls return the raw geometry, and you render it
-     *        yourself.
-     *
-     *        Return convention: when debug rendering is unavailable, most functions
-     *        are no-ops returning OVPHYSX_API_SUCCESS.
-     *        ovphysx_debug_render_set_scope_tokens returns OVPHYSX_API_ERROR when
-     *        scope infrastructure is unavailable. When no USD stage is attached,
-     *        the functions return OVPHYSX_API_ERROR; invalid arguments return
-     *        OVPHYSX_API_INVALID_ARGUMENT (documented per function).
-     *
-     *        Granularity: the debug-render state (enable, parameters, scale,
-     *        scope) applies to every physics scene of the attached stage and
-     *        is process-global; there is no per-scene control. Use
-     *        ovphysx_debug_render_set_scope_tokens to restrict WHAT is drawn.
-     *
-     *        While disabled (the default), debug rendering performs no per-step
-     *        CPU or GPU visualization work, GPU-to-host visualization copies, or
-     *        scratch-allocation growth. Scratch capacity acquired while enabled
-     *        may remain reserved until scene teardown.
-     * @{
-     */
-
-    /**
-     * @brief Enable or disable debug-render generation.
-     *
-     * Enables debug geometry for every body, shape and joint in the scene, applies
-     * the master scale and the current parameter set. Re-call after a scene rebuild
-     * or reset. Read the generated geometry with ovphysx_debug_render_get_points /
-     * _lines / _triangles.
-     *
-     * @param handle  Simulator instance (drives the attached stage).
-     * @param enable  true to start generating debug geometry, false to stop.
-     * @return OVPHYSX_API_SUCCESS (also a no-op SUCCESS when the viz interface is
-     *         unavailable); OVPHYSX_API_ERROR when no USD stage is attached.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_debug_render_enable(ovphysx_handle_t handle, bool enable);
-
-    /**
-     * @brief Set one debug-geometry parameter.
-     *
-     * 0 disables the geometry type and a positive value enables it. For
-     * parameters whose PhysX semantics define a magnitude, that value scales the
-     * geometry together with the master scale. CONTACT_POINT and FRICTION_POINT
-     * use a positive value only as an enable gate; their marker size follows the
-     * master scale. Geometry with an inherent shape (collision shapes, bounds) is
-     * drawn at that shape's dimensions.
-     * @param handle  Simulator instance (drives the attached stage).
-     * @param param   One of ovphysx_debug_render_parameter_t. NONE (0) and values
-     *                >= OVPHYSX_DEBUG_RENDER_PARAM_COUNT are rejected.
-     * @param value   Finite value >= 0; 0 disables and a positive value enables.
-     * @return OVPHYSX_API_INVALID_ARGUMENT if param is out of range or value is
-     *         non-finite or negative; OVPHYSX_API_ERROR when no USD stage is
-     *         attached; otherwise OVPHYSX_API_SUCCESS (a no-op SUCCESS when debug
-     *         rendering is unavailable).
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_debug_render_set_parameter(
-        ovphysx_handle_t handle, uint32_t param, float value);
-
-    /**
-     * @brief Limit debug rendering to an exact set of interned prim paths.
-     *
-     * An object is in scope when its interned prim path is one of the handles
-     * (exact membership, NO prefix expansion). Build the list through the attached
-     * Stage's
-     * path_dictionary_instance_t or from a query's prim list; expand a hierarchy
-     * into its exact object set on the caller side (that is a helper's job, not
-     * this call's). count 0 clears the scope. Joints follow their attached bodies.
-     * The scope applies immediately
-     * to currently instantiated runtime objects; reapply it after runtime topology
-     * changes. Out-of-scope objects are skipped at emission.
-     *
-     * Requires an OVStage attached through ovphysx_attach_ovstage (the path
-     * dictionary lives there). Handles are valid only for that exact dictionary,
-     * require no per-handle release, and the scope is cleared automatically by
-     * ovphysx_detach_ovstage. Re-intern and reapply the scope after attaching a
-     * different Stage. Returns OVPHYSX_API_ERROR when the sidecar symbol,
-     * visualization slot, or attached Stage dictionary is unavailable. Scope
-     * state remains unchanged on every error.
-     *
-     * @param handle  Simulator instance (drives the attached stage).
-     * @param tokens  Array of count interned ovx_primpath_t handles from the
-     *                attached Stage's dictionary. May be NULL when count is 0.
-     * @param count   Number of entries; 0 clears the scope.
-     * @return OVPHYSX_API_INVALID_ARGUMENT when tokens is NULL with count > 0 or
-     *         any token is invalid; OVPHYSX_API_ERROR when the sidecar symbol,
-     *         visualization slot, or attached Stage dictionary is unavailable.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_debug_render_set_scope_tokens(
-        ovphysx_handle_t handle, const ovx_primpath_t* tokens, uint32_t count);
-
-    /**
-     * @brief Read back a debug-render parameter's value.
-     *
-     * Returns the value last set through ovphysx_debug_render_set_parameter,
-     * cached on the OvPhysX side (the debug-render state is process-global;
-     * 0 = off, the default before any set).
-     * @param handle          Instance handle.
-     * @param param           One of ovphysx_debug_render_parameter_t (NONE / out-of-range rejected).
-     * @param[out] out_value  Set to the cached value. Must be non-NULL.
-     * @return OVPHYSX_API_INVALID_ARGUMENT if param is NONE / out of range or out_value is NULL.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_debug_render_get_parameter(
-        ovphysx_handle_t handle, uint32_t param, float* out_value);
-
-    /**
-     * @brief Set the master PhysX debug-render scale.
-     * @param handle  Simulator instance (drives the attached stage).
-     * @param scale   Must be finite and >= 0.
-     * @return OVPHYSX_API_INVALID_ARGUMENT if scale is non-finite or negative;
-     *         OVPHYSX_API_ERROR when no USD stage is attached; otherwise OVPHYSX_API_SUCCESS.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_debug_render_set_scale(ovphysx_handle_t handle, float scale);
-
-    /**
-     * @brief Read back the master debug-render scale last set through OvPhysX (cached;
-     *        defaults to 1.0 before any set).
-     * @param handle          Instance handle.
-     * @param[out] out_scale  Set to the cached scale. Must be non-NULL.
-     * @return OVPHYSX_API_INVALID_ARGUMENT if out_scale is NULL.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_debug_render_get_scale(ovphysx_handle_t handle, float* out_scale);
-
-    /**
-     * @brief Restrict debug-render generation to a world-space AABB.
-     * @param handle  Simulator instance (drives the attached stage).
-     * @param min3    Box minimum, float[3]. Must be non-NULL and finite.
-     * @param max3    Box maximum, float[3]. Must be non-NULL, finite, and >= min3 per axis.
-     * @return OVPHYSX_API_INVALID_ARGUMENT if min3/max3 is NULL, non-finite, or min > max;
-     *         OVPHYSX_API_ERROR when no USD stage is attached; otherwise OVPHYSX_API_SUCCESS.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_debug_render_set_culling_box(
-        ovphysx_handle_t handle, const float min3[3], const float max3[3]);
-
-    /**
-     * @brief Read the current debug-render point buffer (the debug geometry produced
-     *        during the step). OvPhysX has no viewer; draw it yourself.
-     *
-     * **Ownership / lifetime:** the returned pointer aliases an OvPhysX-owned buffer and
-     * is invalidated by the next ovphysx_step() OR by any stage / scene change
-     * (ovphysx_reset_stage, ovphysx_update_from_ovstage, ovphysx_detach_ovstage,
-     * ovphysx_destroy_instance): the underlying PhysX scenes and debug buffers may
-     * be recreated. Copy out before any of those; do not hold the pointer across a
-     * step or re-attach. On
-     * success-with-no-data *out_points is set to NULL and *out_count to 0.
-     *
-     * @param handle           Instance handle.
-     * @param[out] out_points  Set to the buffer base (NULL when empty). Must be non-NULL.
-     * @param[out] out_count   Set to the primitive count (0 when empty). Must be non-NULL.
-     * @return OVPHYSX_API_INVALID_ARGUMENT if out_points or out_count is NULL;
-     *         OVPHYSX_API_ERROR when no USD stage is attached; otherwise OVPHYSX_API_SUCCESS.
-     */
-    OVPHYSX_API ovphysx_result_t ovphysx_debug_render_get_points(
-        ovphysx_handle_t handle, const ovphysx_debug_point_t** out_points, uint32_t* out_count);
-    /** @brief Read the debug-render line buffer. Same ownership / lifetime + argument contract as ovphysx_debug_render_get_points. */
-    OVPHYSX_API ovphysx_result_t ovphysx_debug_render_get_lines(
-        ovphysx_handle_t handle, const ovphysx_debug_line_t** out_lines, uint32_t* out_count);
-    /** @brief Read the debug-render triangle buffer. Same ownership / lifetime + argument contract as ovphysx_debug_render_get_points. */
-    OVPHYSX_API ovphysx_result_t ovphysx_debug_render_get_triangles(
-        ovphysx_handle_t handle, const ovphysx_debug_triangle_t** out_triangles, uint32_t* out_count);
+    OVPHYSX_API ovphysx_result_t ovphysx_flush_log(ovphysx_timeout_t timeout_ns);
 
     /** @} */
 
@@ -2930,5 +2681,9 @@ extern "C" {
 #ifdef __cplusplus
 }
 #endif
+
+/* Compatibility umbrella: existing #include <ovphysx/ovphysx.h> consumers still
+ * see the moved families. New code includes ovphysx_legacy.h explicitly. */
+#include "ovphysx/ovphysx_legacy.h"
 
 #endif // OVPHYSX_OVPHYSX_H

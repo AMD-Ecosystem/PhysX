@@ -1,10 +1,39 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
+
+# @implements REQ-CAPI-VEHICLE-001
+# @covers AC-1
+
+# @implements REQ-CAPI-OVD-NAMES-001
+# @covers AC-3
+
+# @implements REQ-PYTHON-OMNIPVD-LATE-001
+# @covers AC-2
+# @implements REQ-PYTHON-READPOOL-001
+# @covers AC-1
+# @implements REQ-CAPI-OBJECTTYPE-001
+# @covers AC-1
+# @implements REQ-PYTHON-TASK-001
+# @covers AC-8 AC-11
+# @implements REQ-CAPI-CONFIG-001
+# @covers AC-1 AC-8
+# @implements REQ-CAPI-READ-CONTACT-002
+# @covers AC-3
+# @implements REQ-CAPI-WRITE-001
+# @covers AC-15
+# @implements REQ-CAPI-SDF-001
+# @covers AC-4
+# @implements REQ-CAPI-COMPILED-CACHE-001
+# @covers AC-1
 
 """Pure-Python type definitions for ovphysx.
 
+@implements REQ-CAPI-PROFILER-001
+@covers AC-2
+
 This module contains IntEnum definitions that mirror the C enums in
-ovphysx/include/ovphysx/ovphysx_types.h. It has zero native dependencies
+ovphysx/include/ovphysx/ovphysx_types.h and the legacy-only enums in
+ovphysx/include/ovphysx/ovphysx_legacy_types.h. It has zero native dependencies
 (no ctypes, no shared library loading, no USD) and is safe to import in
 any Python process regardless of USD version or native library state.
 
@@ -18,11 +47,19 @@ Naming convention: strip the ``OVPHYSX_TENSOR_`` prefix and scalar dtype suffix
 mechanically verifiable.
 """
 
-from enum import IntEnum
+from enum import IntEnum, IntFlag
+from typing import TYPE_CHECKING, NamedTuple, Sequence, Union
+
+if TYPE_CHECKING:
+    import ovstage
 
 
 class TensorType(IntEnum):
     """Tensor type identifiers for TensorBindingsAPI.
+
+    .. deprecated:: 0.6.0
+        The tensor-binding API is deprecated. Use :meth:`PhysX.read` for reads
+        and :meth:`PhysX.write` for writes.
 
     Values match ovphysx_tensor_type_t in ovphysx_types.h.
     IntEnum members compare equal to plain ints, so they pass directly
@@ -34,27 +71,27 @@ class TensorType(IntEnum):
     # -- Rigid body state (2D, read/write) --
     RIGID_BODY_POSE = 1           # [N, 7]  world-frame pose: (px,py,pz,qx,qy,qz,qw)
     RIGID_BODY_VELOCITY = 2       # [N, 6]  linear (xyz) + angular (xyz) velocity
-    RIGID_BODY_ACCELERATION = 6   # [N, 6]  read-only; linear + angular acceleration
+    RIGID_BODY_ACCELERATION = 6   # [N, 6]  read-only, linear + angular acceleration
 
     # -- Rigid body properties (2D, read/write) --
     RIGID_BODY_MASS = 3           # [N]     mass per body
     RIGID_BODY_INERTIA = 4        # [N, 9]  row-major 3x3 inertia tensor
     RIGID_BODY_COM_POSE = 5       # [N, 7]  center-of-mass pose in local frame
-    RIGID_BODY_INV_MASS = 7       # [N]     read-only; inverse mass
-    RIGID_BODY_INV_INERTIA = 8    # [N, 9]  read-only; inverse inertia
-    RIGID_BODY_DISABLE_SIMULATION = 9  # [N]  read/write uint8/bool; nonzero=disabled, zero=enabled (runtime)
+    RIGID_BODY_INV_MASS = 7       # [N]     read-only, inverse mass
+    RIGID_BODY_INV_INERTIA = 8    # [N, 9]  read-only, inverse inertia
+    RIGID_BODY_DISABLE_SIMULATION = 9  # [N]  read/write uint8/bool, nonzero=disabled, zero=enabled (runtime)
 
     # -- Articulation root (2D, read/write) --
-    ARTICULATION_ROOT_POSE = 10                # [N, 7]  root link world-frame pose
+    ARTICULATION_ROOT_POSE = 10                # [N, 7]  root pose in exposed view world frame
     ARTICULATION_ROOT_VELOCITY = 11            # [N, 6]  root link linear + angular velocity
-    ARTICULATION_MASS_CENTER_WORLD = 12        # [N, 3]    read-only; articulation COM in world frame
-    ARTICULATION_MASS_CENTER_LOCAL = 13        # [N, 3]    read-only; articulation COM in root-local frame
-    ARTICULATION_CENTROIDAL_MOMENTUM = 14      # [N, 6, D+7] read-only; centroidal momentum matrix + bias col; floating-base only
+    ARTICULATION_MASS_CENTER_WORLD = 12        # [N, 3]    read-only, COM in exposed view world frame
+    ARTICULATION_MASS_CENTER_LOCAL = 13        # [N, 3]    read-only, COM in root-link mass frame
+    ARTICULATION_CENTROIDAL_MOMENTUM = 14      # [N, 6, D+7] read-only, centroidal momentum matrix + bias col, floating-base only
 
     # -- Articulation links (3D, read/write unless noted) --
     ARTICULATION_LINK_POSE = 20                # [N, L, 7]  per-link world-frame pose
     ARTICULATION_LINK_VELOCITY = 21            # [N, L, 6]  per-link linear + angular velocity
-    ARTICULATION_LINK_ACCELERATION = 22        # [N, L, 6]  read-only; linear + angular acceleration
+    ARTICULATION_LINK_ACCELERATION = 22        # [N, L, 6]  read-only, linear + angular acceleration
 
     # -- Articulation DOF state (2D, read/write) --
     ARTICULATION_DOF_POSITION = 30             # [N, D]  joint positions
@@ -72,7 +109,7 @@ class TensorType(IntEnum):
     ARTICULATION_DOF_ARMATURE = 40             # [N, D]     reflected rotor inertia
     ARTICULATION_DOF_FRICTION_PROPERTIES = 41  # [N, D, 3]  (static, dynamic, viscous) friction
     ARTICULATION_DOF_DRIVE_MODEL = 42          # [N, D, 3]  (speedEffortGradient, maxActuatorVelocity, velocityDependentResistance)
-    ARTICULATION_DOF_DRIVE_TYPE = 43           # [N, D]     read-only uint8; 0=none, 1=force, 2=acceleration
+    ARTICULATION_DOF_DRIVE_TYPE = 43           # [N, D]     read-only uint8, 0=none, 1=force, 2=acceleration
 
     # -- External wrenches (2D/3D, write-only) --
     RIGID_BODY_FORCE = 50                      # [N, 3]     force in world frame
@@ -83,17 +120,17 @@ class TensorType(IntEnum):
     ARTICULATION_BODY_MASS = 60                # [N, L]     per-link mass
     ARTICULATION_BODY_COM_POSE = 61            # [N, L, 7]  per-link COM pose in local frame
     ARTICULATION_BODY_INERTIA = 62             # [N, L, 9]  row-major 3x3 inertia in COM frame
-    ARTICULATION_BODY_INV_MASS = 63            # [N, L]     read-only; inverse mass
-    ARTICULATION_BODY_INV_INERTIA = 64         # [N, L, 9]  read-only; inverse inertia
-    ARTICULATION_BODY_DISABLE_GRAVITY = 65     # [N, L]     read/write uint8/bool; per-link gravity disable (runtime)
+    ARTICULATION_BODY_INV_MASS = 63            # [N, L]     read-only, inverse mass
+    ARTICULATION_BODY_INV_INERTIA = 64         # [N, L, 9]  read-only, inverse inertia
+    ARTICULATION_BODY_DISABLE_GRAVITY = 65     # [N, L]     read/write uint8/bool, per-link gravity disable (runtime)
 
-    # -- Articulation dynamics queries (2D/3D, read-only) --
+    # -- Articulation inverse dynamics queries (2D/3D, read-only) --
     ARTICULATION_JACOBIAN = 70                 # [N, R, C]  geometric Jacobian
     ARTICULATION_MASS_MATRIX = 71              # [N, M, M]  generalized mass matrix
     ARTICULATION_CORIOLIS_AND_CENTRIFUGAL_FORCE = 72  # [N, M]  Coriolis + centrifugal forces
     ARTICULATION_GRAVITY_FORCE = 73            # [N, M]     generalized gravity forces
     ARTICULATION_LINK_INCOMING_JOINT_FORCE = 74  # [N, L, 6]  joint reaction forces per link
-    ARTICULATION_DOF_PROJECTED_JOINT_FORCE = 75  # [N, D]   read-only; joint forces projected to DOFs
+    ARTICULATION_DOF_PROJECTED_JOINT_FORCE = 75  # [N, D]   read-only, joint forces projected to DOFs
 
     # -- Articulation fixed tendon properties (2D/3D, read/write) --
     ARTICULATION_FIXED_TENDON_STIFFNESS = 80        # [N, T]     tendon stiffness
@@ -110,14 +147,14 @@ class TensorType(IntEnum):
     ARTICULATION_SPATIAL_TENDON_OFFSET = 93           # [N, T]   length offset
 
     # -- Shape-level properties (2D/3D, read/write).
-    #    S = max collision shapes per body/link.  Bodies with fewer shapes
-    #    have zero-padded trailing entries. --
+    #    S = max collision shapes per rigid body, or per articulation summed over all its
+    #    links.  Bodies with fewer shapes have zero-padded trailing entries. --
     RIGID_BODY_SHAPE_FRICTION_AND_RESTITUTION = 100    # [N, S, 3] (static_friction, dynamic_friction, restitution)
     RIGID_BODY_CONTACT_OFFSET = 101                   # [N, S]    contact offset per shape
     RIGID_BODY_REST_OFFSET = 102                      # [N, S]    rest offset per shape
-    # Rigid-body property; occupies the end of the rigid-body numeric range
-    # (no free slot next to RIGID_BODY_DISABLE_SIMULATION=9). Matches the C enum.
-    RIGID_BODY_DISABLE_GRAVITY = 103                  # [N]       read/write uint8/bool; nonzero=gravity disabled (runtime)
+    # Rigid-body property at the end of the rigid-body numeric range, because
+    # there is no free slot next to RIGID_BODY_DISABLE_SIMULATION=9. Matches the C enum.
+    RIGID_BODY_DISABLE_GRAVITY = 103                  # [N]       read/write uint8/bool, nonzero=gravity disabled (runtime)
 
     ARTICULATION_SHAPE_FRICTION_AND_RESTITUTION = 110  # [N, S, 3] (static_friction, dynamic_friction, restitution)
     ARTICULATION_CONTACT_OFFSET = 111                 # [N, S]    contact offset per shape
@@ -142,13 +179,17 @@ class TensorType(IntEnum):
     DEFORMABLE_MATERIAL_YOUNGS_MODULUS = 131         # [M] Young's modulus
     DEFORMABLE_MATERIAL_POISSONS_RATIO = 132         # [M] Poisson's ratio
     DEFORMABLE_MATERIAL_ELASTICITY_DAMPING = 133     # [M] elasticity damping (volume + surface)
-    DEFORMABLE_MATERIAL_BENDING_STIFFNESS = 134      # [M] bending stiffness (surface only; 0 for volume)
-    DEFORMABLE_MATERIAL_THICKNESS = 135              # [M] thickness (surface only; 0 for volume)
-    DEFORMABLE_MATERIAL_BENDING_DAMPING = 136        # [M] bending damping (surface only; 0 for volume)
+    DEFORMABLE_MATERIAL_BENDING_STIFFNESS = 134      # [M] bending stiffness (surface only, 0 for volume)
+    DEFORMABLE_MATERIAL_THICKNESS = 135              # [M] thickness (surface only, 0 for volume)
+    DEFORMABLE_MATERIAL_BENDING_DAMPING = 136        # [M] bending damping (surface only, 0 for volume)
 
 
 class SceneQueryMode(IntEnum):
-    """Scene query hit mode. Mirrors ovphysx_scene_query_mode_t."""
+    """Scene query hit mode. Mirrors ovphysx_scene_query_mode_t.
+
+    .. deprecated:: 0.6.0
+        Scene queries are deprecated.
+    """
 
     CLOSEST = 0  # Return the single closest hit (or none)
     ANY     = 1  # Return whether any hit exists (0 or 1 result)
@@ -156,7 +197,11 @@ class SceneQueryMode(IntEnum):
 
 
 class SceneQueryGeometryType(IntEnum):
-    """Geometry type for sweep/overlap queries. Mirrors ovphysx_scene_query_geometry_type_t."""
+    """Geometry type for sweep/overlap queries. Mirrors ovphysx_scene_query_geometry_type_t.
+
+    .. deprecated:: 0.6.0
+        Scene queries are deprecated.
+    """
 
     SPHERE = 0  # Sphere defined by radius + center
     BOX    = 1  # Oriented box defined by half-extents + pose
@@ -164,13 +209,18 @@ class SceneQueryGeometryType(IntEnum):
 
 
 class LogLevel(IntEnum):
-    """Log level for ovphysx output. Mirrors ovphysx_log_level_t."""
+    """Log level for ovphysx output. Mirrors ovphysx_log_level_t.
 
-    VERBOSE = 0
-    INFO = 1
-    WARNING = 2
-    ERROR = 3
-    NONE = 4
+    ``DEFAULT`` restores the effective ``WARNING`` threshold. ``DEFAULT`` and
+    ``NONE`` configure logging but are never delivered as callback severities.
+    """
+
+    DEFAULT = 0
+    VERBOSE = 1
+    INFO = 2
+    WARNING = 3
+    ERROR = 4
+    NONE = 5
 
 
 class ApiStatus(IntEnum):
@@ -182,25 +232,61 @@ class ApiStatus(IntEnum):
     NOT_IMPLEMENTED = 3
     INVALID_ARGUMENT = 4
     NOT_FOUND = 5
-    BUFFER_TOO_SMALL = 6    # caller-supplied buffer is too small; check API-specific size metadata
+    BUFFER_TOO_SMALL = 6    # caller-supplied buffer is too small, see out_required_size
     DEVICE_MISMATCH = 7     # tensor device cannot be used or staged for this binding/policy
     GPU_NOT_AVAILABLE = 8   # GPU requested but not available or CUDA init failed
-    END_OF_ITERATION = 9    # iterator exhausted (e.g. fetch_read_next past the last group) — not an error
+    INVALID_STATE = 9       # operation is not valid in the instance's current lifecycle state
+
+
+class TaskStatus(IntEnum):
+    """State of an issued task, as reported by :meth:`ovphysx.PhysX.task_status`.
+
+    Mirrors ``ovphysx_task_status_t``. The query never collects: SUCCEEDED and
+    FAILED stay observable until a wait collects the task, which then reports
+    NOT_FOUND.
+    """
+
+    NOT_FOUND = 0   # never issued, or its outcome was already collected
+    PENDING = 1     # accepted and queued; its work has not started
+    RUNNING = 2     # its work started and has not finished
+    SUCCEEDED = 3   # finished successfully; outcome not yet collected
+    FAILED = 4      # finished with a failure; outcome not yet collected
 
 
 class ObjectType(IntEnum):
-    """TensorAPI object classification. Mirrors ovphysx_object_type_t."""
+    """TensorAPI object classification. Mirrors ``ovphysx_object_type_t`` in the legacy C header.
 
-    INVALID = 0
+    .. deprecated:: 0.6.0
+        Object-type lookup via :meth:`PhysX.get_object_type` is deprecated.
+
+    Returned by :meth:`PhysX.get_object_type`. Standalone UsdPhysics joints are
+    ``JOINT``; plugin-registered custom joints are ``CUSTOM_JOINT``; articulation
+    joints are ``ARTICULATION_JOINT``. Native addresses for those kinds are the
+    ``physxPointer`` column on the matching :class:`SimObjectType`.
+    """
+
+    INVALID = 0  # No classified simulation object at the path
     RIGID_BODY = 1
     ARTICULATION = 2
     ARTICULATION_LINK = 3
     ARTICULATION_ROOT_LINK = 4
-    ARTICULATION_JOINT = 5
+    ARTICULATION_JOINT = 5  # Reduced-coordinate articulation joint
+    JOINT = 6  # Maximal-coordinate standalone joint (physx::PxJoint)
+    CUSTOM_JOINT = 7  # Plugin-registered custom joint (CustomPhysXJoint)
 
 
 class SimObjectType(IntEnum):
-    """Simulated object type for the physics output read. Mirrors ovphysx_sim_object_type_t."""
+    """Query target for the physics output read.
+
+    Mirrors ``ovphysx_query_target_t``, including its numbering rules: explicit
+    contiguous values from 0, new entries appended with the next integer, and no
+    gaps or renumbering. ``DEBUG_RENDER`` is an instance target, not a simulated
+    prim. Its value is pinned like the others; later types append after it.
+
+    This is a separate enum domain from the TensorBindings :class:`ObjectType`.
+    In particular, ``SimObjectType.ARTICULATION`` is 9 while
+    ``ObjectType.ARTICULATION`` is 2.
+    """
 
     RIGID_BODY = 0
     ARTICULATION_LINK = 1
@@ -209,12 +295,31 @@ class SimObjectType(IntEnum):
     DEFORMABLE_VOLUME = 4
     DEFORMABLE_SURFACE = 5
     PARTICLE_SET = 6
+    FIXED_TENDON = 7
+    SPATIAL_TENDON = 8
+    ARTICULATION = 9
+    DEFORMABLE_MATERIAL = 10
+    CONTACT_SENSOR = 11
+    CHARACTER_CONTROLLER = 12
+    VEHICLE = 13
+    SCENE = 14
+    PHYSX_MATERIAL = 15
+    SHAPE = 16
+    COMPOUND_SHAPE = 17
+    RIGID_ACTOR = 18
+    JOINT = 19
+    CUSTOM_JOINT = 20
+    PARTICLE_SYSTEM = 21
+    PHYSICS = 22
+    DEBUG_RENDER = 23
+    SDF_SHAPE = 24
+    DEFORMABLE_SKIN_MESH = 25
 
 
 class ObjectScope(IntEnum):
     """Output query scope. Mirrors ovphysx_object_scope_t.
 
-    ACTIVE is single-frame (the active set is recomputed each step); ALL is
+    ACTIVE is single-frame (the active set is recomputed each step). ALL is
     stable until a structural change.
     """
 
@@ -222,40 +327,149 @@ class ObjectScope(IntEnum):
     ACTIVE = 1
 
 
+class ContactSelection(NamedTuple):
+    """One contact-sensor selection and its filters, for ``PhysX.query(..., contacts=[...])`` (ADR-0044).
+
+    ``sensors`` selects sensor bodies -- and, on CPU simulation or GPU dynamics with CPU readback,
+    colliders carrying ``PhysxContactReportAPI`` (host-only; a DirectGPU scene has no separate child-collider
+    rows, and a body row overlaps its collider rows, so don't sum across them). Each
+    entry of ``filters`` must match one object, shared by every sensor of this selection, or exactly one
+    object per sensor, paired by position. Every selection is either a glob ``str`` or a list of native
+    ``ovx_primpath_t`` handles, as for ``pattern`` and ``prim_paths``. All selections of one query carry
+    the same number of filters.
+
+    A separate child collider's schema enables sensor selection, not its owner's reporting. Also enable
+    reporting on the body, owning articulation link, or articulation root to avoid depending on reports
+    from the other actor in each pair. The child remains a row but reads zero when neither actor reports
+    matching contacts. Configure reporting settings on the reporting actor or articulation root;
+    a standalone static collider is its own actor and enables reporting on CPU simulation and GPU dynamics
+    with CPU readback. On DirectGPU its sensor row remains but reads zero force.
+    """
+
+    sensors: Union[str, Sequence["ovstage.PrimPath | int"]]
+    filters: Sequence[Union[str, Sequence["ovstage.PrimPath | int"]]] = ()
+
+
+class ArticulationKinematicFlag(IntFlag):
+    """Articulation state propagated by ``update_articulations_kinematic``."""
+
+    POSITION = 1 << 0
+    VELOCITY = 1 << 1
+
+
+class GlobalConfigKey(IntEnum):
+    """Process-global configuration keys."""
+
+    DISABLE_CONTACT_PROCESSING = 0x00000000
+    COLLISION_CONE_CUSTOM_GEOMETRY = 0x00000001
+    COLLISION_CYLINDER_CUSTOM_GEOMETRY = 0x00000002
+    NUM_THREADS = 0x00000003
+    SCENE_MULTI_GPU_MODE = 0x00000004
+    OVSTAGE_READ_POOL_MAX_MB = 0x00000005
+    PROFILER_BACKEND = 0x00000006
+    COOKED_COLLIDER_CACHE_DIRECTORY = 0x00000007
+    PROFILER_OUTPUT_PATH = 0x00000008
+    CPU_ONLY = 0x00000009
+    LOG_LEVEL = 0x0000000A
+    DEFAULT_LOG_OUTPUT = 0x0000000B
+    OVD_RECORDING_CAPABLE = 0x0000000C
+    ASYNC_EXECUTION = 0x0000000D
+    COMPILED_STAGE_CACHE = 0x0000000E
+
+
+class ConfigKey(IntEnum):
+    """Per-instance configuration keys."""
+
+    ACTIVE_CUDA_GPUS = 0x00010000
+
+
 class ConfigBool(IntEnum):
-    """Boolean config keys. Mirrors ovphysx_config_bool_t."""
+    """Deprecated boolean configuration keys."""
 
     DISABLE_CONTACT_PROCESSING = 0
     COLLISION_CONE_CUSTOM_GEOMETRY = 1
     COLLISION_CYLINDER_CUSTOM_GEOMETRY = 2
-    OMNIPVD_OUTPUT_ENABLED = 3
 
 
 class ConfigInt32(IntEnum):
-    """Int32 config keys. Mirrors ovphysx_config_int32_t."""
+    """Deprecated int32 configuration keys."""
 
     NUM_THREADS = 0
     SCENE_MULTI_GPU_MODE = 1
+    OVSTAGE_READ_POOL_MAX_MB = 4
+    PROFILER_BACKEND = 5
 
 
 class ConfigFloat(IntEnum):
-    """Float config keys (reserved). Mirrors ovphysx_config_float_t."""
+    """Deprecated float configuration keys."""
     pass
 
 
 class ConfigString(IntEnum):
-    """String config keys. Mirrors ovphysx_config_string_t."""
+    """Deprecated string configuration keys."""
 
-    OMNIPVD_OVD_RECORDING_DIRECTORY = 0
+    COOKED_COLLIDER_CACHE_DIRECTORY = 1
+    PROFILER_OUTPUT_PATH = 4
 
 
+class ProfilerBackend(IntEnum):
+    """Profiler backend selection. Mirrors ovphysx_profiler_backend_t.
+
+    The value of :attr:`GlobalConfigKey.PROFILER_BACKEND`.
+    """
+
+    NONE = 0
+    NVTX = 1
+    TRACE = 2
+
+
+class CompiledStageCacheMode(IntEnum):
+    """Compiled ovstage cache mode. Mirrors ovphysx_compiled_stage_cache_mode_t.
+
+    The value of :attr:`GlobalConfigKey.COMPILED_STAGE_CACHE`. Experimental.
+    Each later :meth:`PhysX.attach_ovstage` reads it, so it can change at any
+    time. The cache stores compiled attach results, and physics subtrees that a
+    later :meth:`PhysX.update_from_ovstage` adds, in the cooked-collider
+    (UJITSO) datastore, keyed by the physics inputs and the runtime build.
+    Changed inputs miss and load normally; the developer guide's Compiled Stage
+    Cache section describes what happens when a stored result fails.
+
+    ``AUTOMATIC`` (default) selects ``READ_WRITE`` while cooked colliders persist
+    in a directory :attr:`GlobalConfigKey.COOKED_COLLIDER_CACHE_DIRECTORY`
+    configured, that the datastore was built from and that, on Linux, is private
+    to the user (not a symlink, owned by the user and closed to group and others,
+    with every directory above it owned by the user or root and writable by no one
+    else unless sticky, as ``/tmp`` is), and ``DISABLED`` otherwise; it logs why at
+    ``LogLevel.INFO`` when a configured directory fails either condition. The
+    process-private fallback directory is deleted at shutdown, so storing there
+    would only help within one process. ``READ_WRITE`` uses the configured
+    directory either way; without one it stores into that process-private
+    directory, and reuse ends at shutdown. When no local datastore is usable,
+    the attach loads normally and reports unavailable. Each attach logs its
+    cache outcome at ``LogLevel.INFO``.
+
+    Stored results are deserialized in place, as cooked colliders are; see
+    :attr:`PhysXConfig.cooked_collider_cache_dir` for who may write the directory.
+    Attaches that assign replicator environment ids for :meth:`PhysX.clone` are
+    cached too: a restored stage carries the environment ids that loading it
+    normally assigns.
+    """
+
+    AUTOMATIC = 0
+    DISABLED = 1
+    READ_ONLY = 2
+    READ_WRITE = 3
 
 
 class BindingPrimMode(IntEnum):
     """Prim selection mode for tensor bindings.
 
+    .. deprecated:: 0.6.0
+        The tensor-binding API is deprecated. Use :meth:`PhysX.read` for reads
+        and :meth:`PhysX.write` for writes.
+
     Unlike the other enums in this module, BindingPrimMode does not have a
-    named typedef in ovphysx_types.h -- the values come from the internal
+    named typedef in ovphysx_types.h. The values come from the internal
     implementation. It is not covered by test_types_sync.py.
     """
 

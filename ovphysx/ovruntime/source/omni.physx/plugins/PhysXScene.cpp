@@ -1,9 +1,51 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+// @implements REQ-NATIVE-INTERACTION-001
+// @covers AC-5 AC-6
+
+// @implements REQ-EVENT-QUEUE-001
+// @covers AC-2
+
+// @implements REQ-VEHICLE-CONTROL-001
+// @covers AC-2 AC-3
+
+// @implements REQ-READ-VEHICLE-001
+// @covers AC-9
+
+// @implements REQ-ATTACH-SERVICES-001
+// @covers AC-3
+
+// @implements REQ-ATTACH-LIFETIME-001
+// @covers AC-3
+
+// @implements REQ-ATTACH-RESOLVE-001
+// @covers AC-4
+
+// @implements REQ-CACHE-ATTACH-001
+// @covers AC-3
+
+/**
+ * @implements REQ-SIM-MULTISCENE-001
+ * @covers AC-1 AC-2
+ *
+ * @implements REQ-SIM-ACTIVEACTOR-001
+ * @covers AC-2 AC-3
+ *
+ * @implements REQ-SIM-DIAGNOSTICS-001
+ * @covers AC-1
+ *
+ * @implements REQ-SIM-GPU-ERROR-001
+ * @covers AC-1
+ *
+ * @implements REQ-READ-SDF-001
+ * @covers AC-7
+ */
+
 #include "PhysXSettings.h"
 #include "PhysXScene.h"
+#include "NativeInteractionStep.h"
+#include "OvxPhysicsShared.h"
 #include "PhysXDefines.h"
 #include "Setup.h"
 #include "OmniPhysX.h"
@@ -17,6 +59,7 @@
 #include "PhysXFoundation.h"
 
 #include "internal/InternalParticle.h"
+#include "PhysXDebugVisualization.h"
 
 #include <omni/physx/TriggerEvent.h>
 
@@ -33,7 +76,6 @@
 
 #include <deformables/PhysXDeformablePost.h>
 
-using namespace PXR_NS;
 using namespace carb;
 using namespace ::physx;
 using namespace omni::physx::usdparser;
@@ -73,15 +115,15 @@ static PxFilterFlags OmniFilterShader(PxFilterObjectAttributes attributes0,
     if (filterData0.word2 && filterData1.word2)
     {
         const Pair<uint32_t> groupPair(filterData0.word2, filterData1.word2);
-        CollisionGroupsPairsSet::const_iterator it = physxSetup.getCollisionGroupFilteredPairs().find(groupPair);
+        CollisionGroupsPairsSet::const_iterator it = scene->getAttachedStage().getCollisionGroupFilteredPairs().find(groupPair);
         if (!scene->isInvertedCollisionGroupFilter())
         {
-            if (it != physxSetup.getCollisionGroupFilteredPairs().end())
+            if (it != scene->getAttachedStage().getCollisionGroupFilteredPairs().end())
                 return PxFilterFlag::eKILL;
         }
         else
         {
-            if (it == physxSetup.getCollisionGroupFilteredPairs().end())
+            if (it == scene->getAttachedStage().getCollisionGroupFilteredPairs().end())
                 return PxFilterFlag::eKILL;
         }
     }
@@ -102,8 +144,8 @@ static PxFilterFlags OmniFilterShader(PxFilterObjectAttributes attributes0,
     if (filterData0.word1 && filterData1.word1)
     {
         const Pair<uint32_t> filterPair(filterData0.word1, filterData1.word1);
-        FilteredPairsSet::const_iterator it = physxSetup.getFilteredPairs().find(filterPair);
-        if (it != physxSetup.getFilteredPairs().end())
+        FilteredPairsSet::const_iterator it = scene->getAttachedStage().getFilteredPairs().find(filterPair);
+        if (it != scene->getAttachedStage().getFilteredPairs().end())
             return PxFilterFlag::eKILL;
     }
 
@@ -204,15 +246,15 @@ bool OmniContactReportCallback::isFilteredEvent(const ::physx::PxShape* s0, cons
     if (filterData0.word2 && filterData1.word2)
     {
         const Pair<uint32_t> groupPair(filterData0.word2, filterData1.word2);
-        CollisionGroupsPairsSet::const_iterator it = physxSetup.getCollisionGroupFilteredPairs().find(groupPair);
+        CollisionGroupsPairsSet::const_iterator it = mPhysXScene->getAttachedStage().getCollisionGroupFilteredPairs().find(groupPair);
         if (!mPhysXScene->isInvertedCollisionGroupFilter())
         {
-            if (it != physxSetup.getCollisionGroupFilteredPairs().end())
+            if (it != mPhysXScene->getAttachedStage().getCollisionGroupFilteredPairs().end())
                 return true;
         }
         else
         {
-            if (it == physxSetup.getCollisionGroupFilteredPairs().end())
+            if (it == mPhysXScene->getAttachedStage().getCollisionGroupFilteredPairs().end())
                 return true;
         }
     }
@@ -220,8 +262,8 @@ bool OmniContactReportCallback::isFilteredEvent(const ::physx::PxShape* s0, cons
     if (filterData0.word1 && filterData1.word1)
     {
         const Pair<uint32_t> filterPair(filterData0.word1, filterData1.word1);
-        FilteredPairsSet::const_iterator it = physxSetup.getFilteredPairs().find(filterPair);
-        if (it != physxSetup.getFilteredPairs().end())
+        FilteredPairsSet::const_iterator it = mPhysXScene->getAttachedStage().getFilteredPairs().find(filterPair);
+        if (it != mPhysXScene->getAttachedStage().getFilteredPairs().end())
             return true;
     }
 
@@ -237,7 +279,7 @@ void OmniContactReportCallback::onTrigger(PxTriggerPair* pairs, PxU32 count)
             continue;
         if (current.flags & PxTriggerPairFlag::eREMOVED_SHAPE_OTHER)
         {
-            mOmniPhysX->getTriggerManager()->bufferTriggerEvent(current.triggerShape, current.otherShape, TriggerEventType::eTRIGGER_ON_LEAVE);
+            mOmniPhysX->getTriggerManager()->bufferTriggerEvent(mPhysXScene->getAttachedStage(), current.triggerShape, current.otherShape, TriggerEventType::eTRIGGER_ON_LEAVE);
             continue;
         }
         if (!current.triggerShape || !current.otherShape)
@@ -247,9 +289,11 @@ void OmniContactReportCallback::onTrigger(PxTriggerPair* pairs, PxU32 count)
         }
 
         if (current.status & PxPairFlag::eNOTIFY_TOUCH_FOUND && !isFilteredEvent(current.triggerShape, current.otherShape))
-            mOmniPhysX->getTriggerManager()->bufferTriggerEvent(current.triggerShape, current.otherShape, TriggerEventType::eTRIGGER_ON_ENTER);
+            mOmniPhysX->getTriggerManager()->bufferTriggerEvent(mPhysXScene->getAttachedStage(), current.triggerShape, current.otherShape, TriggerEventType::eTRIGGER_ON_ENTER,
+                uint64_t(current.triggerActor->userData), uint64_t(current.otherActor->userData));
         if (current.status & PxPairFlag::eNOTIFY_TOUCH_LOST && !isFilteredEvent(current.triggerShape, current.otherShape))
-            mOmniPhysX->getTriggerManager()->bufferTriggerEvent(current.triggerShape, current.otherShape, TriggerEventType::eTRIGGER_ON_LEAVE);
+            mOmniPhysX->getTriggerManager()->bufferTriggerEvent(mPhysXScene->getAttachedStage(), current.triggerShape, current.otherShape, TriggerEventType::eTRIGGER_ON_LEAVE,
+                uint64_t(current.triggerActor->userData), uint64_t(current.otherActor->userData));
     }
 }
 
@@ -257,9 +301,31 @@ void OmniContactReportCallback::onAdvance(const PxRigidBody* const* bodyBuffer, 
 {
 }
 
+static const PxMaterial* resolveContactMaterial(PxShape* shape, PxU32 internalFaceIndex)
+{
+    // GPU mesh-mesh contact reduction does not preserve triangle provenance, so
+    // extractContacts() reports an unknown face index for both shapes. Avoid
+    // asking an ordinary triangle mesh to resolve that sentinel: the SDK warns
+    // and returns null. A single-material mesh is unambiguous, but selecting a
+    // material for a multi-material mesh would be incorrect.
+    if (internalFaceIndex == UNKNOWN_FACE_ID &&
+        shape->getGeometry().getType() == PxGeometryType::eTRIANGLEMESH)
+    {
+        if (shape->getNbMaterials() != 1)
+            return nullptr;
+
+        PxMaterial* material = nullptr;
+        return shape->getMaterials(&material, 1) == 1 ? material : nullptr;
+    }
+
+    PxBaseMaterial* baseMaterial = shape->getMaterialFromInternalFaceIndex(internalFaceIndex);
+    PX_ASSERT(!baseMaterial || baseMaterial->getConcreteType() == PxConcreteType::eMATERIAL);
+    return baseMaterial ? baseMaterial->is<PxMaterial>() : nullptr;
+}
+
 void OmniContactReportCallback::onContact(const PxContactPairHeader& pairHeader, const PxContactPair* pairsIn, PxU32 countIn)
 {
-    if (mOmniPhysX->getCachedSettings().disableContactProcessing)
+    if (mPhysXScene->getAttachedStage().getCachedSettings().disableContactProcessing)
         return;
 
     PxU32 count = countIn;
@@ -357,13 +423,10 @@ void OmniContactReportCallback::onContact(const PxContactPairHeader& pairHeader,
                 const uint32_t faceIndex0 = indexResolve0.resolveFaceIndex(contactPoints[j].internalFaceIndex0);
                 const uint32_t faceIndex1 = indexResolve1.resolveFaceIndex(contactPoints[j].internalFaceIndex1);
 
-                PxBaseMaterial* baseMaterial0 = current.shapes[0]->getMaterialFromInternalFaceIndex(contactPoints[j].internalFaceIndex0);
-                PX_ASSERT(!baseMaterial0 || baseMaterial0->getConcreteType() == PxConcreteType::eMATERIAL);
-                const PxMaterial* material0 = (baseMaterial0 != nullptr) ? baseMaterial0->is<PxMaterial>() : nullptr;
-
-                PxBaseMaterial* baseMaterial1 = current.shapes[1]->getMaterialFromInternalFaceIndex(contactPoints[j].internalFaceIndex1);
-                PX_ASSERT(!baseMaterial1 || baseMaterial1->getConcreteType() == PxConcreteType::eMATERIAL);
-                const PxMaterial* material1 = (baseMaterial1 != nullptr) ? baseMaterial1->is<PxMaterial>() : nullptr;
+                const PxMaterial* material0 =
+                    resolveContactMaterial(current.shapes[0], contactPoints[j].internalFaceIndex0);
+                const PxMaterial* material1 =
+                    resolveContactMaterial(current.shapes[1], contactPoints[j].internalFaceIndex1);
 
                 mContactReport->reportContactPoint(mPhysXScene, contactPoints[j].position, contactPoints[j].normal, contactPoints[j].impulse, contactPoints[j].separation, faceIndex0, faceIndex1, material0, material1);
             }
@@ -399,23 +462,23 @@ bool getSurfaceVelocities(internal::InternalPhysXDatabase& db,
                 const PxVec3 contactPoint = contacts.getPoint(PxU32(index));
                 const PxVec3 localPoint = splineWorldPose.transformInv(contactPoint);
 
-                GfVec3f pointOnCurve;
-                GfVec3f tangent;
-                GfVec3f curvaturePoint;
+                PxVec3 pointOnCurve;
+                PxVec3 tangent;
+                PxVec3 curvaturePoint;
                 const bool retVal =
-                    intActor->mSplinesCurve->getClosestPoint(toVec3f(localPoint), pointOnCurve, tangent, curvaturePoint);
+                    intActor->mSplinesCurve->getClosestPoint(localPoint, pointOnCurve, tangent, curvaturePoint);
 
                 if (retVal)
                 {
                     // Check if we have valid curvature (not a straight line)
-                    const bool hasCurvature = (curvaturePoint[0] != FLT_MAX);
+                    const bool hasCurvature = (curvaturePoint.x != FLT_MAX);
 
                     float radiusScale = 1.0f;
 
                     if (hasCurvature)
                     {
-                        const PxVec3 worldPointOnCurve = splineWorldPose.transform(toPhysX(pointOnCurve));
-                        const PxVec3 worldCurvaturePoint = splineWorldPose.transform(toPhysX(curvaturePoint));
+                        const PxVec3 worldPointOnCurve = splineWorldPose.transform(pointOnCurve);
+                        const PxVec3 worldCurvaturePoint = splineWorldPose.transform(curvaturePoint);
 
 
                         const PxVec3 contactNormal = contacts.getNormal(PxU32(index));
@@ -446,7 +509,7 @@ bool getSurfaceVelocities(internal::InternalPhysXDatabase& db,
                     }
 
                     {
-                        linearVelocities[index] = splineWorldPose.rotate(toPhysX(tangent));
+                        linearVelocities[index] = splineWorldPose.rotate(tangent);
                         linearVelocities[index].normalize();
                         linearVelocities[index] *= intActor->mSplinesSurfaceVelocityMagnitude * radiusScale;
                     }
@@ -586,15 +649,15 @@ void OmniContactReportCallback::onContactModify(PxContactModifyPair* pairs, PxU3
         const bool s1 = (pair.shape[1]->getSimulationFilterData().word3 & CONTACT_MODIFY_SURFACE_VELOCITY) != 0;
         if (s0 && s1)
         {
-            computeContactsSurfaceVelocitiesBoth(mOmniPhysX->getInternalPhysXDatabase(), * pair.actor[0], * pair.actor[1], pair.contacts);
+            computeContactsSurfaceVelocitiesBoth(mPhysXScene->getAttachedStage().getInternalPhysXDatabase(), * pair.actor[0], * pair.actor[1], pair.contacts);
         }
         else if (s0)
         {
-            computeContactsSurfaceVelocities(mOmniPhysX->getInternalPhysXDatabase(), * pair.actor[0], * pair.actor[1], pair.contacts);
+            computeContactsSurfaceVelocities(mPhysXScene->getAttachedStage().getInternalPhysXDatabase(), * pair.actor[0], * pair.actor[1], pair.contacts);
         }
         else if (s1)
         {
-            computeContactsSurfaceVelocities(mOmniPhysX->getInternalPhysXDatabase(), * pair.actor[1], * pair.actor[0], pair.contacts);
+            computeContactsSurfaceVelocities(mPhysXScene->getAttachedStage().getInternalPhysXDatabase(), * pair.actor[1], * pair.actor[0], pair.contacts);
         }
     }
 }
@@ -745,6 +808,7 @@ void PhysXStepper::launch(int nbSubsteps, float stepSize, PhysXScene* scene, PxT
 {
     const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
     mPhysXScene = scene;
+    mStepAttach = scene->getAttachedStage().getAttachHandle();
     mNbSubsteps = nbSubsteps;
     mStepSize = stepSize;
     mLastStep = lastStep;
@@ -753,23 +817,15 @@ void PhysXStepper::launch(int nbSubsteps, float stepSize, PhysXScene* scene, PxT
     mSendStepping = false;
     mPhysXScene->getContactReportCallback().mStepSize = stepSize;
     mComplete = false;
-    mUpdateVelocities = omniPhysX.getCachedSettings().updateVelocitiesToUsd;
+    mUpdateVelocities = mPhysXScene->getAttachedStage().getCachedSettings().updateVelocitiesToUsd;
     mSceneQueryUpdateMode = scene->getSceneQueryUpdateMode();
 
     // skip for empty scenes
-    mSkipSimulation = !omniPhysX.getCachedSettings().simulateEmptyScene && omniPhysX.getInternalPhysXDatabase().getRecords().size() <= 2;
+    mSkipSimulation = !mPhysXScene->getAttachedStage().getCachedSettings().simulateEmptyScene && mPhysXScene->getAttachedStage().getInternalPhysXDatabase().getRecords().size() <= 2;
     const uint32_t wc = taskManager->getCpuDispatcher()->getWorkerCount();
     if (wc > 0)
     {
-        if (!omniPhysX.getPhysXSetup().isPhysXCpuDispatcher())
-        {
-            omniPhysX.getITasking()->addTask(carb::tasking::Priority::eHigh, {}, [this] { run(); });
-        }
-        else
-        {
-            setContinuation(*taskManager, NULL);
-            removeReference();
-        }
+        omniPhysX.getITasking()->addTask(carb::tasking::Priority::eHigh, {}, [this] { run(); });
     }
     else
     {
@@ -804,22 +860,29 @@ void clearVelocities(PxActor& pxActor)
 
 void PhysXStepper::updateQuasistaticActors(const PxU32 nbActors, PxActor** activeActors)
 {
-    if (mPhysXScene->getInternalScene()->getSceneDesc().quasistaticActors.empty())
+    InternalScene* internalScene = mPhysXScene->getInternalScene();
+    const bool hasReleasedActors = internalScene->hasReleasedActiveActors();
+    if (internalScene->getSceneDesc().quasistaticActors.empty())
     {
         for (PxU32 i = 0; i < nbActors; i++)
         {
             PxActor* pxActor = activeActors[i];
+            if (!pxActor || (hasReleasedActors && internalScene->isReleasedActiveActor(pxActor)))
+                continue;
             clearVelocities(*pxActor);
         }
     }
     else
     {
-        InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+        InternalPhysXDatabase& db = mPhysXScene->getAttachedStage().getInternalPhysXDatabase();
         for (PxU32 i = 0; i < nbActors; i++)
         {
             PxActor* pxActor = activeActors[i];
+            if (!pxActor || (hasReleasedActors && internalScene->isReleasedActiveActor(pxActor)))
+                continue;
+
             const size_t recordsIndex = (size_t)pxActor->userData;
-            if (!pxActor || recordsIndex >= db.getRecords().size())
+            if (recordsIndex >= db.getRecords().size())
                 continue;
 
             const InternalDatabase::Record& record = db.getRecords()[recordsIndex];
@@ -998,7 +1061,7 @@ void PhysXStepper::updateVehicles()
             // supporting both ITasking and PhysX dispatcher for now as Ales encountered cases
             // where ITasking was slow
 
-            if (!omniPhysX.getPhysXSetup().isPhysXCpuDispatcher())
+            if (!mPhysXScene->getAttachedStage().getSharedSettings().usePhysxDispatcher)
             {
                 carb::tasking::ITasking* iTasking = omniPhysX.getITasking();
                 iTasking->applyRangeBatch(tasksToRun, 1, [&](size_t begin, size_t end) {
@@ -1044,6 +1107,10 @@ void PhysXStepper::updateVehicles()
                     *physxVehicle, physxSetup);
 
                 physxVehicle->simulateEnd(mStepSize, simContextMod);
+                // @implements REQ-VEHICLE-CONTROL-001
+                // @covers AC-2 AC-3
+                vehicles[i]->mGroundQueryRecordEpoch =
+                    mPhysXScene->getAttachedStage().getInternalPhysXDatabase().recordEpoch();
             }
         }
     }
@@ -1078,16 +1145,16 @@ void PhysXStepper::updateDeformables(int step, int numSteps)
     if (!isLastSubstep)
         return;
 
-    const bool updateUSD = OmniPhysX::getInstance().getCachedSettings().updateToUsd;
+    const bool updateUSD = mPhysXScene->getAttachedStage().getCachedSettings().updateToUsd;
     if (!updateUSD)
         return; // AD is this the right thing to do? we might want the DtoH copy even if we don't write to USD..?
 
-    SimulationCallbacks* cb = SimulationCallbacks::getSimulationCallbacks();
+    SimulationCallbacks* cb = &mPhysXScene->getAttachedStage().getSimulationCallbacks();
     const bool skipWriteTransforms = cb->checkGlobalSimulationFlags(GlobalSimulationFlag::eTRANSFORMATION | GlobalSimulationFlag::eSKIP_WRITE);
     if (skipWriteTransforms)
         return;
 
-    PxCudaContextManager* cudaContextManager = OmniPhysX::getInstance().getPhysXSetup().getCudaContextManager();
+    PxCudaContextManager* cudaContextManager = mPhysXScene->getScene()->getCudaContextManager();
     if (!cudaContextManager)
         return;
 
@@ -1097,7 +1164,7 @@ void PhysXStepper::updateDeformables(int step, int numSteps)
     InternalScene& internalScene = *mPhysXScene->getInternalScene();
     CUstream copyStream = internalScene.getDeformableCopyStream();
 
-    const bool updateVelocitiesToUsd = OmniPhysX::getInstance().getCachedSettings().updateVelocitiesToUsd;
+    const bool updateVelocitiesToUsd = mPhysXScene->getAttachedStage().getCachedSettings().updateVelocitiesToUsd;
 
     for (size_t i = 0; i < internalScene.mVolumeDeformableBodies.size(); ++i)
     {
@@ -1198,7 +1265,7 @@ void PhysXStepper::run()
         updateParticles(i, mNbSubsteps);
         mPhysXScene->getContactReport()->clearBatchedData();
 
-        omniPhysX.fireStatusEventSubscriptions(eSimulationStarting);
+        omniPhysX.fireStatusEventSubscriptions(mStepAttach, eSimulationStarting);
         {
             CARB_PROFILE_ZONE(0, "PhysX simulate");
             // artificially skip simulation if there is nothing to simulate
@@ -1207,17 +1274,55 @@ void PhysXStepper::run()
                 if (mPhysXScene->getUpdateType() == eAsynchronous)
                 {
                     CARB_PROFILE_ZONE(0, "pre-step update subscription update");
-                    omniPhysX.fireOnStepEventSubscriptions(mStepSize, true);
+                    omniPhysX.fireOnStepEventSubscriptions(mStepAttach, mStepSize, true);
                 }
 
-                mPhysXScene->getScene()->simulate(mStepSize);
-                mPhysXScene->getScene()->fetchResults(true);
+                // Managed force grabs execute for this scene's actual substep,
+                // after input callbacks and before simulation; no idle-frame pump.
+                native::stepForceDrags(mPhysXScene->getAttachedStage(),*mPhysXScene->getScene(),mStepSize);
+
+                // The next simulation replaces the preceding active-actor
+                // array, so its release tombstones are no longer needed.
+                mPhysXScene->getInternalScene()->clearReleasedActiveActors();
+                mPhysXScene->noteSimulateLaunch();
+                PxScene* scene = mPhysXScene->getScene();
+                carb::tasking::ITasking* tasking = omniPhysX.getITasking();
+                carb::tasking::TaskContext taskContext = carb::tasking::kInvalidTaskContext;
+                if (tasking)
+                {
+                    taskContext = tasking->getTaskContext();
+                }
+
+                if (taskContext == carb::tasking::kInvalidTaskContext)
+                {
+                    scene->simulate(mStepSize);
+                    scene->fetchResults(true);
+                }
+                else
+                {
+                    mSimulationCompletionTask.initialize(tasking, taskContext);
+                    mSimulationCompletionTask.setContinuation(*scene->getTaskManager(), nullptr);
+                    scene->simulate(mStepSize, &mSimulationCompletionTask);
+                    mSimulationCompletionTask.removeReference();
+                    const bool taskResumed = tasking->suspendTask();
+                    CARB_ASSERT(taskResumed);
+                    CARB_UNUSED(taskResumed);
+                    const bool resultsFetched = scene->fetchResults(false);
+                    // Let the waiting caller report a fatal GPU error after this worker completes.
+                    CARB_ASSERT(resultsFetched ||
+                                (((scene->getFlags() & PxSceneFlag::eENABLE_GPU_DYNAMICS) ||
+                                  scene->getBroadPhaseType() == PxBroadPhaseType::eGPU) &&
+                                 cudaContextManager && cudaContextManager->getCudaContext()->getLastError() != 0));
+                    CARB_UNUSED(resultsFetched);
+                }
             }
             // A.B. This might not be actually correct, we might need this per scene in the end
-            OmniPhysX::getInstance().increateSimulationTimestamp();
+            mPhysXScene->getAttachedStage().recordSimulationStep();
+            OmniPhysX::getInstance().getPhysXSetup().notePvdSimulation();
         }
         updateQuasistatic();
-        omniPhysX.fireStatusEventSubscriptions(eSimulationEnded);
+        omniPhysX.getPhysXSetup().reportCudaContextError(mPhysXScene->getAttachedStage(), mPhysXScene->getScene()->getCudaContextManager());
+        omniPhysX.fireStatusEventSubscriptions(mStepAttach, eSimulationEnded);
 
         // requests the DMA to CPU if lastSubStep, UpdateToUsd + no skipWriteTransforms.
         updateDeformables(i, mNbSubsteps);
@@ -1242,7 +1347,7 @@ void PhysXStepper::run()
             {
                 {
                     CARB_PROFILE_ZONE(0, "post-step update subscription update");
-                    omniPhysX.fireOnStepEventSubscriptions(mStepSize, false);
+                    omniPhysX.fireOnStepEventSubscriptions(mStepAttach, mStepSize, false);
                 }
             }
             else
@@ -1253,8 +1358,8 @@ void PhysXStepper::run()
     }
 
     // stop buffering USD changes and process them
-    UsdLoad::getUsdLoad()->setAsyncUSDUpdate(false);
-    UsdLoad::getUsdLoad()->processChanges();
+    mPhysXScene->getAttachedStage().setAsyncUSDUpdate(false);
+    processChangeMap(mPhysXScene->getAttachedStage());
 
     {
         std::lock_guard<carb::tasking::MutexWrapper> completeLock(mCompleteLock);        
@@ -1282,11 +1387,13 @@ void PhysXStepper::waitForCompletion(bool sendPostEvents)
     {
         // A.B. this code should not run in parallel
         // send the events from the waiting thread to avoid deadlocking in python that is waiting for results.
+        // A prior wait(false) releases mPhysXScene but leaves this post-step
+        // notification pending; dispatch through the captured owner identity.
         if (mSendStepping)
         {
             {
                 CARB_PROFILE_ZONE(0, "post-step update subscription update");
-                OmniPhysX::getInstance().fireOnStepEventSubscriptions(mStepSize, false);
+                OmniPhysX::getInstance().fireOnStepEventSubscriptions(mStepAttach, mStepSize, false);
             }
             mSendStepping = false;
         }
@@ -1314,7 +1421,7 @@ void PhysXStepper::waitForCompletion(bool sendPostEvents)
         if (mPhysXScene && (mForceAsync || mPhysXScene->getUpdateType() == eAsynchronous))
         {
             CARB_PROFILE_ZONE(0, "SimulationComplete");
-            omniPhysX.fireStatusEventSubscriptions(eSimulationComplete);
+            omniPhysX.fireStatusEventSubscriptions(mStepAttach, eSimulationComplete);
         }
     }
     else
@@ -1353,7 +1460,26 @@ static uint32_t roundUpToNextPowerOfTwo(uint32_t value)
 }
 #endif
 
-static PxScene* createPhysicsScene(PhysXSetup& physxSetup, double metersPerUnit, const PhysxSceneDesc& physxSceneDesc,
+bool attachmentMayUseGpu(const usdparser::AttachedStage& attachedStage)
+{
+#if USE_PHYSX_GPU
+    const int gpuPipelineOverride = attachedStage.getCachedSettings().gpuPipelineOverride;
+    const auto& foundation = omni::physx::foundation::getInterface();
+    return (gpuPipelineOverride > 0 || gpuPipelineOverride == -1) &&
+           !(foundation.isCpuMode && foundation.isCpuMode()) && OmniPhysX::getInstance().isCudaLibPresent();
+#else
+    return false;
+#endif
+}
+
+bool sceneRequestsGpu(const usdparser::AttachedStage& attachedStage, const PhysxSceneDesc& desc)
+{
+    const int gpuPipelineOverride = attachedStage.getCachedSettings().gpuPipelineOverride;
+    return attachmentMayUseGpu(attachedStage) &&
+           (gpuPipelineOverride > 0 || desc.enableGPUDynamics || desc.broadphaseType == eGPU);
+}
+
+static PxScene* createPhysicsScene(usdparser::AttachedStage& attachedStage, PhysXSetup& physxSetup, double metersPerUnit, const PhysxSceneDesc& physxSceneDesc,
     OmniFilterCallback* filterCallback, OmniContactReportCallback* reportCallback)
 {
     OmniPhysX& omniPhysX = OmniPhysX::getInstance();
@@ -1376,56 +1502,17 @@ static PxScene* createPhysicsScene(PhysXSetup& physxSetup, double metersPerUnit,
 
 #if USE_PHYSX_GPU
     carb::settings::ISettings* settings = carb::getCachedInterface<carb::settings::ISettings>();
-    const bool suppressReadback = settings->getAsBool(kSettingSuppressReadback);
-    int multiGPUMode = settings->getAsInt(kSettingSceneMultiGPUMode);
+    const bool suppressReadback = attachedStage.getCachedSettings().suppressReadback;
+    sceneDesc.cudaContextManager = sceneRequestsGpu(attachedStage, physxSceneDesc) ?
+                                       physxSetup.acquireAttachmentCudaContext(attachedStage) :
+                                       nullptr;
 
-    // Lazy GPU context creation: create the CUDA context the first time a scene
-    // requests GPU, never at startup. A CPU-only process never reaches the inner
-    // block (sceneWantsGpu=false or cpuMode=true). Once created the context
-    // persists for the process lifetime (cleared only by releasePhysics()).
-    if (!physxSetup.getCudaContextManager())
-    {
-        const int gpuPipelineOverride = omniPhysX.getGpuPipelineOverride();
-        const bool sceneWantsGpu = (gpuPipelineOverride > 0) ||
-                                   (gpuPipelineOverride == -1 && physxSceneDesc.enableGPUDynamics);
-        const omni::physx::IPhysxFoundation& physxFoundation = omni::physx::foundation::getInterface();
-        const bool cpuMode = physxFoundation.isCpuMode && physxFoundation.isCpuMode();
-        if (sceneWantsGpu && !cpuMode && omniPhysX.isCudaLibPresent())
-        {
-            if (physxFoundation.cudaDeviceCheck && physxFoundation.cudaDeviceCheck())
-            {
-                physxSetup.setupGPU();
-            }
-            else
-            {
-                CARB_LOG_ERROR("CUDA libs are present, but no suitable CUDA GPU was found!");
-                if (physxFoundation.setCpuMode)
-                    physxFoundation.setCpuMode(true);
-            }
-        }
-    }
-
-    // If no CUDA context manager exists (CPU-only mode or GPU init not performed),
-    // MultiGPU mode must be treated as disabled to avoid selecting a null manager
-    // and tripping assertions.
-    if (multiGPUMode && !physxSetup.getCudaContextManager())
-    {
-        multiGPUMode = 0;
-    }
-
-    sceneDesc.cudaContextManager = multiGPUMode ? physxSetup.getNextCudaContextManager()  : physxSetup.getCudaContextManager();
-    if (multiGPUMode)
-    {
-        CARB_ASSERT(sceneDesc.cudaContextManager);
-        OMNI_LOG_WARN(kSceneMultiGPULogChannel, "Next PhysicsScene is assigned to %s", sceneDesc.cudaContextManager->getDeviceName());
-    }
-
-    if (omniPhysX.getGpuPipelineOverride() == -1)
+    if (attachedStage.getCachedSettings().gpuPipelineOverride == -1)
     {
         if (physxSceneDesc.enableGPUDynamics)
             sceneDesc.flags |= PxSceneFlag::eENABLE_GPU_DYNAMICS;
     }
-    else if (omniPhysX.getGpuPipelineOverride() > 0)
+    else if (attachedStage.getCachedSettings().gpuPipelineOverride > 0)
     {
         sceneDesc.flags |= PxSceneFlag::eENABLE_GPU_DYNAMICS;
     }
@@ -1513,7 +1600,7 @@ static PxScene* createPhysicsScene(PhysXSetup& physxSetup, double metersPerUnit,
     else
         sceneDesc.flags &= ~PxSceneFlag::eENABLE_PCM;
 
-    if (omniPhysX.getSolverTypeOverride() == -1)
+    if (attachedStage.getCachedSettings().solverTypeOverride == -1)
     {
         if (physxSceneDesc.solverType == eTGS)
             sceneDesc.solverType = PxSolverType::eTGS;
@@ -1522,13 +1609,13 @@ static PxScene* createPhysicsScene(PhysXSetup& physxSetup, double metersPerUnit,
     }
     else
     {
-        if (omniPhysX.getSolverTypeOverride() > 0)
+        if (attachedStage.getCachedSettings().solverTypeOverride > 0)
             sceneDesc.solverType = PxSolverType::eTGS;
         else
             sceneDesc.solverType = PxSolverType::ePGS;
     }
 
-    if (omniPhysX.getGpuPipelineOverride() == -1)
+    if (attachedStage.getCachedSettings().gpuPipelineOverride == -1)
     {
         if (physxSceneDesc.broadphaseType == eMBP)
             sceneDesc.broadPhaseType = PxBroadPhaseType::ePABP;
@@ -1541,7 +1628,7 @@ static PxScene* createPhysicsScene(PhysXSetup& physxSetup, double metersPerUnit,
         else if (physxSceneDesc.broadphaseType == eSAP)
             sceneDesc.broadPhaseType = PxBroadPhaseType::eSAP;
     }
-    else if (omniPhysX.getGpuPipelineOverride() > 0)
+    else if (attachedStage.getCachedSettings().gpuPipelineOverride > 0)
     {
         sceneDesc.broadPhaseType = PxBroadPhaseType::eGPU;
     }
@@ -1549,7 +1636,9 @@ static PxScene* createPhysicsScene(PhysXSetup& physxSetup, double metersPerUnit,
     // Without a CUDA context manager, GPU broadphase cannot run — fall back.
     if (!sceneDesc.cudaContextManager && sceneDesc.broadPhaseType == PxBroadPhaseType::eGPU)
     {
-        CARB_LOG_WARN("GPU broadphase requires a CUDA context manager; falling back to ePABP.");
+        CARB_LOG_WARN_ONCE(
+            OMNI_LOG_DEFAULT_CHANNEL,
+            "GPU broadphase requires a CUDA context manager; falling back to ePABP.");
         sceneDesc.broadPhaseType = PxBroadPhaseType::ePABP;
     }
 
@@ -1582,7 +1671,7 @@ static PxScene* createPhysicsScene(PhysXSetup& physxSetup, double metersPerUnit,
 		sceneDesc.gpuBroadPhaseDesc = &gpuBPDesc;
 	}
 
-    sceneDesc.cpuDispatcher = physxSetup.getCpuDispatcher();
+    sceneDesc.cpuDispatcher = attachedStage.cpuDispatcher.get();
     // sceneDesc.filterShader = PxDefaultSimulationFilterShader;
     sceneDesc.filterShader = OmniFilterShader;
     sceneDesc.filterCallback = filterCallback;
@@ -1594,7 +1683,7 @@ static PxScene* createPhysicsScene(PhysXSetup& physxSetup, double metersPerUnit,
         // A.B. this is an edge case we should guard for the paramters in the parsing
         CARB_LOG_ERROR("PhysicsScene does have invalid parameters, falling back to default parameters.");
         sceneDesc = PxSceneDesc(tolerances);
-        sceneDesc.cpuDispatcher = physxSetup.getCpuDispatcher();
+        sceneDesc.cpuDispatcher = attachedStage.cpuDispatcher.get();
         sceneDesc.filterShader = OmniFilterShader;
         sceneDesc.filterCallback = filterCallback;
     }
@@ -1604,7 +1693,7 @@ static PxScene* createPhysicsScene(PhysXSetup& physxSetup, double metersPerUnit,
     if (!physxScene)
     {
 #if USE_PHYSX_GPU
-        if (physxSetup.getCudaContextManager() && physxSetup.getCudaContextManager()->getCudaContext()->isInAbortMode())
+        if (sceneDesc.cudaContextManager && sceneDesc.cudaContextManager->getCudaContext()->isInAbortMode())
         {
             CARB_LOG_WARN("Not enough GPU memory available to create a PhysicsScene, falling back to CPU simulation.");
             sceneDesc.flags.clear(PxSceneFlag::eENABLE_GPU_DYNAMICS);
@@ -1639,24 +1728,25 @@ static PxScene* createPhysicsScene(PhysXSetup& physxSetup, double metersPerUnit,
         }
     }
 
-    if (omniPhysX.isDebugVisualizationEnabled())
+    if (attachedStage.isDebugVisualizationEnabled())
     {
-        const float gizmoScale = omniPhysX.getCachedSettings().viewportGizmoScale;
+        const float gizmoScale = attachedStage.getCachedSettings().viewportGizmoScale;
         physxScene->setVisualizationParameter(
-            PxVisualizationParameter::eSCALE, gizmoScale * omniPhysX.getVisualizationScale());
-        const uint64_t visMask = omniPhysX.getVisualizationBitMask();
+            PxVisualizationParameter::eSCALE, gizmoScale * attachedStage.getVisualizationScale());
+        const uint64_t visMask = attachedStage.getVisualizationBitMask();
         for (uint64_t i = 0; i < uint64_t(ePhysXNumValues); i++)
         {
             if (visMask & (1ull << i))
             {
-                physxScene->setVisualizationParameter(PxVisualizationParameter::Enum(i), 1.0f);
+                physxScene->setVisualizationParameter(PxVisualizationParameter::Enum(i),
+                    attachedStage.getDebugVisualizationCache().mParamValues[i]);
             }
         }
     }
     return physxScene;
 }
 
-PhysXScene::PhysXScene(const usdparser::AttachedStage& attachedStage)
+PhysXScene::PhysXScene(usdparser::AttachedStage& attachedStage)
     : mAttachedStage(attachedStage), mScene(nullptr), mControllerManager(nullptr), mInternalScene(nullptr), mTimeStepsPerSeconds(60),
       mSceneUpdateType(usdparser::eSynchronous), mMaterial(nullptr),
       mVolumeDeformableMaterial(nullptr), mSurfaceDeformableMaterial(nullptr),
@@ -1665,18 +1755,25 @@ PhysXScene::PhysXScene(const usdparser::AttachedStage& attachedStage)
 {
 }
 
+void PhysXScene::noteSimulateLaunch()
+{
+    mRecordVersionAtLastSimulate.store(mAttachedStage.recordVersion.load(std::memory_order_relaxed),
+                                       std::memory_order_relaxed);
+}
+
 PhysXScene::~PhysXScene()
 {
+    ovx::ovxRetireSceneCaches(mScene, mAttachedStage.getAttachHandle());
     SAFE_RELEASE(mInternalScene);
 
     SAFE_RELEASE(mMaterial)
-    mMaterialPath = SdfPath();
+    mMaterialPath = omni::physics::parse::ObjectKey();
     SAFE_RELEASE(mVolumeDeformableMaterial);
-    mVolumeDeformableMaterialPath = SdfPath();
+    mVolumeDeformableMaterialPath = omni::physics::parse::ObjectKey();
     SAFE_RELEASE(mSurfaceDeformableMaterial);
-    mSurfaceDeformableMaterialPath = SdfPath();
+    mSurfaceDeformableMaterialPath = omni::physics::parse::ObjectKey();
     SAFE_RELEASE(mPBDMaterial);
-    mPBDMaterialPath = SdfPath();
+    mPBDMaterialPath = omni::physics::parse::ObjectKey();
 
     SAFE_RELEASE(mControllerManager);
     SAFE_RELEASE(mScene);
@@ -1703,7 +1800,7 @@ void PhysXScene::computeSubstepping(float elapsedSecs, float fixedTimeStep, floa
 {
     uint32_t steps = (uint32_t)((elapsedSecs + mRemaining) * (1.f / fixedTimeStep));
 
-    const uint32_t minFrameRate = OmniPhysX::getInstance().getCachedSettings().minFrameRate;
+    const uint32_t minFrameRate = getAttachedStage().getCachedSettings().minFrameRate;
     if (minFrameRate)
     {
         const uint32_t floorSteps = (uint32_t)timestepsPerSecond / minFrameRate;
@@ -1734,10 +1831,10 @@ void PhysXScene::computeSubstepping(float elapsedSecs, float fixedTimeStep, floa
 }
 
 
-PhysXScene* PhysXScene::createPhysXScene(const usdparser::AttachedStage& attachedStage, size_t sceneId, PhysXSetup& physxSetup, double metersPerUnit, double kilogramsPerUnit,
+PhysXScene* PhysXScene::createPhysXScene(usdparser::AttachedStage& attachedStage, size_t sceneId, PhysXSetup& physxSetup, double metersPerUnit, double kilogramsPerUnit,
     const usdparser::PhysxSceneDesc& sceneDesc)
 {
-    const internal::InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     if (sceneId >= db.getRecords().size())
         return nullptr;
@@ -1747,8 +1844,8 @@ PhysXScene* PhysXScene::createPhysXScene(const usdparser::AttachedStage& attache
 
     PhysXScene* scene = new PhysXScene(attachedStage);
 
-    scene->mContactReport = new ContactReport();
-    scene->mSceneSdfPath = attachedStage.pathFor(db.getRecords()[sceneId].mKey);
+    scene->mContactReport = new ContactReport(attachedStage);
+    scene->mSceneSdfPath = db.getRecords()[sceneId].mKey;
     scene->mSupportSceneQuery = sceneDesc.supportSceneQueries;
 
     // setup callbacks
@@ -1760,7 +1857,7 @@ PhysXScene* PhysXScene::createPhysXScene(const usdparser::AttachedStage& attache
     scene->mContactReportCallback.mPhysXScene = scene;
     scene->mContactReportCallback.mContactReport = scene->mContactReport;
 
-    PxScene* physXScene = createPhysicsScene(physxSetup, metersPerUnit, sceneDesc, &scene->mFilterCallback, &scene->mContactReportCallback);
+    PxScene* physXScene = createPhysicsScene(attachedStage, physxSetup, metersPerUnit, sceneDesc, &scene->mFilterCallback, &scene->mContactReportCallback);
 
     if (!physXScene)
     {
@@ -1770,7 +1867,7 @@ PhysXScene* PhysXScene::createPhysXScene(const usdparser::AttachedStage& attache
     }
     physXScene->setFilterShaderData((const void*)(&scene), sizeof(const void*));
     scene->mScene = physXScene;
-    internal::InternalScene* internalScene = ICE_NEW(internal::InternalScene)(sceneDesc, physXScene);
+    internal::InternalScene* internalScene = ICE_NEW(internal::InternalScene)(attachedStage, sceneDesc, physXScene);
     scene->mInternalScene = internalScene;
 
     scene->mSceneQueryUpdateMode = physXScene->getSceneQueryUpdateMode();
@@ -1786,8 +1883,10 @@ PhysXScene* PhysXScene::createPhysXScene(const usdparser::AttachedStage& attache
 
         if (!scene->mMaterial)
         {
+            // ObjectKey-native diagnostic text (ADR-0019): textFor() is the pxr-free sibling of
+            // pathFor(key).GetText() for exactly this "%s log formatting" use case.
             CARB_LOG_ERROR("Failed to create default material: %s\n",
-                attachedStage.pathFor(sceneDesc.defaultMaterialDesc.materialKey).GetText());
+                attachedStage.textFor(sceneDesc.defaultMaterialDesc.materialKey));
             scene->mMaterial = physxSetup.getPhysics()->createMaterial(0.5f, 0.5f, 0.5f);
         }
 
@@ -1799,7 +1898,7 @@ PhysXScene* PhysXScene::createPhysXScene(const usdparser::AttachedStage& attache
                 (PxCombineMode::Enum)sceneDesc.defaultMaterialDesc.restitutionCombineMode);
             scene->mMaterial->setDampingCombineMode((PxCombineMode::Enum)sceneDesc.defaultMaterialDesc.dampingCombineMode);
         }
-        scene->mMaterialPath = attachedStage.pathFor(sceneDesc.defaultMaterialDesc.materialKey);
+        scene->mMaterialPath = sceneDesc.defaultMaterialDesc.materialKey;
     }
 
 #if USE_PHYSX_GPU
@@ -1809,7 +1908,7 @@ PhysXScene* PhysXScene::createPhysXScene(const usdparser::AttachedStage& attache
         scene->mVolumeDeformableMaterial = physxSetup.getPhysics()->createDeformableVolumeMaterial(
             defaultMat.youngsModulus, defaultMat.poissonsRatio, defaultMat.dynamicFriction, defaultMat.elasticityDamping);
 
-        scene->mVolumeDeformableMaterialPath = attachedStage.pathFor(defaultMat.materialKey);
+        scene->mVolumeDeformableMaterialPath = defaultMat.materialKey;
     }
     {
         // no conversion here, we expect the descriptor's parameter to be in the correct units
@@ -1818,7 +1917,7 @@ PhysXScene* PhysXScene::createPhysXScene(const usdparser::AttachedStage& attache
             defaultMat.youngsModulus, defaultMat.poissonsRatio, defaultMat.dynamicFriction, defaultMat.surfaceThickness,
             defaultMat.surfaceBendStiffness, defaultMat.elasticityDamping, defaultMat.bendDamping);
 
-        scene->mSurfaceDeformableMaterialPath = attachedStage.pathFor(defaultMat.materialKey);
+        scene->mSurfaceDeformableMaterialPath = defaultMat.materialKey;
     }
     {
         scene->mPBDMaterial = physxSetup.getPhysics()->createPBDMaterial(sceneDesc.defaultPBDMaterialDesc.friction,
@@ -1834,7 +1933,7 @@ PhysXScene* PhysXScene::createPhysXScene(const usdparser::AttachedStage& attache
             scene->mPBDMaterial->setAdhesionRadiusScale(sceneDesc.defaultPBDMaterialDesc.adhesionOffsetScale);
         }
 
-        scene->mPBDMaterialPath = attachedStage.pathFor(sceneDesc.defaultPBDMaterialDesc.materialKey);
+        scene->mPBDMaterialPath = sceneDesc.defaultPBDMaterialDesc.materialKey;
     }
 #endif // USE_PHYSX_GPU
 
@@ -1847,17 +1946,18 @@ PhysXScene* PhysXScene::createPhysXScene(const usdparser::AttachedStage& attache
 void PhysXScene::resetDefaultMaterial()
 {
     usdparser::PhysxMaterialDesc defaultMaterialDesc;
-    usdparser::setToDefault(defaultMaterialDesc);    
+    usdparser::setToDefault(defaultMaterialDesc);
+    SAFE_RELEASE(mMaterial);
     mMaterial = OmniPhysX::getInstance().getPhysXSetup().getPhysics()->createMaterial(
         defaultMaterialDesc.staticFriction, defaultMaterialDesc.dynamicFriction,
         defaultMaterialDesc.restitution);
-    mMaterialPath = SdfPath();
+    mMaterialPath = omni::physics::parse::ObjectKey();
 }
 
-bool isRigidBodyDynamic(omni::physx::usdparser::ObjectId id)
+bool isRigidBodyDynamic(const omni::physx::usdparser::AttachedStage& attachedStage, omni::physx::usdparser::ObjectId id)
 {
     PhysXType internalType = ePTRemoved;
-    const internal::InternalDatabase::Record* objectRecord = OmniPhysX::getInstance().getInternalPhysXDatabase().getFullRecord(internalType, id);
+    const internal::InternalDatabase::Record* objectRecord = attachedStage.getInternalPhysXDatabase().getFullRecord(internalType, id);
     if (!objectRecord)
         return false;
 

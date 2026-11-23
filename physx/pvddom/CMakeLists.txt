@@ -1,30 +1,8 @@
-## Redistribution and use in source and binary forms, with or without
-## modification, are permitted provided that the following conditions
-## are met:
-##  * Redistributions of source code must retain the above copyright
-##    notice, this list of conditions and the following disclaimer.
-##  * Redistributions in binary form must reproduce the above copyright
-##    notice, this list of conditions and the following disclaimer in the
-##    documentation and/or other materials provided with the distribution.
-##  * Neither the name of NVIDIA CORPORATION nor the names of its
-##    contributors may be used to endorse or promote products derived
-##    from this software without specific prior written permission.
-##
-## THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-## EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-## IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-## PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-## CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-## EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-## PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-## PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-## OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-## (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-##
-## Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
-## Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 ## Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+## Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
+## SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+## SPDX-License-Identifier: Apache-2.0
+
 
 
 # When included from PhysX SDK build, project() is already called at top level.
@@ -39,6 +17,8 @@ if(NOT CMAKE_PROJECT_NAME OR CMAKE_PROJECT_NAME STREQUAL "PvdDom")
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
 endif()
 
+option(PVDDOM_BUILD_INSPECTION "Build bounded OVD inspection APIs" OFF)
+
 set(PVDDOM_SOURCES
     src/PvdDomLog.cpp
     src/PvdDom.cpp
@@ -48,127 +28,174 @@ set(PVDDOM_SOURCES
     src/PvdDomUtils.cpp
     src/PvdDomChunkAlloc.cpp
 )
-
-if(TARGET PVDRuntime)
-    # -------------------------------------------------------------------------
-    # PhysX SDK build mode: PVDRuntime target already exists (shared library).
-    # Link against it instead of compiling sources in.
-    # -------------------------------------------------------------------------
-    add_library(PvdDom STATIC ${PVDDOM_SOURCES})
-
-    # The archive gets linked into shared objects (e.g. libomni.physx.pvd.plugin.so),
-    # so the objects must be position-independent on Linux/clang/gcc.
-    set_target_properties(PvdDom PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-    # Match the PhysX SDK's MSVC runtime library.  CMP0091/MSVC_RUNTIME_LIBRARY
-    # is unreliable across subdirectory boundaries with CMake 3.25 + ninja, so
-    # strip the default /MD flags and replace with the correct CRT choice.
-    if(MSVC)
-        foreach(_cfg CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_CHECKED CMAKE_CXX_FLAGS_PROFILE CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO)
-            string(REGEX REPLACE "/MD[d]?" "" ${_cfg} "${${_cfg}}")
-        endforeach()
-        if(NV_USE_STATIC_WINCRT)
-            target_compile_options(PvdDom PRIVATE
-                $<$<CONFIG:Debug>:/MTd>
-                $<$<NOT:$<CONFIG:Debug>>:/MT>
-            )
-        else()
-            target_compile_options(PvdDom PRIVATE
-                $<$<CONFIG:Debug>:/MDd>
-                $<$<NOT:$<CONFIG:Debug>>:/MD>
-            )
-        endif()
-    endif()
-
-    target_include_directories(PvdDom
-        PUBLIC
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${PHYSX_ROOT_DIR}/pvdruntime/include
-        PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${PHYSX_ROOT_DIR}/pvdruntime/src
-    )
-
-    target_link_libraries(PvdDom PUBLIC PVDRuntime)
-
-else()
-    # -------------------------------------------------------------------------
-    # Standalone mode (e.g. PVD3): compile pvdruntime sources directly into
-    # pvddom. No DLL loading, no external PVDRuntime dependency.
-    # -------------------------------------------------------------------------
-    if(NOT DEFINED PVDRUNTIME_ROOT)
-        message(FATAL_ERROR "PVDRUNTIME_ROOT must be set to the pvdruntime directory (standalone mode)")
-    endif()
-
-    set(PVDRUNTIME_SOURCES
-        ${PVDRUNTIME_ROOT}/src/OmniPvdHelpers.cpp
-        ${PVDRUNTIME_ROOT}/src/OmniPvdLibraryFunctionsImpl.cpp
-        ${PVDRUNTIME_ROOT}/src/OmniPvdLog.cpp
-        ${PVDRUNTIME_ROOT}/src/OmniPvdReaderImpl.cpp
-        ${PVDRUNTIME_ROOT}/src/OmniPvdWriterImpl.cpp
-        ${PVDRUNTIME_ROOT}/src/OmniPvdFileReadStreamImpl.cpp
-        ${PVDRUNTIME_ROOT}/src/OmniPvdFileWriteStreamImpl.cpp
-        ${PVDRUNTIME_ROOT}/src/OmniPvdMemoryStreamImpl.cpp
-        ${PVDRUNTIME_ROOT}/src/OmniPvdMemoryReadStreamImpl.cpp
-        ${PVDRUNTIME_ROOT}/src/OmniPvdMemoryWriteStreamImpl.cpp
-        # TCP live-stream transport. Compiled into PvdDom so a standalone DOM
-        # consumer can drive a live socket read stream command by command. The
-        # pvddom code in this MR does not reference the socket readers/writers
-        # itself; the downstream DOM consumer does. The createOmniPvdSocket*Stream()
-        # factories in OmniPvdLibraryFunctionsImpl.cpp (above) reference these
-        # out-of-line, so they must be compiled in or the standalone PvdDom lib
-        # fails to link (unresolved OmniPvdSocket*Impl / OmniPvdSocket symbols).
-        ${PVDRUNTIME_ROOT}/src/OmniPvdSocket.cpp
-        ${PVDRUNTIME_ROOT}/src/OmniPvdSocketReadStreamImpl.cpp
-        ${PVDRUNTIME_ROOT}/src/OmniPvdSocketWriteStreamImpl.cpp
-    )
-
-    add_library(PvdDom STATIC ${PVDDOM_SOURCES} ${PVDRUNTIME_SOURCES})
-
-    # May be linked into shared objects downstream; keep objects position-independent.
-    set_target_properties(PvdDom PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-    # The socket sources compiled above call into Winsock; propagate ws2_32 PUBLIC so any
-    # standalone consumer that links this static PvdDom resolves WSAStartup/socket/etc. without
-    # having to know about it (a static archive does not link the dependency itself).
-    if(WIN32)
-        target_link_libraries(PvdDom PUBLIC ws2_32)
-    endif()
-
-    # Honor the host project's MSVC CRT choice. Mirrors the SDK-mode block: strip
-    # the default /MD flags and apply /MT or /MD based on NV_USE_STATIC_WINCRT so
-    # consumers that link pvddom into a /MT-linked host (e.g. PVD3) don't get a
-    # runtime-library mismatch.
-    if(MSVC)
-        foreach(_cfg CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_CHECKED CMAKE_CXX_FLAGS_PROFILE CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO)
-            string(REGEX REPLACE "/MD[d]?" "" ${_cfg} "${${_cfg}}")
-        endforeach()
-        if(NV_USE_STATIC_WINCRT)
-            target_compile_options(PvdDom PRIVATE
-                $<$<CONFIG:Debug>:/MTd>
-                $<$<NOT:$<CONFIG:Debug>>:/MT>
-            )
-        else()
-            target_compile_options(PvdDom PRIVATE
-                $<$<CONFIG:Debug>:/MDd>
-                $<$<NOT:$<CONFIG:Debug>>:/MD>
-            )
-        endif()
-    endif()
-
-    target_include_directories(PvdDom
-        PUBLIC
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
-            ${PVDRUNTIME_ROOT}/include
-        PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${PVDRUNTIME_ROOT}/src
+if(PVDDOM_BUILD_INSPECTION)
+    list(APPEND PVDDOM_SOURCES
+        src/PvdDomDocument.cpp
+        src/PvdDomInspection.cpp
+        src/PvdDomEvidence.cpp
     )
 endif()
 
-# Suppress C4005 (OMNI_PVD_EXPORT macro redefinition) on MSVC
+if(NOT TARGET PVDRuntime)
+    # Standalone mode (e.g. PVD3): create the same static runtime target used by
+    # the PhysX SDK build, then link PvdDom to it below.
+    if(NOT DEFINED PVDRUNTIME_ROOT)
+        message(FATAL_ERROR "PVDRUNTIME_ROOT must be set to the pvdruntime directory (standalone mode)")
+    endif()
+    file(TO_CMAKE_PATH "${PVDRUNTIME_ROOT}" PVDRUNTIME_ROOT)
+    get_filename_component(PVDRUNTIME_ROOT "${PVDRUNTIME_ROOT}" ABSOLUTE)
+
+    if(WIN32)
+        set(_PVDDOM_RUNTIME_PLATFORM windows)
+    elseif(UNIX)
+        set(_PVDDOM_RUNTIME_PLATFORM linux)
+    else()
+        message(FATAL_ERROR "Standalone PVDRuntime is unsupported on this platform")
+    endif()
+
+    function(_pvddom_add_standalone_runtime runtime_root platform)
+        get_filename_component(PVDRUNTIME_ROOT "${runtime_root}" ABSOLUTE)
+        get_filename_component(PHYSX_ROOT_DIR "${PVDRUNTIME_ROOT}" DIRECTORY)
+        set(PROJECT_CMAKE_FILES_DIR compiler/cmake)
+        set(TARGET_BUILD_PLATFORM "${platform}")
+        set(PX_ENABLE_INSTALL OFF)
+        include("${PVDRUNTIME_ROOT}/compiler/cmake/PVDRuntime.cmake")
+
+        # Keep the standalone runtime on the same CRT as PvdDom. The integrated
+        # PhysX path configures this on the existing target before reaching here.
+        if(MSVC)
+            if(NV_USE_STATIC_WINCRT)
+                target_compile_options(PVDRuntime PRIVATE
+                    $<$<CONFIG:Debug>:/MTd>
+                    $<$<NOT:$<CONFIG:Debug>>:/MT>
+                )
+            else()
+                target_compile_options(PVDRuntime PRIVATE
+                    $<$<CONFIG:Debug>:/MDd>
+                    $<$<NOT:$<CONFIG:Debug>>:/MD>
+                )
+            endif()
+        endif()
+    endfunction()
+
+    _pvddom_add_standalone_runtime("${PVDRUNTIME_ROOT}" "${_PVDDOM_RUNTIME_PLATFORM}")
+endif()
+
 if(MSVC)
-    target_compile_options(PvdDom PRIVATE /wd4005)
+    # This directory builds the ordinary PvdDom core without C++ exceptions.
+    string(REGEX REPLACE "(^|[ \\t])/EHsc([ \\t]|$)" " " CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+add_library(PvdDom STATIC ${PVDDOM_SOURCES})
+
+if(PVDDOM_BUILD_INSPECTION)
+    target_compile_definitions(PvdDom PRIVATE PVDDOM_INSPECTION_ENABLED)
+    if(MSVC)
+        target_compile_options(PvdDom PRIVATE /EHsc)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(PvdDom PRIVATE -fexceptions)
+    endif()
+elseif(MSVC)
+    target_compile_definitions(PvdDom PRIVATE _HAS_EXCEPTIONS=0)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(PvdDom PRIVATE -fno-exceptions)
+endif()
+
+# The archive gets linked into shared objects (e.g. libomni.physx.pvd.plugin.so),
+# so the objects must be position-independent on Linux/clang/gcc.
+set_target_properties(PvdDom PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Match the PhysX SDK's MSVC runtime library. CMP0091/MSVC_RUNTIME_LIBRARY is
+# unreliable across subdirectory boundaries with CMake 3.25 + Ninja, so strip
+# the default /MD flags and replace them with the host project's CRT choice.
+if(MSVC)
+    foreach(_cfg CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_CHECKED CMAKE_CXX_FLAGS_PROFILE CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO)
+        string(REGEX REPLACE "/MD[d]?" "" ${_cfg} "${${_cfg}}")
+    endforeach()
+    if(NV_USE_STATIC_WINCRT)
+        target_compile_options(PvdDom PRIVATE
+            $<$<CONFIG:Debug>:/MTd>
+            $<$<NOT:$<CONFIG:Debug>>:/MT>
+        )
+    else()
+        target_compile_options(PvdDom PRIVATE
+            $<$<CONFIG:Debug>:/MDd>
+            $<$<NOT:$<CONFIG:Debug>>:/MD>
+        )
+    endif()
+endif()
+
+target_include_directories(PvdDom
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include/pvddom>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(PvdDom PUBLIC PVDRuntime)
+target_compile_features(PvdDom PUBLIC cxx_std_14)
+
+option(PVDDOM_BUILD_TOOLS "Build the SDK OVD inspection CLI" OFF)
+if(PVDDOM_BUILD_TOOLS AND NOT PVDDOM_BUILD_INSPECTION)
+    message(FATAL_ERROR "PVDDOM_BUILD_TOOLS requires PVDDOM_BUILD_INSPECTION=ON")
+endif()
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../include/foundation/PxPhysicsVersion.h" _version_lines
+    REGEX "#define PX_PHYSICS_VERSION_(MAJOR|MINOR|BUGFIX)")
+foreach(_line IN LISTS _version_lines)
+    if(_line MATCHES "#define PX_PHYSICS_VERSION_(MAJOR|MINOR|BUGFIX)[ \t]+([0-9]+)")
+        set(_version_${CMAKE_MATCH_1} "${CMAKE_MATCH_2}")
+    endif()
+endforeach()
+set(_pvddom_sdk_version "${_version_MAJOR}.${_version_MINOR}.${_version_BUGFIX}")
+if(PVDDOM_BUILD_TOOLS)
+    add_executable(ovd_inspect tools/ovd_inspect.cpp)
+    if(MSVC)
+        target_compile_options(ovd_inspect PRIVATE /EHsc)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(ovd_inspect PRIVATE -fexceptions)
+    endif()
+    set_target_properties(ovd_inspect PROPERTIES OUTPUT_NAME ovd-inspect)
+    target_link_libraries(ovd_inspect PRIVATE PvdDom)
+    if(MSVC AND NV_USE_STATIC_WINCRT)
+        target_compile_options(ovd_inspect PRIVATE $<$<CONFIG:Debug>:/MTd> $<$<NOT:$<CONFIG:Debug>>:/MT>)
+    endif()
+    target_include_directories(ovd_inspect PRIVATE src)
+    target_compile_definitions(ovd_inspect PRIVATE
+        PVDDOM_SDK_VERSION="${_pvddom_sdk_version}"
+        PVDDOM_BUILD_INFO="${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}-$<CONFIG>")
+    install(TARGETS ovd_inspect RUNTIME DESTINATION bin)
+endif()
+
+# Standalone exports carry both archives and all public headers.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    include(CMakePackageConfigHelpers)
+    configure_package_config_file(cmake/PvdDomConfig.cmake
+        "${CMAKE_CURRENT_BINARY_DIR}/PvdDomConfig.cmake"
+        INSTALL_DESTINATION lib/cmake/PvdDom)
+    write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/PvdDomConfigVersion.cmake"
+        VERSION "${_pvddom_sdk_version}" COMPATIBILITY SameMajorVersion)
+    install(TARGETS PvdDom EXPORT PvdDomTargets ARCHIVE DESTINATION lib/$<CONFIG>)
+    install(TARGETS PVDRuntime EXPORT PvdDomRuntimeTargets ARCHIVE DESTINATION lib/$<CONFIG>)
+    install(FILES
+        include/PvdDom.h
+        include/PvdDomLog.h
+        include/PvdDomParser.h
+        include/PvdDomQuery.h
+        include/PvdDomUtils.h
+        DESTINATION include/pvddom)
+    if(PVDDOM_BUILD_INSPECTION)
+        install(FILES
+            include/PvdDomDocument.h
+            include/PvdDomInspection.h
+            DESTINATION include/pvddom)
+    endif()
+    install(DIRECTORY "${PVDRUNTIME_ROOT}/include/" DESTINATION pvdruntime/include FILES_MATCHING PATTERN "*.h")
+    install(EXPORT PvdDomTargets NAMESPACE PhysX:: DESTINATION lib/cmake/PvdDom)
+    install(EXPORT PvdDomRuntimeTargets NAMESPACE PvdDom:: DESTINATION lib/cmake/PvdDom)
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/PvdDomConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/PvdDomConfigVersion.cmake" DESTINATION lib/cmake/PvdDom)
+    install(DIRECTORY ../skills/ DESTINATION share/physx/skills)
+    install(FILES ../SKILLS.md DESTINATION share/physx)
 endif()
 
 # Tests (optional)

@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "NpScene.h"
 #include "NpRigidStatic.h"
@@ -226,6 +203,10 @@ NpScene::NpScene(const PxSceneDesc& desc, NpPhysics& physics) :
 			// pdeheras : should be depending on OVD readback flags
 			sc->setEnableOVDReadback(true);
 			sc->setEnableOVDCollisionReadback(true);
+#if PX_SUPPORT_GPU_PHYSX
+			if (desc.flags & PxSceneFlag::eENABLE_DIRECT_GPU_API)
+				getDirectGPUAPI(); // Install OVD callbacks before the first simulation readback.
+#endif
 		}
 	}
 #endif
@@ -234,6 +215,7 @@ NpScene::NpScene(const PxSceneDesc& desc, NpPhysics& physics) :
 NpScene::~NpScene()
 {
 #if PX_SUPPORT_OMNI_PVD
+	NpOmniPvdCaptureRetireHandle(reinterpret_cast<PxU64>(static_cast<PxScene*>(this)));
 	OMNI_PVD_WRITE_SCOPE_BEGIN(pvdWriter, pvdRegData)
 	OMNI_PVD_DESTROY_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxGpuDynamicsMemoryConfig, this->mGpuDynamicsConfig)
 	OMNI_PVD_DESTROY_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxScene, static_cast<PxScene &>(*this))
@@ -1554,9 +1536,12 @@ bool NpScene::addDeformableSurface(PxDeformableSurface& deformableSurface)
 			"PxScene::addActor(): Deformable surfaces can only be simulated by GPU-accelerated scenes!");
 
 #if PX_SUPPORT_GPU_PHYSX
-	if (mDeformableSurfaces.size() == PX_MAX_NB_DEFORMABLE_SURFACE)
+	// The limit counts GPU ids rather than deformable surfaces, because a removed surface keeps its id until the
+	// next simulation step completes. This keeps every id below PX_MAX_NB_DEFORMABLE_SURFACE.
+	if (mScene.getSimulationController()->getNbReservedFEMClothIds() >= PX_MAX_NB_DEFORMABLE_SURFACE)
 		return outputError<PxErrorCode::eINVALID_OPERATION>(__LINE__,
-			"PxScene::addActor(): Deformable surface exceeds maximum number of instances per scene (PX_MAX_NB_DEFORMABLE_SURFACE)!");
+			"PxScene::addActor(): Deformable surface exceeds maximum number of instances per scene (PX_MAX_NB_DEFORMABLE_SURFACE)! "
+			"Deformable surfaces removed since the last simulation step count toward the limit until the next step completes.");
 
 	// Add deformable surface
 	NpDeformableSurface& npSurface = static_cast<NpDeformableSurface&>(deformableSurface);
@@ -1617,9 +1602,12 @@ bool NpScene::addDeformableVolume(PxDeformableVolume& deformableVolume)
 		return outputError<PxErrorCode::eINVALID_PARAMETER>(__LINE__,
 			"PxScene::addActor(): Deformable volume does not have simulation mesh, will not be added to scene!");
 
-	if (mDeformableVolumes.size() == PX_MAX_NB_DEFORMABLE_VOLUME)
+	// The limit counts GPU ids rather than deformable volumes, because a removed volume keeps its id until the
+	// next simulation step completes. This keeps every id below PX_MAX_NB_DEFORMABLE_VOLUME.
+	if (mScene.getSimulationController()->getNbReservedSoftBodyIds() >= PX_MAX_NB_DEFORMABLE_VOLUME)
 		return outputError<PxErrorCode::eINVALID_OPERATION>(__LINE__,
-			"PxScene::addActor(): Deformable volume exceeds maximum number of deformable volumes per scene (PX_MAX_NB_DEFORMABLE_VOLUME)!");
+			"PxScene::addActor(): Deformable volume exceeds maximum number of deformable volumes per scene (PX_MAX_NB_DEFORMABLE_VOLUME)! "
+			"Deformable volumes removed since the last simulation step count toward the limit until the next step completes.");
 
 	NpDeformableVolume& npVolume = static_cast<NpDeformableVolume&>(deformableVolume);
 
@@ -1731,11 +1719,6 @@ bool NpScene::addParticleSystem(PxPBDParticleSystem& particleSystem)
 	mScene.addParticleSystemSimControl(npPS.getCore());
 
 #if PX_SUPPORT_OMNI_PVD
-	OmniPvdPxSampler* omniPvdSampler = NpPhysics::getInstance().mOmniPvdSampler;
-	if (omniPvdSampler && omniPvdSampler->isSampling()) 
-	{
-		npPS.getCore().getSim()->getLowLevelParticleSystem()->mFlag |= Dy::ParticleSystemFlag::eENABLE_GPU_DATA_SYNC;
-	}
 	OMNI_PVD_ADD(OMNI_PVD_CONTEXT_HANDLE, PxScene, actors, static_cast<PxScene&>(*this), static_cast<PxActor&>(particleSystem));
 #endif // PX_SUPPORT_OMNI_PVD
 
@@ -1835,6 +1818,15 @@ void NpScene::addArticulationLink(NpArticulationLink& link)
 void NpScene::removeArticulationLink(NpArticulationLink& link, bool wakeOnLostTouch)
 {
 	NpArticulationJointReducedCoordinate* j = static_cast<NpArticulationJointReducedCoordinate*>(link.getInboundJoint());
+
+#if PX_SUPPORT_GPU_PHYSX
+	// PT: OMPE-109164 - mirrors removeRigidActorT(): a link can be the rigid side of a deformable
+	// attachment or element filter, and those hold on to its BodyCore. scRemoveActor() below clears
+	// that core's sim, so they have to be torn down here while the sim is still alive. Otherwise the
+	// attachment outlives the link and whoever releases it next dereferences a null sim.
+	link.removeAttachments(link, false);
+	link.removeElementFilters(link, false);
+#endif
 
 	link.removeConstraintsFromScene();
 	link.getShapeManager().teardownAllSceneQuery(getSQAPI(), link);
@@ -1973,6 +1965,10 @@ void NpScene::scRemoveAggregate(NpAggregate& agg)
 	PX_ASSERT(!isAPIWriteForbidden());
 
 	mScene.deleteAggregate(agg.getAggregateHandle());
+	// PT: the Bp aggregate is gone so its handle must not survive in the Np aggregate. The actors stay listed in the aggregate
+	// after PxScene::removeAggregate, and an articulation among them can be re-added to the scene on its own; nothing must
+	// pick up the stale handle in that case (see ScSceneFns<NpArticulationReducedCoordinate>::insert).
+	agg.setAggregateHandle(PX_INVALID_U32);
 	agg.setNpScene(NULL);
 #if PX_SUPPORT_PVD
 	mScenePvdClient.releasePvdInstance(&agg);
@@ -2429,14 +2425,6 @@ PxSolverType::Enum NpScene::getSolverType() const
 {
 	NP_READ_CHECK(this);
 	return mScene.getSolverType();
-}
-
-//FrictionModel 
-
-PxFrictionType::Enum NpScene::getFrictionType() const
-{
-	NP_READ_CHECK(this);
-	return PxFrictionType::ePATCH;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -2977,6 +2965,9 @@ bool NpScene::simulateOrCollide(PxReal elapsedTime, PxBaseTask* completionTask, 
 
 		syncMaterialEvents();
 
+#if PX_SUPPORT_OMNI_PVD
+		mSceneOvdClient.setContactsValid(false);
+#endif
 		setSimulationStage(simStage);
 		setAPIWriteToForbidden();
 		setAPIReadToForbidden();
@@ -3177,6 +3168,9 @@ void NpScene::flushSimulation(bool sendPendingReports)
 
 	PX_SIMD_GUARD
 
+#if PX_SUPPORT_OMNI_PVD
+	mSceneOvdClient.setContactsValid(false);
+#endif
 	mScene.flush(sendPendingReports);
 	getSQAPI().flushMemory();
 
@@ -3751,6 +3745,7 @@ void NpScene::shiftOrigin(const PxVec3& shift)
 	{
 		NP_API_READ_WRITE_ERROR_MSG(
 			"shiftOrigin() not allowed when direct-GPU API is used.");
+		return;
 	}
 
 	PX_CHECK_SCENE_API_WRITE_FORBIDDEN(this, "PxScene::shiftOrigin() not allowed while simulation is running. Call will be ignored.")
@@ -3758,6 +3753,10 @@ void NpScene::shiftOrigin(const PxVec3& shift)
 	PX_SIMD_GUARD
 
 	NP_CHECK_CORRUPTION_AND_RETURN
+
+#if PX_SUPPORT_OMNI_PVD
+	mSceneOvdClient.setContactsValid(false);
+#endif
 
 	shiftRigidActors(mRigidDynamics, shift);	// PT: TODO: we don't need to re-test the type all the time in shiftRigidActors...
 	shiftRigidActors(mRigidStatics, shift);
@@ -4366,8 +4365,19 @@ template<> struct ScSceneFns<NpPBDParticleSystem>
 template<> struct ScSceneFns<NpArticulationReducedCoordinate>
 {
 	static PX_FORCE_INLINE void insert(Sc::Scene& s, NpArticulationReducedCoordinate& v, PxBounds3*, const BVH*, bool)
-	{ 
-		s.addArticulation(v.getCore(), v.getRoot()->getCore());
+	{
+		// PT: the sim caches the aggregate handle of the articulation. We read it from the root link's core, i.e. from the same
+		// place the link shapes get their aggregate membership from, so that the sim and the shapes cannot disagree. This ID is
+		// set on all links by NpAggregate::scAddActor when the aggregate is in a scene, and reset by NpAggregate::scRemoveActor,
+		// in particular by PxScene::removeAggregate, after which the articulation can legally be re-added to the scene on its own.
+		Sc::BodyCore& root = v.getRoot()->getCore();
+		const Bp::AggregateHandle h = root.getAggregateID();
+
+		// PT: the Np aggregate must agree with the link cores. If this fires, some path left a stale handle in NpAggregate
+		// (see NpScene::scRemoveAggregate).
+		PX_ASSERT(h == (v.mAggregate ? v.mAggregate->getAggregateHandle() : PX_INVALID_U32));
+
+		s.addArticulation(v.getCore(), root, h);
 	}
 	static PX_FORCE_INLINE void remove(Sc::Scene& s, NpArticulationReducedCoordinate& v, bool /*wakeOnLostTouch*/)
 	{
@@ -4734,7 +4744,7 @@ void NpScene::removeFromConstraintList(PxConstraint& constraint)
 	}
 #endif
 
-	mScene.removeConstraint(npConstraint.getCore());
+	ScSceneFns<NpConstraint>::remove(mScene, npConstraint, false);
 
 	// Release pvd constraint immediately since delayed removal with already released ext::joints does not work, can't call callback.
 	RELEASE_PVD_INSTANCE(&npConstraint)
@@ -4891,12 +4901,14 @@ void NpScene::scRemoveArticulationMimicJoint(NpArticulationMimicJoint& mimicJoin
 #if PX_SUPPORT_OMNI_PVD
 void NpScene::emitSceneStateToOmniPvd()
 {
+	if (!NpOmniPvdCaptureScene(*this)) return;
 	// NOTE: sourced entirely from live getters + cached members (no PxSceneDesc), so
 	// this is safe to call both at construction and from a full-state OVD snapshot.
 	// mScene.getLimits() is used instead of getLimits() to avoid the NP_READ_CHECK.
 	const PxSceneLimits limits = mScene.getLimits();
 
 	OMNI_PVD_WRITE_SCOPE_BEGIN(pvdWriter, pvdRegData)
+	NpOmniPvdCaptureDependency(&mGpuDynamicsConfig);
 
 	OMNI_PVD_CREATE_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxScene, static_cast<PxScene &>(*this))
 
@@ -4924,7 +4936,6 @@ void NpScene::emitSceneStateToOmniPvd()
 
 	OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxScene, gravity, static_cast<PxScene &>(*this), getGravity())
 	OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxScene, flags,	static_cast<PxScene&>(*this), getFlags())
-	OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxScene, frictionType,	static_cast<PxScene&>(*this), getFrictionType())
 	OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxScene, broadPhaseType,	static_cast<PxScene&>(*this), getBroadPhaseType())
 	OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxScene, kineKineFilteringMode,	static_cast<PxScene&>(*this), getKinematicKinematicFilteringMode())
 	OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxScene, staticKineFilteringMode,	static_cast<PxScene&>(*this), getStaticKinematicFilteringMode())
@@ -4977,6 +4988,7 @@ void NpScene::emitSceneStateToOmniPvd()
 
 void NpScene::emitSceneObjectListsToOmniPvd()
 {
+	if (!NpOmniPvdCaptureScene(*this)) return;
 	// Re-emit the scene's object-list memberships from the scene's live contents. The
 	// referenced actor/articulation/aggregate objects must already have been emitted
 	// (the snapshot walks shared resources -> objects -> scenes). In the normal flow
@@ -5071,8 +5083,97 @@ namespace
 	}
 }
 
+bool NpScene::streamGPUStateToOmniPvd(bool snapshot)
+{
+#if PX_SUPPORT_GPU_PHYSX
+	if (!NpOmniPvdSampling() || !(getFlags() & PxSceneFlag::eENABLE_DIRECT_GPU_API) || !NpOmniPvdCaptureScene(*this)) return true;
+	getDirectGPUAPI(); // Installs the callbacks used by indexed capture reads.
+	PxsSimulationController* controller = getSimulationController();
+	if (!controller || controller->getOVDReadbackMode() == PxsOVDReadbackMode::eDISABLED) return true;
+	OmniPvdPxSampler* sampler = OmniPvdPxSampler::getInstance();
+	sampler->prepareSceneJointState(*this);
+	const bool payloadState = NpOmniPvdCaptureIsSelective() || snapshot;
+	const bool accelerations = getFlags().isSet(PxSceneFlag::eENABLE_BODY_ACCELERATIONS);
+	bool success = true;
+	PxArray<PxU32>& gpuIndices = mSceneOvdClient.getGpuSnapshotIndices();
+	gpuIndices.clear();
+	for (PxU32 i = 0; i < mRigidDynamics.size(); ++i)
+	{
+		NpRigidDynamic& actor = *mRigidDynamics[i];
+		const PxNodeIndex index = actor.getCore().getInternalIslandNodeIndex();
+		if (((payloadState && NpOmniPvdCaptureActorState(actor)) || sampler->isJointStateActor(actor)) && index.isValid())
+			gpuIndices.pushBack(index.index());
+	}
+	if (gpuIndices.size())
+	{
+		const PxU32* indices = gpuIndices.begin();
+		const PxU32 count = gpuIndices.size();
+		success = controller->ovdReadbackRigidDynamicData(indices, count, PxRigidDynamicGPUAPIReadType::eGLOBAL_POSE);
+		if (success) success = controller->ovdReadbackRigidDynamicData(indices, count, PxRigidDynamicGPUAPIReadType::eLINEAR_VELOCITY);
+		if (success) success = controller->ovdReadbackRigidDynamicData(indices, count, PxRigidDynamicGPUAPIReadType::eANGULAR_VELOCITY);
+	}
+	if (success && accelerations)
+	{
+		gpuIndices.clear();
+		for (PxU32 i = 0; i < mRigidDynamics.size(); ++i)
+		{
+			NpRigidDynamic& actor = *mRigidDynamics[i];
+			const PxNodeIndex index = actor.getCore().getInternalIslandNodeIndex();
+			if (NpOmniPvdCaptureActor(actor) && index.isValid()) gpuIndices.pushBack(index.index());
+		}
+		const PxU32* indices = gpuIndices.begin();
+		const PxU32 count = gpuIndices.size();
+		success = controller->ovdReadbackRigidDynamicData(indices, count, PxRigidDynamicGPUAPIReadType::eLINEAR_ACCELERATION);
+		if (success) success = controller->ovdReadbackRigidDynamicData(indices, count, PxRigidDynamicGPUAPIReadType::eANGULAR_ACCELERATION);
+	}
+	gpuIndices.clear();
+	for (PxU32 i = 0; i < mArticulations.size(); ++i)
+	{
+		const NpArticulationReducedCoordinate& articulation = static_cast<const NpArticulationReducedCoordinate&>(*mArticulations.getEntries()[i]);
+		const PxU32 index = articulation.getCore().getGpuArticulationIndex();
+		bool required = payloadState && NpOmniPvdCaptureArticulation(articulation);
+		for (PxU32 link = 0; !required && link < articulation.getNbLinks(); ++link)
+			required = (payloadState && NpOmniPvdCaptureActorState(*articulation.getLinks()[link])) || sampler->isJointStateActor(*articulation.getLinks()[link]);
+		if (required && index != 0xffffffffu) gpuIndices.pushBack(index);
+	}
+#define OVD_READ_ART(channel, dataType) \
+	if (success && (channel)) success = controller->ovdReadbackArticulationData(gpuIndices.begin(), gpuIndices.size(), PxArticulationGPUAPIReadType::dataType)
+	OVD_READ_ART(true, eLINK_GLOBAL_POSE);
+	OVD_READ_ART(true, eLINK_LINEAR_VELOCITY);
+	OVD_READ_ART(true, eLINK_ANGULAR_VELOCITY);
+	// DOF values and solver data belong only to primary articulations, including full capture.
+	gpuIndices.clear();
+	for (PxU32 i = 0; i < mArticulations.size(); ++i)
+	{
+		const NpArticulationReducedCoordinate& articulation = static_cast<const NpArticulationReducedCoordinate&>(*mArticulations.getEntries()[i]);
+		const PxU32 index = articulation.getCore().getGpuArticulationIndex();
+		if (NpOmniPvdCaptureArticulation(articulation) && index != 0xffffffffu) gpuIndices.pushBack(index);
+	}
+	OVD_READ_ART(payloadState, eJOINT_POSITION);
+	OVD_READ_ART(payloadState, eJOINT_VELOCITY);
+	OVD_READ_ART(accelerations, eJOINT_ACCELERATION);
+	OVD_READ_ART(accelerations, eLINK_LINEAR_ACCELERATION);
+	OVD_READ_ART(accelerations, eLINK_ANGULAR_ACCELERATION);
+	OVD_READ_ART(snapshot && NpOmniPvdRecordSecondaryData(), eJOINT_FORCE);
+	OVD_READ_ART(snapshot && NpOmniPvdRecordSecondaryData(), eJOINT_TARGET_POSITION);
+	OVD_READ_ART(snapshot && NpOmniPvdRecordSecondaryData(), eJOINT_TARGET_VELOCITY);
+	OVD_READ_ART(NpOmniPvdRecordSecondaryData(), eLINK_INCOMING_JOINT_FORCE);
+#undef OVD_READ_ART
+	if (!success)
+	{
+		PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "Selective OmniPVD GPU readback failed; recording stopped.");
+		sampler->stopSampling();
+	}
+	return success;
+#else
+	PX_UNUSED(snapshot);
+	return true;
+#endif
+}
+
 void NpScene::streamRigidDynamicGPUForcesToOmniPvd()
 {
+	if (!NpOmniPvdRecordSecondaryData() || !NpOmniPvdCaptureScene(*this)) return;
 	// Forces/torques applied through the direct-GPU API live in device state and are emitted live via the
 	// direct-GPU write callback, but a late attach missed that, so reconstruct them from the device for the
 	// snapshot. Only for direct-GPU-API scenes, where these device-resident forces exist. The readback
@@ -5080,17 +5181,19 @@ void NpScene::streamRigidDynamicGPUForcesToOmniPvd()
 	// steps).
 	if (!(getFlags() & PxSceneFlag::eENABLE_DIRECT_GPU_API))
 		return;
+	getDirectGPUAPI();
 
 	PxsSimulationController* sc = getSimulationController();
-	if (!sc || !sc->getEnableOVDReadback())
+	if (!sc || sc->getOVDReadbackMode() == PxsOVDReadbackMode::eDISABLED)
 		return;
 
 	const PxU32 nbRigidDynamics = mRigidDynamics.size();
 	if (nbRigidDynamics == 0)
 		return;
 
-	gatherGpuIndicesAndSnapshot(mOvdSnapshotGpuIndices, mRigidDynamics.begin(), nbRigidDynamics,
+	gatherGpuIndicesAndSnapshot(mSceneOvdClient.getGpuSnapshotIndices(), mRigidDynamics.begin(), nbRigidDynamics,
 		[](NpRigidDynamic* a) -> PxU32 {
+			if (!NpOmniPvdCaptureActor(*a)) return 0xffffffffu;
 			const PxNodeIndex nodeIndex = a->getCore().getInternalIslandNodeIndex();
 			return nodeIndex.isValid() ? nodeIndex.index() : 0xffffffffu;
 		},
@@ -5099,6 +5202,7 @@ void NpScene::streamRigidDynamicGPUForcesToOmniPvd()
 
 void NpScene::streamArticulationGPUForcesToOmniPvd()
 {
+	if (!NpOmniPvdRecordSecondaryData() || !NpOmniPvdCaptureScene(*this)) return;
 	// Articulation link forces set through the direct-GPU articulation API live in device state and are
 	// emitted live via the direct-GPU write callback; a late attach missed that, so reconstruct them from
 	// the device for the snapshot. Only for direct-GPU-API scenes; no-op without OVD readback. The readback
@@ -5106,9 +5210,10 @@ void NpScene::streamArticulationGPUForcesToOmniPvd()
 	// back zero, matching the live direct-GPU path.
 	if (!(getFlags() & PxSceneFlag::eENABLE_DIRECT_GPU_API))
 		return;
+	getDirectGPUAPI();
 
 	PxsSimulationController* sc = getSimulationController();
-	if (!sc || !sc->getEnableOVDReadback())
+	if (!sc || sc->getOVDReadbackMode() == PxsOVDReadbackMode::eDISABLED)
 		return;
 
 	const PxU32 nbArts = mArticulations.size();
@@ -5119,8 +5224,9 @@ void NpScene::streamArticulationGPUForcesToOmniPvd()
 	// rigid path; returns 0xffffffff when the articulation is not GPU-resident. A non-sentinel index can
 	// still be past the device pool (assigned but not simulated yet); ovdSnapshotArticulationForces drops
 	// those against the resident articulation count, so the kernel never indexes out of bounds.
-	gatherGpuIndicesAndSnapshot(mOvdSnapshotGpuIndices, mArticulations.getEntries(), nbArts,
+	gatherGpuIndicesAndSnapshot(mSceneOvdClient.getGpuSnapshotIndices(), mArticulations.getEntries(), nbArts,
 		[](PxArticulationReducedCoordinate* a) -> PxU32 {
+			if (!NpOmniPvdCaptureArticulation(*a)) return 0xffffffffu;
 			return static_cast<NpArticulationReducedCoordinate*>(a)->getCore().getGpuArticulationIndex();
 		},
 		[sc](const PxU32* indices, PxU32 n) { sc->ovdSnapshotArticulationForces(indices, n); });

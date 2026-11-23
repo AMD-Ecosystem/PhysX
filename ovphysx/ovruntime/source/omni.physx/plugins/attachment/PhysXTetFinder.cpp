@@ -1,9 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1 AC-2
+/** @implements REQ-PARSE-BATCH-001
+ * @covers AC-3
+ */
+
+/**
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-20 AC-22
+ *
+ * @implements REQ-PARSE-CORE-006
+ * @covers AC-8
+ */
 
 #include "PhysXTetFinder.h"
+#include "../RuntimeExecution.h"
 
 #include <PhysXTools.h>
 
@@ -11,17 +24,18 @@
 #include "extensions/PxGjkQueryExt.h"
 
 #include <usdLoad/IceDescriptorAllocator.h>
+#include <usdLoad/ScannedCollision.h>
 #include <usdLoad/LoadUsd.h>
 #include <usdLoad/ScannedShapeCookingDispatch.h>
 #include <CookingDataAsync.h>
 #include <ConeCylinderConvexMesh.h>
 #include <common/utilities/MemoryMacros.h>
 
-#include <omni/physics/usd/StageScan.h>
-
 #include <unordered_set>
 
-using namespace PXR_NS;
+#include <omni/physics/parse/ScanBackend.h>
+#include <omni/physics/parse/ScannedStage.h>
+
 using namespace physx;
 using namespace omni::physx;
 using namespace omni::physx::usdparser;
@@ -42,7 +56,7 @@ namespace omni
             float separation;
         };
 
-        PxBVH* createTetBVH(const PxTypedStridedData<const PxVec3>& vertices, const PxU32* tets, PxU32 numTets, PxBounds3& bvhBounds, PxReal fatten = 1e-6f)
+        PxBVH* createTetBVH(const PxTypedBoundedData<const PxVec3>& vertices, const PxU32* tets, PxU32 numTets, PxBounds3& bvhBounds, PxReal fatten = 1e-6f)
         {
             if (numTets == 0)
             {
@@ -75,7 +89,7 @@ namespace omni
             return bvh;
         }
 
-        PxBVH* createTriBVH(const PxTypedStridedData<const PxVec3>& vertices, const PxU32* tris, PxU32 numTris, PxBounds3& bvhBounds, PxReal fatten = 1e-6f)
+        PxBVH* createTriBVH(const PxTypedBoundedData<const PxVec3>& vertices, const PxU32* tris, PxU32 numTris, PxBounds3& bvhBounds, PxReal fatten = 1e-6f)
         {
             if (numTris == 0)
             {
@@ -256,7 +270,7 @@ namespace omni
         {
             PxBVH* mBvh = nullptr;
             PxReal mAbsToleranceSqr;
-            PxTypedStridedData<const PxVec3> mVertices;
+            PxTypedBoundedData<const PxVec3> mVertices;
             PxU32 mNumVertices;
             const PxU32* mTets = nullptr;
             PxU32 mNumTets;
@@ -266,7 +280,7 @@ namespace omni
             PxArray<PxVec3> mVerticesCopy;
             PxArray<PxU32> mTetsCopy;
 
-            TetFinder(const PxTypedStridedData<const PxVec3>& vertices, PxU32 numVertices, const PxU32* tets, PxU32 numTets, float tolerance = 1e-5f);
+            TetFinder(const PxTypedBoundedData<const PxVec3>& vertices, PxU32 numVertices, const PxU32* tets, PxU32 numTets, float tolerance = 1e-5f);
             ~TetFinder();
             
             int findTet(const PxVec3& queryPoint, PxVec4& bary) const; // Returns -1 if no tet was found
@@ -300,7 +314,7 @@ namespace omni
                 const PxVec3* triPoints, const PxU32* triIndices, PxU32 triIndicesSize, const PxReal overlapOffset) const;
         };
 
-        TetFinder::TetFinder(const PxTypedStridedData<const PxVec3>& vertices, PxU32 numVertices, const PxU32* tets, PxU32 numTets, float tolerance) :
+        TetFinder::TetFinder(const PxTypedBoundedData<const PxVec3>& vertices, PxU32 numVertices, const PxU32* tets, PxU32 numTets, float tolerance) :
             mVertices(vertices), mTets(tets), mNumTets(numTets)
         {
             //copy data
@@ -309,7 +323,7 @@ namespace omni
             {
                 mVerticesCopy[i] = mVertices.at(i);
             }
-            mVertices = PxTypedStridedData<const PxVec3>(mVerticesCopy.begin());
+            mVertices = PxTypedBoundedData<const PxVec3>(mVerticesCopy.begin());
             mNumVertices = numVertices;
 
             mTetsCopy.assign(tets, tets + (PxU64(numTets) * 4));
@@ -452,7 +466,7 @@ namespace omni
                 if (distanceDir.magnitudeSquared() >= mAbsToleranceSqr)
                 {
                     const PxU32* tet = &mTets[4 * tetIds[i]];
-                    computeBarycentric(mVertices.at(tet[0]), mVertices.at(tet[1]), mVertices.at(tet[2]), mVertices.at(tet[3]), points[i], barys[i]);
+                    PxComputeBarycentric(mVertices.at(tet[0]), mVertices.at(tet[1]), mVertices.at(tet[2]), mVertices.at(tet[3]), points[i], barys[i]);
                 }
             }
 
@@ -1132,7 +1146,7 @@ namespace omni
         uint64_t createTetFinder(const carb::Float3* points, const uint32_t pointsSize, const uint32_t pointsByteStride, const uint32_t* indices, const uint32_t indicesSize)
         {
             CARB_ASSERT(indicesSize % 4 == 0);
-            PxTypedStridedData<const PxVec3> stridedData(reinterpret_cast<const PxVec3*>(points), pointsByteStride);
+            PxTypedBoundedData<const PxVec3> stridedData(reinterpret_cast<const PxVec3*>(points), pointsByteStride);
             TetFinder* tetFinder = ICE_NEW(TetFinder)(stridedData, pointsSize, (const PxU32*)indices, indicesSize / 4);
             return uint64_t(tetFinder);
         }
@@ -1332,22 +1346,29 @@ namespace omni
             memcpy(triIds, tmpTriIds.begin(), sizeof(int32_t) * triIdsSize);
         }
 
-        PhysxShapeDesc* parseClosestPointsShape(usdparser::AttachedStage& attachedStage, const PXR_NS::SdfPath& rigidPath)
+        // Cooks/describes the shape on demand via a fresh scan of the collider (there is no
+        // ObjectKey-keyed cache to substitute -- see getClosestPoints's own comment).
+        // Retain the complete scan so the descriptor, pool and mesh auxiliaries
+        // remain valid until the closest-point query finishes.
+        usdparser::ScannedCollision parseClosestPointsShape(
+            usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey rigidKey)
         {
             const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
-            if (!src || !src->exists(attachedStage.keyFor(rigidPath)))
-                return nullptr;
+            if (!src || !src->exists(rigidKey))
+                return {};
 
-            const std::vector<PXR_NS::SdfPath> scanRoots{ rigidPath };
-            static const std::unordered_set<PXR_NS::SdfPath, PXR_NS::SdfPath::Hash> kNoExclude;
-            omni::physics::usd::ScannedStage scanned = omni::physics::usd::scanStage(
-                attachedStage.attachTarget(), scanRoots, kNoExclude, usdparser::iceDescriptorAllocator());
+            const std::string rigidPathText(attachedStage.textViewFor(rigidKey));
+            const std::vector<std::string> scanRoots{ rigidPathText };
+            static const std::vector<std::string> kNoExclude;
+            omni::physics::parse::ScannedStage scanned = attachedStage.scanStage(scanRoots, kNoExclude, attachedStage.descriptorScanOptions(),
+                usdparser::iceDescriptorAllocator());
+            const omni::physics::parse::IPhysicsSource& scanSrc = scanned.source();
 
             for (auto& shape : scanned.shapes)
             {
                 PhysxShapeDesc* desc = shape.get();
-                if (scanned.pathFor(desc->primKey) != rigidPath &&
-                    (!desc->sourceGprim.valid() || scanned.pathFor(desc->sourceGprim) != rigidPath))
+                if (scanSrc.sourceKeyToString(desc->primKey) != rigidPathText &&
+                    (!desc->sourceGprim.valid() || scanSrc.sourceKeyToString(desc->sourceGprim) != rigidPathText))
                 {
                     continue;
                 }
@@ -1355,14 +1376,14 @@ namespace omni
                 usdparser::scan::dispatchScannedShapeCooking(attachedStage, scanned, desc);
 
                 if (desc->rigidBody.valid())
-                    desc->rigidBody = attachedStage.keyFor(scanned.pathFor(desc->rigidBody));
+                    desc->rigidBody = attachedStage.keyFor(scanSrc.sourceKeyToString(desc->rigidBody));
                 if (desc->sourceGprim.valid())
-                    desc->sourceGprim = attachedStage.keyFor(scanned.pathFor(desc->sourceGprim));
+                    desc->sourceGprim = attachedStage.keyFor(scanSrc.sourceKeyToString(desc->sourceGprim));
                 if (desc->type == eConvexMeshShape)
                 {
                     auto* d = static_cast<ConvexMeshPhysxShapeDesc*>(desc);
                     if (d->meshPrimKey.valid())
-                        d->meshPrimKey = attachedStage.keyFor(scanned.pathFor(d->meshPrimKey));
+                        d->meshPrimKey = attachedStage.keyFor(scanSrc.sourceKeyToString(d->meshPrimKey));
                 }
                 else if (desc->type == eTriangleMeshShape ||
                          desc->type == eConvexMeshDecompositionShape ||
@@ -1370,29 +1391,37 @@ namespace omni
                 {
                     auto* d = static_cast<TriangleMeshPhysxShapeDesc*>(desc);
                     if (d->meshPrimKey.valid())
-                        d->meshPrimKey = attachedStage.keyFor(scanned.pathFor(d->meshPrimKey));
+                        d->meshPrimKey = attachedStage.keyFor(scanSrc.sourceKeyToString(d->meshPrimKey));
                 }
-                return shape.release();
+                return usdparser::ScannedCollision(std::move(scanned), desc);
             }
 
-            return nullptr;
+            return {};
         }
 
-        void getClosestPoints(carb::Float3* closestPoints, float* dists, const carb::Float3* points, const uint32_t pointsSize, const PXR_NS::SdfPath& rigidPath)
+        void getClosestPoints(omni::physics::AttachHandle attach, carb::Float3* closestPoints, float* dists, const carb::Float3* points, const uint32_t pointsSize, omni::physics::parse::ObjectKey rigidKey)
         {
-            usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getActiveAttachedStage();
+            omni::physx::RuntimeExecutionScope operation(attach);
+            if (!operation)
+                return;
+            usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getAttachedStageByHandle(attach);
             if (!attachedStage)
                 return;
 
-            PhysxShapeDesc* shapeDesc = parseClosestPointsShape(*attachedStage, rigidPath);
+            // parseClosestPointsShape does a fresh scan of the collider (it cooks/describes the
+            // shape on demand rather than looking up an already-tracked simulation object, so
+            // there is no ObjectKey-keyed cache to substitute -- this must stay a real scan for
+            // correctness).
+            const usdparser::ScannedCollision shapeOwner =
+                parseClosestPointsShape(*attachedStage, rigidKey);
+            PhysxShapeDesc* shapeDesc = shapeOwner.get();
             if (!shapeDesc)
             {
                 return;
             }
 
-            const omni::physics::parse::ObjectKey rigidKey = attachedStage->keyFor(rigidPath);
-            GfMatrix4d mat = omni::physx::internal::getWorldTransform(*attachedStage, rigidKey, PXR_NS::UsdTimeCode::Default());
-            PxTransform transform = toPhysX(mat);
+            const PxMat44d mat = omni::physx::internal::getWorldTransform(*attachedStage, rigidKey, omni::physics::parse::ReadTime::defaultTime());
+            PxTransform transform = omni::physx::toTransform(mat);
 
             for (size_t i = 0; i < pointsSize; ++i)
             {

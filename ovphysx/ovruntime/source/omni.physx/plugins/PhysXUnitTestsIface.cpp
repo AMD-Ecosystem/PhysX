@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1 AC-3 AC-4
 
 #include "OmniPhysX.h"
+#include "RuntimeExecution.h"
 #include "Setup.h"
 #include "PhysXUnitTestsIface.h"
 
@@ -18,7 +20,6 @@
 #include <carb/logging/StandardLogger.h>
 
 using namespace ::physx;
-using namespace PXR_NS;
 using namespace carb;
 
 namespace omni
@@ -122,12 +123,16 @@ PhysicsStats getPhysicsStats()
     return stats;
 }
 
-BatchedContactBufferStats getBatchedContactBufferStats()
+BatchedContactBufferStats getBatchedContactBufferStats(AttachHandle attach)
 {
+    RuntimeExecutionScope operation(attach);
+    if (!operation)
+        return {};
     BatchedContactBufferStats stats;
     stats.liveContactReportCount = ContactReport::getLiveInstanceCount();
-    const PhysXSetup& physxSetup = OmniPhysX::getInstance().getPhysXSetup();
-    const PhysXScenesMap& scenes = physxSetup.getPhysXScenes();
+    const usdparser::AttachedStage* owner = usdparser::UsdLoad::getUsdLoad()->getAttachedStageByHandle(attach);
+    if (!owner) return stats;
+    const usdparser::AttachedStage::SceneMap& scenes = owner->getPhysXScenes();
     stats.sceneCount = scenes.size();
     if (scenes.empty())
     {
@@ -146,23 +151,30 @@ BatchedContactBufferStats getBatchedContactBufferStats()
     return stats;
 }
 
-float getMassInformation(const char* path, Float3& inertia, Float3& com)
+float getMassInformation(AttachHandle attach, const char* path, Float3& inertia, Float3& com)
 {
+    RuntimeExecutionScope operation(attach);
+    if (!operation)
+        return -1.0f;
     float mass = -1.0f;
-    const internal::InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
 
-    SdfPath rbPath(path);
-
-    const usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getActiveAttachedStage();
+    const usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getAttachedStageByHandle(attach);
     if (!attachedStage)
         return mass;
 
-    OmniPhysX::getInstance().getInternalPhysXDatabase().updateDirtyMassActors();
+    const internal::InternalPhysXDatabase& db = attachedStage->getInternalPhysXDatabase();
+    // ObjectKey resolved straight from the caller's path string, via the source-agnostic
+    // IPhysicsSource::findByPath -- no SdfPath needed, matching resolveObjectKey's pattern
+    // (path string is the ABI boundary, not a pxr type).
+    const omni::physics::parse::IPhysicsSource* src = attachedStage->getSource();
+    const omni::physics::parse::ObjectKey rbKey = src ? src->findByPath(path) : omni::physics::parse::ObjectKey{};
 
-    PxRigidActor* actor = (PxRigidActor*)getObjectDataOrID<ObjectDataQueryType::ePHYSX_PTR>(rbPath, ePTActor, db, *attachedStage);
+    attachedStage->getInternalPhysXDatabase().updateDirtyMassActors();
+
+    PxRigidActor* actor = (PxRigidActor*)getObjectDataOrID<ObjectDataQueryType::ePHYSX_PTR>(rbKey, ePTActor, db, *attachedStage);
     if (!actor)
     {
-        actor = (PxRigidActor*)getObjectDataOrID<ObjectDataQueryType::ePHYSX_PTR>(rbPath, ePTLink, db, *attachedStage);
+        actor = (PxRigidActor*)getObjectDataOrID<ObjectDataQueryType::ePHYSX_PTR>(rbKey, ePTLink, db, *attachedStage);
     }
 
     if (!actor)
@@ -184,17 +196,26 @@ float getMassInformation(const char* path, Float3& inertia, Float3& com)
     return mass;
 }
 
-void getMaterialsPaths(const PXR_NS::SdfPath& path, std::vector<PXR_NS::SdfPath>& materialPaths)
+// ObjectKey resolved straight from the caller's path string via IPhysicsSource::findByPath
+// (mirrors getMassInformation above); material paths are read back via textFor(ObjectKey)
+// instead of pathFor(...).GetString() -- both pxr-free.
+void getMaterialsPaths(AttachHandle attach, const TestPathArg& path, std::vector<TestPathArg>& materialPaths)
 {
-    const internal::InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    RuntimeExecutionScope operation(attach);
+    if (!operation)
+        return ;
 
     std::vector<PxMaterial*> materials;
 
-    const usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getActiveAttachedStage();
+    const usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getAttachedStageByHandle(attach);
     if (!attachedStage)
         return;
 
-    const PxShape* shape = static_cast<const PxShape*>((void*)(getObjectDataOrID<ObjectDataQueryType::ePHYSX_PTR>(path, ePTShape, db, *attachedStage)));
+    const internal::InternalPhysXDatabase& db = attachedStage->getInternalPhysXDatabase();
+    const omni::physics::parse::IPhysicsSource* src = attachedStage->getSource();
+    const omni::physics::parse::ObjectKey shapeKey = src ? src->findByPath(path) : omni::physics::parse::ObjectKey{};
+
+    const PxShape* shape = static_cast<const PxShape*>((void*)(getObjectDataOrID<ObjectDataQueryType::ePHYSX_PTR>(shapeKey, ePTShape, db, *attachedStage)));
     if (shape != nullptr)
     {
         const PxU32 nbMaterials = shape->getNbMaterials();
@@ -206,7 +227,7 @@ void getMaterialsPaths(const PXR_NS::SdfPath& path, std::vector<PXR_NS::SdfPath>
     }
     else
     {
-        const PhysXCompoundShape* shape = static_cast<const PhysXCompoundShape*>((void*)(getObjectDataOrID<ObjectDataQueryType::ePHYSX_PTR>(path, ePTCompoundShape, db, *attachedStage)));
+        const PhysXCompoundShape* shape = static_cast<const PhysXCompoundShape*>((void*)(getObjectDataOrID<ObjectDataQueryType::ePHYSX_PTR>(shapeKey, ePTCompoundShape, db, *attachedStage)));
         if (shape)
         {
             for (size_t i = 0; i < shape->getShapes().size(); i++)
@@ -233,7 +254,7 @@ void getMaterialsPaths(const PXR_NS::SdfPath& path, std::vector<PXR_NS::SdfPath>
         const internal::InternalDatabase::Record* record = db.getFullTypedRecord(ePTMaterial, index);
         if (record)
         {
-            materialPaths.push_back(attachedStage->pathFor(record->mKey));
+            materialPaths.push_back(attachedStage->textFor(record->mKey));
         }
     }
 }
@@ -373,6 +394,108 @@ bool isCudaLibPresent()
 {
     omni::physx::OmniPhysX& physx = omni::physx::OmniPhysX::getInstance();
     return physx.isCudaLibPresent();
+}
+
+// ObjectKey resolved via IPhysicsSource::findByPath, same as getMaterialsPaths above.
+size_t getSceneInternalActorCount(AttachHandle attach, const TestPathArg& scenePath)
+{
+    RuntimeExecutionScope operation(attach);
+    if (!operation)
+        return 0;
+    OmniPhysX& omniPhysX = OmniPhysX::getInstance();
+    const usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getAttachedStageByHandle(attach);
+    if (!attachedStage)
+    {
+        return 0;
+    }
+
+    const omni::physics::parse::IPhysicsSource* src = attachedStage->getSource();
+    const omni::physics::parse::ObjectKey sceneKey = src ? src->findByPath(scenePath) : omni::physics::parse::ObjectKey{};
+
+    const usdparser::ObjectId sceneId = usdparser::ObjectId(getObjectDataOrID<ObjectDataQueryType::eOBJECT_ID>(
+        sceneKey, ePTScene, attachedStage->getInternalPhysXDatabase(), *attachedStage));
+    if (sceneId == usdparser::kInvalidObjectId)
+    {
+        return 0;
+    }
+
+    const PhysXScene* physxScene = attachedStage->getPhysXScene(sceneId);
+    if (!physxScene || !physxScene->getInternalScene())
+    {
+        return 0;
+    }
+
+    return physxScene->getInternalScene()->mActors.size();
+}
+
+// ObjectKey resolved via IPhysicsSource::findByPath, same as getSceneInternalActorCount above --
+// unconditional, no NO_USD fence needed.
+bool getForceRigidActor(AttachHandle attach, const TestPathArg& forcePath, void** outRigidActor)
+{
+    if (outRigidActor)
+    {
+        *outRigidActor = nullptr;
+    }
+
+    OmniPhysX& omniPhysX = OmniPhysX::getInstance();
+    const usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getAttachedStageByHandle(attach);
+    if (!attachedStage)
+    {
+        return false;
+    }
+
+    const omni::physics::parse::IPhysicsSource* src = attachedStage->getSource();
+    const omni::physics::parse::ObjectKey forceKey = src ? src->findByPath(forcePath) : omni::physics::parse::ObjectKey{};
+
+    internal::InternalPhysXDatabase& db = attachedStage->getInternalPhysXDatabase();
+    const usdparser::ObjectId forceId = usdparser::ObjectId(
+        getObjectDataOrID<ObjectDataQueryType::eOBJECT_ID>(forceKey, ePTForce, db, *attachedStage));
+    if (forceId == usdparser::kInvalidObjectId)
+    {
+        return false;
+    }
+
+    const internal::InternalForce* force =
+        static_cast<const internal::InternalForce*>(db.getInternalTypedRecord(ePTForce, forceId));
+    if (!force)
+    {
+        return false;
+    }
+
+    if (outRigidActor)
+    {
+        *outRigidActor = force->mRigidActor;
+    }
+    return true;
+}
+
+// Same resolution path as getSceneInternalActorCount above, for the per-scene force registration.
+size_t getSceneInternalForceCount(AttachHandle attach, const TestPathArg& scenePath)
+{
+    OmniPhysX& omniPhysX = OmniPhysX::getInstance();
+    const usdparser::AttachedStage* attachedStage = usdparser::UsdLoad::getUsdLoad()->getAttachedStageByHandle(attach);
+    if (!attachedStage)
+    {
+        return 0;
+    }
+
+    const omni::physics::parse::IPhysicsSource* src = attachedStage->getSource();
+    const omni::physics::parse::ObjectKey sceneKey = src ? src->findByPath(scenePath) : omni::physics::parse::ObjectKey{};
+
+    const usdparser::ObjectId sceneId = usdparser::ObjectId(getObjectDataOrID<ObjectDataQueryType::eOBJECT_ID>(
+        sceneKey, ePTScene, attachedStage->getInternalPhysXDatabase(), *attachedStage));
+    if (sceneId == usdparser::kInvalidObjectId)
+    {
+        return 0;
+    }
+
+    const PhysXScene* physxScene = attachedStage->getPhysXScene(sceneId);
+    if (!physxScene || !physxScene->getInternalScene())
+    {
+        return 0;
+    }
+
+    return physxScene->getInternalScene()->mForces.size();
 }
 
 } // namespace physx

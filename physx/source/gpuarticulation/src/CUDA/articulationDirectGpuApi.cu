@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PxDirectGPUAPI.h"
 #include "foundation/PxSimpleTypes.h"
@@ -293,7 +270,7 @@ static PX_FORCE_INLINE __device__ void updateKinematicInternal(
 
 //This function is called after user update gpu buffer(Dy::ArticulationDirtyFlag::eDIRTY_ROOT || Dy::ArticulationDirtyFlag::eDIRTY_POSITIONS)
 extern "C" __global__ void artiUpdateKinematic(
-	const PxgArticulationCoreDesc* const PX_RESTRICT scDesc,
+	PxgArticulation* PX_RESTRICT articulations,
 	const PxgShapeSim* PX_RESTRICT gShapeSimPool,
 	const PxgShape* PX_RESTRICT gConvexShapes,
 	PxsCachedTransform* PX_RESTRICT gTransformCache,
@@ -303,6 +280,7 @@ extern "C" __global__ void artiUpdateKinematic(
 	PxBounds3* PX_RESTRICT bounds,
 	const PxArticulationGPUIndex* PX_RESTRICT gpuIndices,	// NULL: process all the dirty articulations
 	const PxU32 nbElements,						// can be 0 in combination with NULL index buffer.
+	const PxU32 nbSlots,						// number of slots in articulations, walked with a NULL index buffer.
     bool zeroSimOutput)
 {
 	// we launch blocks of 32x2 threads. 1 warp deals with 1 articulation.
@@ -313,13 +291,22 @@ extern "C" __global__ void artiUpdateKinematic(
 	const PxU32 globalWarpIndex = blockIdx.x * blockDim.y + threadIdx.y;
 	const PxU32 warpsPerGrid = gridDim.x * blockDim.y;
 
-	const PxU32 nbArticulations = gpuIndices ? nbElements : scDesc->nbArticulations;
+	// Without an index list, walk every slot. Slots are not compacted after a removal, so live articulations can be in
+	// slots at or above the number of articulations simulated in the last step.
+	const PxU32 nbArticulations = gpuIndices ? nbElements : nbSlots;
 
 	for (PxU32 i = globalWarpIndex; i < nbArticulations; i += warpsPerGrid)
 	{
 		const PxU32 articulationIndex = gpuIndices ? gpuIndices[i] : i;
 
-		PxgArticulation& articulation = scDesc->articulations[articulationIndex];
+		PxgArticulation& articulation = articulations[articulationIndex];
+
+		// An uploaded articulation stores its slot in data.index. A slot that no articulation was uploaded to, for
+		// example the slot of an articulation removed before its upload, keeps the 0xFFFFFFFF fill and is skipped.
+		// The step after the removal of an articulation writes the same value into its record, so its slot is skipped too.
+		if (!gpuIndices && articulation.data.index != articulationIndex)
+			continue;
+
 		if (articulation.data.gpuDirtyFlag & ArticulationDirtyFlag::eNEEDS_KINEMATIC_UPDATE)
 		{
 			// reset while in cache.

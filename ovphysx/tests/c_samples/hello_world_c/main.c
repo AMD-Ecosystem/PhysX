@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-// NOTE: This file is included verbatim in documentation via literalinclude.
-// Tutorial marker comments below define the included range.
+// NOTE: This file is included in the documentation via literalinclude.
+// The tutorial marker comments below define the included range.
 
-// Compile-time check: fail compilation if C++ compiler is used (for internal testing)
+// The sample exercises the plain C API, so a C++ compiler is rejected.
 #ifdef __cplusplus
 #error "This file should be compiled as C, not C++"
 #endif
@@ -16,18 +16,17 @@
 
 static int run(void)
 {
-  // Create PhysX instance with default args
-  ovphysx_create_args create_args = OVPHYSX_CREATE_ARGS_DEFAULT;
-  ovphysx_handle_t handle = 0;
+  // Create a PhysX instance.
+  ovphysx_instance_handle_t handle = 0;
   
-  ovphysx_result_t result = ovphysx_create_instance(&create_args, &handle);
+  ovphysx_result_t result = ovphysx_create_instance(&handle);
   if (result.status != OVPHYSX_API_SUCCESS) {
     fprintf(stderr, "Failed to create PhysX instance\n");
   ovphysx_shutdown();
     return 1;
   }
 
-  // Populate ovstage from USD and attach it to ovphysx
+  // Populate an ovstage instance from the USD file and attach it to ovphysx.
   ovphysx_sample_stage_attachment_t stage_attachment = {0};
   if (!ovphysx_sample_attach_usd_with_ovstage(
           handle, OVPHYSX_TEST_DATA "/simple_physics_scene.usda", &stage_attachment)) {
@@ -37,7 +36,7 @@ static int run(void)
     return 1;
   }
 
-  // Step the simulation
+  // Enqueue one simulation step. Stepping is asynchronous.
   ovphysx_enqueue_result_t step_result = ovphysx_step(handle, 0.016f);
   if (step_result.status != OVPHYSX_API_SUCCESS) {
     fprintf(stderr, "Failed to step simulation\n");
@@ -47,11 +46,12 @@ static int run(void)
     return 1;
   }
 
-  // Wait for step to complete
-  ovphysx_op_wait_result_t step_wait_result = {0};
-  ovphysx_result_t step_wait_status = ovphysx_wait_op(handle, step_result.op_index, UINT64_MAX, &step_wait_result);
+  // Wait for the step to complete and check it reported no errors.
+  ovphysx_wait_task_result_t step_wait_result = {0};
+  ovphysx_result_t step_wait_status = ovphysx_wait_task(
+      handle, step_result, OVPHYSX_TIMEOUT_INFINITE, &step_wait_result);
   int step_ok = (step_wait_status.status == OVPHYSX_API_SUCCESS && step_wait_result.num_errors == 0);
-  ovphysx_destroy_wait_result(&step_wait_result);
+  ovphysx_destroy_wait_task_result(&step_wait_result);
   if (!step_ok) {
     fprintf(stderr, "Simulation step failed\n");
     ovphysx_sample_destroy_stage(handle, &stage_attachment);

@@ -1,7 +1,13 @@
-# ovphysx Python benchmark driver
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# @implements REQ-PACKAGING-TESTDEPS-001
+# @covers AC-1 AC-2 AC-3
+#
+# ovphysx Python benchmark driver.
 # Mirrors scripts/test_python_runtime.cmake but runs the pytest-benchmark suite
-# under tests/python_benchmarks/ in two passes (CPU and GPU) because the
-# ovphysx process device-mode is locked by the first PhysX() call.
+# under tests/python_benchmarks/ in two passes (CPU and GPU), because the
+# ovphysx process device mode is locked by the first PhysX() call.
 #
 # Usage:
 #   cmake -P scripts/test_benchmarks_python.cmake
@@ -20,10 +26,12 @@ cmake_minimum_required(VERSION 3.16)
 get_filename_component(SCRIPT_DIR "${CMAKE_CURRENT_LIST_FILE}" DIRECTORY)
 include("${SCRIPT_DIR}/crossplatform_helpers.cmake")
 include("${SCRIPT_DIR}/build_common.cmake")
+include("${SCRIPT_DIR}/dev_schema_provider.cmake")
 
 set(INSTALL_DIR "${PROJECT_ROOT}/_install")
 set(BENCHMARK_DIR "${PROJECT_ROOT}/tests/python_benchmarks")
-set(RESULTS_DIR "${PROJECT_ROOT}/_build/benchmark_results/python")
+set(RESULTS_DIR "${BUILD_PATH}/benchmark_results/python")
+ovphysx_require_build_path("${RESULTS_DIR}")
 file(MAKE_DIRECTORY "${RESULTS_DIR}")
 
 if(NOT EXISTS "${BENCHMARK_DIR}")
@@ -44,8 +52,9 @@ if(NOT OVPHYSX_UV_COMMAND)
     message(FATAL_ERROR "uv not found (needed for running pytest-benchmark)")
 endif()
 
-# Create venv with packman Python -- same recipe as test_python_runtime.cmake.
-set(VENV_DIR "${BENCHMARK_DIR}/.venv")
+# Create the venv with packman Python, the same recipe as test_python_runtime.cmake.
+set(VENV_DIR "${BUILD_PATH}/venv/python_benchmarks")
+ovphysx_require_build_path("${VENV_DIR}")
 if(EXISTS "${VENV_DIR}")
     file(REMOVE_RECURSE "${VENV_DIR}")
 endif()
@@ -70,35 +79,31 @@ if("$ENV{BENCHMARK_CPU}" STREQUAL "0" OR "$ENV{BENCHMARK_CPU}" STREQUAL "false")
     set(RUN_CPU FALSE)
 endif()
 
-set(UV_CACHE_DIR_PATH "${PROJECT_ROOT}/_build/.uv_cache")
+set(UV_CACHE_DIR_PATH "${BUILD_PATH}/.uv_cache")
+foreach(_CACHE_PATH IN ITEMS "${UV_CACHE_DIR_PATH}" "${BUILD_PATH}/pycache"
+                             "${BUILD_PATH}/pytest_cache/python_benchmarks")
+    ovphysx_require_build_path("${_CACHE_PATH}")
+endforeach()
 file(MAKE_DIRECTORY "${UV_CACHE_DIR_PATH}")
-set(OVSTAGE_WHEEL_DIR "${PROJECT_ROOT}/_build/target-deps/ovstage_wheel")
-file(GLOB OVSTAGE_WHEELS "${OVSTAGE_WHEEL_DIR}/ovstage-*.whl")
-if(NOT OVSTAGE_WHEELS)
-    message(FATAL_ERROR "ovstage wheel not found in ${OVSTAGE_WHEEL_DIR}. Run the ovphysx build first.")
-endif()
+include("${CMAKE_CURRENT_LIST_DIR}/ovstage_index.cmake")
+ovphysx_ovstage_index_env(OVSTAGE_INDEX_ENV PROJECT tests/python_benchmarks)
 set(BASE_UV_ENV
     "UV_CACHE_DIR=${UV_CACHE_DIR_PATH}"
+    "UV_PROJECT_ENVIRONMENT=${VENV_DIR}"
+    "PYTHONPYCACHEPREFIX=${BUILD_PATH}/pycache"
+    "PYTEST_ADDOPTS=$ENV{PYTEST_ADDOPTS} -o cache_dir=\"${BUILD_PATH}/pytest_cache/python_benchmarks\""
     "UV_NO_CONFIG=1"
-    "UV_FIND_LINKS=${OVSTAGE_WHEEL_DIR}"
+    ${OVSTAGE_INDEX_ENV}
     "UV_HTTP_TIMEOUT=300"
     "UV_SKIP_WHEEL_FILENAME_CHECK=1"
-    # PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 was set here originally but it
-    # prevents pytest-benchmark from registering even when explicitly
-    # passed via -p, so --benchmark-* args get rejected. Removed: the
-    # venv only pins pytest + pytest-benchmark + numpy + (optionally
-    # torch via the [gpu] extra), so there are no surprise plugins to
-    # guard against.
+    # PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 is deliberately absent. It prevents
+    # pytest-benchmark from registering even when passed via -p, so the
+    # --benchmark-* args get rejected. The venv only pins pytest,
+    # pytest-benchmark, numpy and optionally torch via the [gpu] extra, so
+    # there are no surprise plugins to guard against.
 )
-# ovstage is not installed; consume the configured external package.
+# Load native OVStage from the configured package.
 ovphysx_resolve_ovstage_paths()
-set(OVSTAGE_PYTHON_DIR "${OVPHYSX_OVSTAGE_PYTHON_DIR}")
-if(NOT OVSTAGE_PYTHON_DIR OR NOT EXISTS "${OVSTAGE_PYTHON_DIR}/ovstage/__init__.py")
-    message(FATAL_ERROR
-        "ovstage Python package not found under the configured ovstage root "
-        "'${OVPHYSX_OVSTAGE_ROOT}'.\n"
-        "Run scripts/fetch_deps.cmake so the ovstage release is extracted.")
-endif()
 if(WIN32)
     set(OVSTAGE_RUNTIME_DIR "${OVPHYSX_OVSTAGE_RUNTIME_DIR}")
     set(OVSTAGE_RUNTIME_FILE "${OVSTAGE_RUNTIME_DIR}/ovstage.dll")
@@ -106,20 +111,22 @@ if(WIN32)
         "${INSTALL_DIR}/bin"
         "${INSTALL_DIR}/plugins"
         "${OVSTAGE_RUNTIME_DIR}"
-        "${OVSTAGE_PYTHON_DIR}/ovstage/bin"
+        # ovstage.dll statically imports the USD monolith, which lives in
+        # OVStage's plugins/ dir and which the SDK does not ship
+        # (REQ-PACKAGING-USDFREE-001 AC-4). Linux resolves it via ovstage's
+        # RUNPATH ($ORIGIN/plugins). Windows needs it on PATH.
+        "${OVSTAGE_RUNTIME_DIR}/plugins"
         "$ENV{PATH}"
     )
     list(JOIN _WINDOWS_PATH_SEGMENTS ";" _WINDOWS_PATH_VALUE)
     set(ENV{PATH} "${_WINDOWS_PATH_VALUE}")
     list(APPEND BASE_UV_ENV
-        "PYTHONPATH=${OVSTAGE_PYTHON_DIR}"
         "OVSTAGE_LIBRARY_PATH_HINT=${OVSTAGE_RUNTIME_DIR}"
     )
 else()
-    set(OVSTAGE_RUNTIME_DIR "${OVSTAGE_PYTHON_DIR}/ovstage/bin")
+    set(OVSTAGE_RUNTIME_DIR "${OVPHYSX_OVSTAGE_RUNTIME_DIR}")
     set(OVSTAGE_RUNTIME_FILE "${OVSTAGE_RUNTIME_DIR}/libovstage.so")
     list(APPEND BASE_UV_ENV
-        "PYTHONPATH=${OVSTAGE_PYTHON_DIR}"
         "OVSTAGE_LIBRARY_PATH_HINT=${OVSTAGE_RUNTIME_DIR}"
         "LD_LIBRARY_PATH=${INSTALL_DIR}/lib:${INSTALL_DIR}/plugins:${OVSTAGE_RUNTIME_DIR}:$ENV{LD_LIBRARY_PATH}"
     )
@@ -128,9 +135,21 @@ if(NOT EXISTS "${OVSTAGE_RUNTIME_FILE}")
     message(FATAL_ERROR "ovstage runtime not found at ${OVSTAGE_RUNTIME_FILE}")
 endif()
 
+execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env ${BASE_UV_ENV}
+        "${OVPHYSX_UV_COMMAND}" sync --no-install-project
+    WORKING_DIRECTORY "${BENCHMARK_DIR}"
+    RESULT_VARIABLE _SYNC_RESULT
+)
+if(NOT _SYNC_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to sync Python benchmark dependencies")
+endif()
+
 function(run_python_bench_pass _LABEL _DEVICE)
     set(_JSON "${RESULTS_DIR}/${_LABEL}.json")
     set(_LOG "${RESULTS_DIR}/${_LABEL}.log")
+    ovphysx_require_build_path("${_JSON}")
+    ovphysx_require_build_path("${_LOG}")
     file(REMOVE "${_LOG}")
 
     set(_PYTEST_ARGS
@@ -143,25 +162,24 @@ function(run_python_bench_pass _LABEL _DEVICE)
         list(APPEND _PYTEST_ARGS -k "${BENCHMARK_FILTER}")
     endif()
     if(REGENERATE)
-        # Save a new baseline; do not fail on regression.
+        # Save a new baseline without failing on regression.
         list(APPEND _PYTEST_ARGS --benchmark-save=${PLATFORM_NAME}-${_LABEL})
     else()
-        # Compare against the most recent saved baseline; fail on >10% regression in mean.
+        # Compare against the most recent saved baseline and fail on a >10% regression in mean.
         list(APPEND _PYTEST_ARGS
             --benchmark-compare
             --benchmark-compare-fail=mean:10%
         )
     endif()
 
-    # Device knob now flows via pytest CLI option (--bench-device, above).
-    # The env var was switched out per review.
+    # The device is selected by the --bench-device pytest option above, not by an env var.
     set(_PASS_ENV ${BASE_UV_ENV})
 
     message(STATUS "")
     message(STATUS "--- python ${_LABEL} pass ---")
     execute_process(
         COMMAND ${CMAKE_COMMAND} -E env ${_PASS_ENV}
-                "${OVPHYSX_UV_COMMAND}" run pytest ${_PYTEST_ARGS}
+                "${OVPHYSX_UV_COMMAND}" run --no-sync pytest ${_PYTEST_ARGS}
         WORKING_DIRECTORY "${BENCHMARK_DIR}"
         TIMEOUT 1800
         RESULT_VARIABLE _RC
@@ -174,9 +192,9 @@ function(run_python_bench_pass _LABEL _DEVICE)
     message(STATUS "Exit code (python ${_LABEL}): ${_RC}")
 
     if(NOT _RC STREQUAL "0")
-        # Treat the GPU pass as a soft-skip when the device is unavailable.
-        # pytest exits 1 on test failure -- we cannot distinguish a fixture skip
-        # from an assertion failure here, so devs must rely on stderr for now.
+        # The GPU pass is a soft skip when the device is unavailable. pytest exits 1
+        # on any test failure, so a fixture skip cannot be distinguished from an
+        # assertion failure here and stderr is matched instead.
         if(_LABEL STREQUAL "gpu" AND _STDERR MATCHES "GPU not available|cuda not available|no CUDA")
             message(STATUS "GPU not available; skipping GPU python benchmark pass.")
             return()

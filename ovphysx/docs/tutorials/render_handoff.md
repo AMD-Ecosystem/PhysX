@@ -1,32 +1,40 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
-<!-- SPDX-License-Identifier: BSD-3-Clause -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # Rendering Handoff
 
 ovphysx is a headless simulation SDK — it has no built-in renderer.
-To visualize simulation state, you read data back through tensor bindings and hand it to an external tool such as [Rerun](https://rerun.io) or ovrtx.
+To visualize simulation state, you read data back through the session read API (`PhysX.read_sync` in this sample) and hand it to an external tool such as [Rerun](https://rerun.io) or the ovrtx renderer.
 
 This tutorial shows the pattern using Rerun: populate an ovstage scene from USD and attach it, step the simulation, and stream rigid body transforms to a browser-based viewer.
 
 ## Key Idea
 
 Rerun does not read USD.
-The sample explicitly logs all visual geometry to Rerun from the simulation data returned by ovphysx tensor bindings:
+The sample explicitly logs all visual geometry to Rerun from the simulation data returned by `PhysX.read_sync`:
 
-- **Falling cubes** — logged each frame as `rr.Boxes3D` with positions and quaternions from the `RIGID_BODY_POSE` tensor binding.
+- **Falling cubes** — logged each frame as `rr.Boxes3D` with positions and quaternions from `PhysX.read_sync` on the rigid-body `position` and `orientation` attributes.
 - **Ground plane** — logged once as a static flat box for visual context.
 
 This is the core of the render handoff pattern: ovphysx owns the simulation, you log what you need to your visualization tool.
 
-## Two ways to hand off, and what each populates
+For scaled content, pair the read orientation with the decomposed world scale,
+not the authored scale. See [Signed scale and body orientation](../read_write/data_model.md#signed-scale-and-body-orientation)
+for the reconstruction rule and orientation-write convention.
+
+For deformables, read the skinned render mesh with `PhysX.read_sync(SimObjectType.DEFORMABLE_SKIN_MESH, ["points"])`; refer to
+[Readable data](../read_write/readable.md#deformable-skin-meshes).
+
+## Two Ways to Hand Off, and What Each Populates
 
 - **Tensor handoff (this tutorial).** The viewer never reads the Stage — Rerun
-  receives transforms from tensor bindings and the sample supplies its own
-  geometry. The sample USD is non-instanced, so `domains=PopulationDomain.PHYSICS`
-  is enough here; for arbitrary content prefer `ALL`.
+  receives transforms from `PhysX.read_sync` and the sample supplies its own
+  geometry. The sample USD is non-instanced, so the physics population description
+  alone (`physics_population_descs()`) is enough here; for arbitrary content add
+  RENDERING beside it.
 - **Shared Stage.** A renderer such as ovrtx draws from the same Stage, so
-  populate `ALL` (or `PHYSICS | RENDERING`). See
-  [Population domains](../ovstage_integration.md#population-domains)
+  populate the physics description with RENDERING beside it. Refer to
+  [Populating physics](../ovstage_integration.md#populating-physics-the-physics-population-description)
   for the full contract, the native-instance caveat, sequencing, and cost.
 
 ## Prerequisites
@@ -36,6 +44,10 @@ This is the core of the render handoff pattern: ovphysx owns the simulation, you
 - Get the sample from the [source repository](https://github.com/NVIDIA-Omniverse/PhysX/): the Rerun sample lives under `tests/python_samples_extra/visual_rerunio_sample/` and is not part of the `pip install` wheel.
 
 ## Sample
+
+This complete sample starts a Rerun web viewer, attaches a USD scene, logs the
+static ground plane once, then steps the simulation and logs the rigid-body
+transforms from `PhysX.read_sync` as `rr.Boxes3D` on every frame:
 
 ```{literalinclude} ../../tests/python_samples_extra/visual_rerunio_sample/visualize_rigid_bodies.py
 :language: python
@@ -50,7 +62,9 @@ cd tests/python_samples_extra/visual_rerunio_sample
 uv run visualize_rigid_bodies.py --interactive
 ```
 
-This installs dependencies, starts a Rerun web viewer at `http://localhost:9090`, pauses for 5 seconds so you can open the URL in your browser, then runs the simulation at real-time speed.
+This installs dependencies, starts a Rerun web viewer on localhost port 9090,
+pauses for 5 seconds so you can open the viewer in your browser, then runs the
+simulation at real-time speed.
 
 Without `--interactive`, the simulation runs as fast as possible — useful for CI or when you only need the recorded data in the Rerun viewer's timeline.
 

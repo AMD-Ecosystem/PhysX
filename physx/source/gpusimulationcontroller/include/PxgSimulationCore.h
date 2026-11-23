@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef PXG_SIMULATION_CORE_H
 #define	PXG_SIMULATION_CORE_H
@@ -38,6 +15,7 @@
 #include "PxgFEMCloth.h"
 #include "PxgAllocatorDesc.h"
 #include "PxgShapeSimManager.h"
+#include "PxgCopyManager.h"
 #include "CmPinnableArray.h"
 
 #include "CmPinnableObject.h"
@@ -61,13 +39,16 @@ namespace physx
 	class PxCudaContextManager;
 	class PxCudaContext;
 	struct PxgBodySimVelocities;
-	struct PxgDbRigidAttachmentBlock;
+	struct PxgRigidDbAttachmentBlock;
 	struct PxgDbDbAttachmentBlock;
 	struct PxsCachedTransform;
 	class PxgCudaKernelWranglerManager;
 	class PxgArticulationBuffer;
 	class PxgSoftBodyBuffer;
 	class PxgFEMClothBuffer;
+	class PxgDeformableFilterManager;
+	class PxgDeformableSurfaceTopology;
+	class PxgAttachmentManager;
 	class PxgBodySimManager;
 	class PxgGpuContext;
 	
@@ -83,28 +64,6 @@ namespace physx
 		PxReal	_padAngular;	// Padding to maintain 32-byte struct size
 	}
 	PX_ALIGN_SUFFIX(16);
-
-	struct SoftBodyAttachmentAndFilterData
-	{
-	public:
-		Cm::PinnableArray<PxgFEMRigidAttachment>* rigidAttachments;
-		Cm::PinnableArray<PxgRigidFilterPair>* rigidFilterPairs;
-		bool dirtyRigidAttachments;
-		bool dirtyRigidFilterPairs;
-		Cm::PinnableArray<PxU32>* activeRigidAttachments;
-		bool dirtyActiveRigidAttachments;
-		Cm::PinnableArray<PxgFEMFEMAttachment>* softBodyAttachments;
-		bool dirtySoftBodyAttachments;
-		Cm::PinnableArray<PxU32>* activeSoftBodyAttachments;
-		bool dirtyActiveSoftBodyAttachments;
-		PxArray<Dy::DeformableVolume*>* dirtyDeformableVolumeForFilterPairs;
-		Cm::PinnableArray<PxgFEMFEMAttachment>* clothAttachments;
-		Cm::PinnableArray<PxgNonRigidFilterPair>* clothFilterPairs;
-		bool dirtyClothAttachments;
-		bool dirtyClothFilterPairs;
-		Cm::PinnableArray<PxU32>* activeClothAttachments;
-		bool dirtyActiveClothAttachments;
-	};
 
 	class PxgSimulationCore : public PxUserAllocated
 	{
@@ -160,7 +119,12 @@ namespace physx
 			Cm::PinnableArray<PxU32>& softBodyElementIndexPool,
 			PxArray<PxU32>& softBodyNodeIndexPool,
 			PxgBodySimManager& bodySimManager,
-			SoftBodyAttachmentAndFilterData& data);
+			PxgAttachmentManager& rigidAttachments,
+			PxgAttachmentManager& softBodyAttachments,
+			PxgAttachmentManager& clothAttachments,
+			const PxgDeformableFilterManager& rigidVolumeFilters,
+			const PxgDeformableFilterManager& volumeVolumeFilters,
+			const PxgDeformableFilterManager& volumeSurfaceFilters);
 
 		void gpuMemDmaUpFEMCloths(Cm::PinnableArray<PxgFEMCloth>& newFEMClothPool,
 			PxU32* newTriangleMeshByteSizePool,
@@ -172,19 +136,11 @@ namespace physx
 			Cm::PinnableArray<PxU32>& femClothElementIndexPool,
 			PxArray<PxU32>& femClothNodeIndexPool,
 			PxgBodySimManager& bodySimManager,
-			Cm::PinnableArray<PxgFEMRigidAttachment>& rigidAttachments,
-			Cm::PinnableArray<PxgRigidFilterPair>& rigidAttachmentIds,
-			bool dirtyRigidAttachments,
-			bool dirtyRigidFilterPairs,
-			Cm::PinnableArray<PxU32>& activeRigidAttachments,
-			bool dirtyActiveRigidAttachments,
-			Cm::PinnableArray<PxgFEMFEMAttachment>& clothAttachments,
-			Cm::PinnableArray<PxgNonRigidFilterPair>& clothVertTriFilterIds,
-			bool dirtyClothAttachments,
-			bool dirtyClothFilterPairs,
-			Cm::PinnableArray<PxU32>& activeClothAttachments,
-			bool dirtyActiveClothAttachments
-		);
+			PxgAttachmentManager& rigidAttachments,
+			PxgAttachmentManager& clothAttachments,
+			const PxgDeformableFilterManager& rigidSurfaceFilters,
+			const PxgDeformableFilterManager& surfaceSurfaceFilters,
+			const PxArray<PxgDeformableSurfaceTopology*>& surfaceTopologies);
 
 		void gpuMemDmaUpParticleSystem(PxgBodySimManager& bodySimManager);
 
@@ -207,6 +163,8 @@ namespace physx
 
 		void updateArticulations(const PxU32 nbNewArticulations, PxgArticulationSimUpdate* updates,
 			const PxU32 nbUpdatedArticulations, PxReal* dofData);
+
+		void markRemovedArticulationSlotsEmpty(const PxgBodySimManager& bodySimManager);
 
 		void updateJointsAndSyncData(const Cm::PinnableArray<PxgD6JointData>& rigidJointData,
 			const Cm::PinnableArray<PxU32>& dirtyRigidJointIndices,
@@ -236,6 +194,7 @@ namespace physx
 		// ones to OVD. A late attach uses this to recover forces that, with eRETAIN_ACCELERATIONS, persist
 		// across steps but were applied before sampling started. gpuIndices are PxRigidDynamic node indices.
 		void ovdSnapshotRigidDynamicForces(const PxRigidDynamicGPUIndex* gpuIndices, PxU32 nbElements);
+		bool ovdReadbackRigidDynamicData(const PxRigidDynamicGPUIndex* indices, PxU32 nbElements, PxRigidDynamicGPUAPIReadType::Enum dataType);
 #endif
 
 		void launchComputeRigidBodyAccelerations(const PxU32 nbBodies, const float oneOverDt);
@@ -310,7 +269,7 @@ namespace physx
 		// FEM-cloth
 		PX_FORCE_INLINE PxU32 getMaxClothVerts() { return mMaxNbClothVerts; }
 		PX_FORCE_INLINE PxU32 getMaxClothTriangles() { return mMaxNbClothTriangles; }
-		PX_FORCE_INLINE PxU32 getMaxClothTrianglesWithActiveEdges() { return mMaxNbClothTrianglesWithActiveEdges; }
+		PX_FORCE_INLINE PxU32 getMaxClothTrianglesWithOwnedEdges() { return mMaxNbClothTrianglesWithOwnedEdges; }
 
 		PX_FORCE_INLINE PxU32 getMaxNonSharedTrianglePartitions() { return mMaxNbNonSharedTriPartitions; }
 		PX_FORCE_INLINE PxU32 getMaxNonSharedTrianglesPerPartition() { return mMaxNbNonSharedTrianglesPerPartition; }
@@ -340,47 +299,40 @@ namespace physx
 		PX_FORCE_INLINE PxU32 getNumTotalSoftbodies() { return mNbTotalSoftBodies; }
 
 		PX_FORCE_INLINE PxU32 getNbRigidSoftBodyAttachments() const { return mNbRigidSoftBodyAttachments; }
-		PX_FORCE_INLINE PxU32 getNbRigidSoftBodyFilters() const { return mNbRigidSoftBodyFilters; }
-		PX_FORCE_INLINE PxgDevicePointer<PxgFEMRigidAttachment> getRigidSoftBodyAttachments() { return mSoftBodyRigidAttachments.getTypedDevicePtr(); }
+		PX_FORCE_INLINE PxgDevicePointer<PxgDeformableAttachment> getRigidSoftBodyAttachments() { return mSoftBodyRigidAttachments.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxU32> getActiveRigidSoftBodyAttachments() { return mActiveSoftBodyRigidConstraints.getTypedDevicePtr(); }
-		PX_FORCE_INLINE PxgDevicePointer<PxgDbRigidAttachmentBlock> getSoftBodyRigidAttachmentBlocks() { return mSoftBodyRigidAttachmentBlocks.getTypedDevicePtr(); }
+		PX_FORCE_INLINE PxgDevicePointer<PxU32> getRigidSoftBodyAttachmentRigidRefCounts() { return mSoftBodyRigidAttachmentRigidRefCounts.getTypedDevicePtr(); }
+		PX_FORCE_INLINE PxgDevicePointer<PxgRigidDbAttachmentBlock> getSoftBodyRigidAttachmentBlocks() { return mSoftBodyRigidAttachmentBlocks.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxU32> getGpuSoftBodyRigidCounter() { return mNumSoftBodyRigidAttachments.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxNodeIndex> getSoftBodyRigidAttachmentIds() { return mSoftBodyRigidAttachmentIds.getTypedDevicePtr(); }
-		PX_FORCE_INLINE PxgDevicePointer<PxgRigidFilterPair> getRigidSoftBodyFilters() { return mSoftBodyRigidFilterPairs.getTypedDevicePtr(); }
 
 		PX_FORCE_INLINE PxU32 getNbSoftBodySoftBodyAttachments() const { return mNbSoftBodySoftBodyAttachments; }
-		PX_FORCE_INLINE PxgDevicePointer<PxgFEMFEMAttachment> getSoftBodySoftBodyAttachments() { return mSoftBodySoftBodyAttachments.getTypedDevicePtr(); }
+		PX_FORCE_INLINE PxgDevicePointer<PxgDeformableAttachment> getSoftBodySoftBodyAttachments() { return mSoftBodySoftBodyAttachments.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxU32> getActiveSoftBodySoftAttachments() { return mActiveSoftBodySoftBodyConstraints.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxgDbDbAttachmentBlock> getSoftBodySoftBodyAttachmentBlocks() { return mSoftBodySoftBodyAttachmentBlocks.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxU32> getGpuSoftBodySoftBodyCounter() { return mNumSoftBodySoftBodyAttachments.getTypedDevicePtr(); }
 
 		PX_FORCE_INLINE PxU32 getNbClothSoftBodyAttachments() const { return mNbClothSoftBodyAttachments; }
-		PX_FORCE_INLINE PxU32 getNbClothSoftBodyFilters() const { return mNbClothSoftBodyFilters; }
-		PX_FORCE_INLINE PxgDevicePointer<PxgFEMFEMAttachment> getClothSoftBodyAttachments() { return mSoftBodyClothAttachments.getTypedDevicePtr(); }
+		PX_FORCE_INLINE PxgDevicePointer<PxgDeformableAttachment> getClothSoftBodyAttachments() { return mSoftBodyClothAttachments.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxU32> getActiveClothSoftBodyAttachments() { return mActiveSoftBodyClothConstraints.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxgDbDbAttachmentBlock> getSoftBodyClothAttachmentBlocks() { return mSoftBodyClothAttachmentBlocks.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxU32> getGpuSoftBodyClothCounter() { return mNumSoftBodyClothAttachments.getTypedDevicePtr(); }
-		PX_FORCE_INLINE PxgDevicePointer<PxgNonRigidFilterPair> getClothSoftBodyFilters() { return mSoftBodyClothFilterPairs.getTypedDevicePtr(); }
 
 
 		PX_FORCE_INLINE PxU32 getNbActiveRigidClothAttachments() const { return mNbRigidClothAttachments; }
-		PX_FORCE_INLINE PxU32 getNbRigidClothFilters() const { return mNbRigidClothFilters; }
-		PX_FORCE_INLINE PxgDevicePointer<PxgFEMRigidAttachment> getRigidClothAttachments() { return mClothRigidAttachments.getTypedDevicePtr(); }
+		PX_FORCE_INLINE PxgDevicePointer<PxgDeformableAttachment> getRigidClothAttachments() { return mClothRigidAttachments.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxU32> getActiveRigidClothAttachments() { return mActiveClothRigidAttachments.getTypedDevicePtr(); }
-		PX_FORCE_INLINE PxgDevicePointer<PxgDbRigidAttachmentBlock> getClothRigidAttachmentBlocks() { return mClothRigidAttachmentBlocks.getTypedDevicePtr(); }
+		PX_FORCE_INLINE PxgDevicePointer<PxU32> getRigidClothAttachmentRigidRefCounts() { return mClothRigidAttachmentRigidRefCounts.getTypedDevicePtr(); }
+		PX_FORCE_INLINE PxgDevicePointer<PxgRigidDbAttachmentBlock> getClothRigidAttachmentBlocks() { return mClothRigidAttachmentBlocks.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxU32> getGpuClothRigidCounter() { return mNumClothRigidAttachments.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxNodeIndex> getClothRigidAttachmentIds() { return mClothRigidAttachmentIds.getTypedDevicePtr(); }
-		PX_FORCE_INLINE PxgDevicePointer<PxgRigidFilterPair> getRigidClothFilters() { return mClothRigidFilterPairs.getTypedDevicePtr(); }
 
 
 		PX_FORCE_INLINE PxU32 getNbActiveClothClothAttachments() const { return mNbClothClothAttachments; }
-		PX_FORCE_INLINE PxU32 getNbClothClothVertTriFilters() const { return mNbClothClothVertTriFilters; }
-		PX_FORCE_INLINE PxgDevicePointer<PxgFEMFEMAttachment> getClothClothAttachments() { return mClothClothAttachments.getTypedDevicePtr(); }
+		PX_FORCE_INLINE PxgDevicePointer<PxgDeformableAttachment> getClothClothAttachments() { return mClothClothAttachments.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxU32> getActiveClothClothAttachments() { return mActiveClothClothAttachments.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxgDbDbAttachmentBlock> getClothClothAttachmentBlocks() { return mClothClothAttachmentBlocks.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxU32> getGpuClothClothCounter() { return mNumClothClothAttachments.getTypedDevicePtr(); }
-
-		PX_FORCE_INLINE PxgDevicePointer<PxgNonRigidFilterPair> getClothClothVertTriFilters() { return mClothClothVertTriFilterPairs.getTypedDevicePtr(); }
 
 		PX_FORCE_INLINE Cm::PinnableBitMap& getActiveClothStateChangedMap() { return mActiveFEMClothStateChangedMap; }
 		PX_FORCE_INLINE PxReal* getActiveClothWakeCountsCPU() { return mFEMClothWakeCounts.begin(); }
@@ -394,6 +346,12 @@ namespace physx
 
 		PX_FORCE_INLINE PxgDevicePointer<PxgSimulationCoreDesc> getSimulationCoreDesc() { return mUpdatedCacheAndBoundsDescBuffer.getTypedDevicePtr(); }
 		PX_FORCE_INLINE PxgDevicePointer<PxgUpdateActorDataDesc> getUpdatedActorDescDesc() { return mUpdatedActorDescBuffer.getTypedDevicePtr(); }
+
+		// Direct GPU API: stages the body2World target of a kinematic for this step. applyKinematicTargets() writes the staged
+		// targets to the body sims after the solver, which takes the start pose of a kinematic from its solver body data, or
+		// instead of the solver in a step without one.
+		void			stageKinematicTarget(PxU32 nodeIndex, const PxTransform& body2World);
+		void			applyKinematicTargets();
 
 		PxU32			getMaxArticulationLinks() const;
 		PxU32			getMaxArticulationDofs() const;
@@ -433,7 +391,8 @@ namespace physx
 		PxgTypedCudaBuffer<PxU32>	mActivateBuffer;
 		PxgTypedCudaBuffer<PxU32>	mDeactivateBuffer;
 
-		PxgTypedCudaBuffer<PxU32>	mUpdatedDirectBuffer;
+		PxgTypedCudaBuffer<PxU32>	mDirectGPUUpdateFlagsBuffer;
+		PxU32						mNbDirectGPUUpdateFlags;	// Number of update flags in mDirectGPUUpdateFlagsBuffer, a multiple of 32
 
 		// PT: new naming convention with "CudaBuffer" suffix and specific prefix for easier searching
 		PxgTypedCudaBuffer<PxgBodySim>	mBodySimCudaBuffer;						// PT: contains PxgBodySim structs.
@@ -466,6 +425,7 @@ namespace physx
 		PxgTypedCudaBuffer<PxgArticulationBlockTendonJointData>	mArticulationTendonJointBatchBuffer;
 
 		PxArray<PxgArticulationBuffer*>	mArticulationDataBuffer;// persistent data, map with mArticulationBuffer
+		Cm::PinnableArray<PxU32>		mRemovedArticulationSlots; //mapped, slots of the articulations removed since the last step
 		//PxU32			mMaxLinks;
 		//PxU32			mMaxDofs;
 
@@ -536,53 +496,47 @@ namespace physx
 		PxgTypedCudaBuffer<PxBounds3>	mBoundsBuffer;					//Bp in CPU so we can't use the BoundsBuffer in the GPU BP
 		PxgTypedCudaBuffer<PxU32>   mChangedAABBMgrHandlesBuffer;  //Bp in CPU so we can't use the changedAABBMgrHandlesBuffer in the GPU AABBManager
 
-		PxgTypedCudaBuffer<PxgFEMRigidAttachment>		mSoftBodyRigidAttachments;
-		PxgTypedCudaBuffer<PxgRigidFilterPair>			mSoftBodyRigidFilterPairs;
-		PxgTypedCudaBuffer<PxgDbRigidAttachmentBlock>	mSoftBodyRigidAttachmentBlocks;
+		PxgTypedCudaBuffer<PxgDeformableAttachment>		mSoftBodyRigidAttachments;
+		PxgTypedCudaBuffer<PxgRigidDbAttachmentBlock>	mSoftBodyRigidAttachmentBlocks;
 		PxgTypedCudaBuffer<PxU32>						mActiveSoftBodyRigidConstraints;
 		PxgTypedCudaBuffer<PxU32>						mNumSoftBodyRigidAttachments;
+		PxgTypedCudaBuffer<PxU32>						mSoftBodyRigidAttachmentRigidRefCounts;
 		PxgTypedCudaBuffer<PxNodeIndex>					mSoftBodyRigidAttachmentIds;
 
 
-		PxgTypedCudaBuffer<PxgFEMFEMAttachment>			mSoftBodySoftBodyAttachments;
+		PxgTypedCudaBuffer<PxgDeformableAttachment>		mSoftBodySoftBodyAttachments;
 		PxgTypedCudaBuffer<PxgDbDbAttachmentBlock>		mSoftBodySoftBodyAttachmentBlocks;
 		PxgTypedCudaBuffer<PxU32>						mActiveSoftBodySoftBodyConstraints;
 		PxgTypedCudaBuffer<PxU32>						mNumSoftBodySoftBodyAttachments;
 
-		PxgTypedCudaBuffer<PxgFEMFEMAttachment>			mSoftBodyClothAttachments;
-		PxgTypedCudaBuffer<PxgNonRigidFilterPair>		mSoftBodyClothFilterPairs;
+		PxgTypedCudaBuffer<PxgDeformableAttachment>		mSoftBodyClothAttachments;
 		PxgTypedCudaBuffer<PxgDbDbAttachmentBlock>		mSoftBodyClothAttachmentBlocks;
 		PxgTypedCudaBuffer<PxU32>						mActiveSoftBodyClothConstraints;
 		PxgTypedCudaBuffer<PxU32>						mNumSoftBodyClothAttachments;
 
-		PxgTypedCudaBuffer<PxgFEMRigidAttachment>		mClothRigidAttachments;
+		PxgTypedCudaBuffer<PxgDeformableAttachment>		mClothRigidAttachments;
 		PxgTypedCudaBuffer<PxU32>						mActiveClothRigidAttachments;
-		PxgTypedCudaBuffer<PxgRigidFilterPair>			mClothRigidFilterPairs;
-		PxgTypedCudaBuffer<PxgDbRigidAttachmentBlock>	mClothRigidAttachmentBlocks;
+		PxgTypedCudaBuffer<PxgRigidDbAttachmentBlock>	mClothRigidAttachmentBlocks;
 		PxgTypedCudaBuffer<PxU32>						mNumClothRigidAttachments;
+		PxgTypedCudaBuffer<PxU32>						mClothRigidAttachmentRigidRefCounts;
 		PxgTypedCudaBuffer<PxNodeIndex>					mClothRigidAttachmentIds;
 
-		PxgTypedCudaBuffer<PxgFEMFEMAttachment>			mClothClothAttachments;
+		PxgTypedCudaBuffer<PxgDeformableAttachment>		mClothClothAttachments;
 		PxgTypedCudaBuffer<PxU32>						mActiveClothClothAttachments;
-		PxgTypedCudaBuffer<PxgNonRigidFilterPair>		mClothClothVertTriFilterPairs;
 		PxgTypedCudaBuffer<PxgDbDbAttachmentBlock>		mClothClothAttachmentBlocks;
 		PxgTypedCudaBuffer<PxU32>						mNumClothClothAttachments;
 
 		PxU32*			mEventMapped;
 
 		PxU32			mNbRigidSoftBodyAttachments;
-		PxU32			mNbRigidSoftBodyFilters;
 
 		PxU32			mNbSoftBodySoftBodyAttachments;
 
 		PxU32			mNbClothSoftBodyAttachments;
-		PxU32			mNbClothSoftBodyFilters;
 
 		PxU32			mNbRigidClothAttachments;
-		PxU32			mNbRigidClothFilters;
 
 		PxU32			mNbClothClothAttachments;
-		PxU32			mNbClothClothVertTriFilters;
 
 		PxU32			mNbTotalBodySim;
 		PxU32			mNbTotalArticulations; //this is used for articulation
@@ -601,7 +555,7 @@ namespace physx
 
 		PxU32			mMaxNbClothVerts;
 		PxU32			mMaxNbClothTriangles;
-		PxU32			mMaxNbClothTrianglesWithActiveEdges;
+		PxU32			mMaxNbClothTrianglesWithOwnedEdges;
 		PxU32			mMaxNbNonSharedTriangles;
 
 		PxU32			mMaxNbNonSharedTriPartitions;
@@ -632,22 +586,29 @@ namespace physx
 		CUstream		mStream;
 		CUevent			mEvent;
 		CUevent			mDmaEvent; 
+		CUevent			mRemovedArticulationSlotsEvent; //recorded after the last kernel that reads mRemovedArticulationSlots
 	
 		PxVec3			mGravity;
 
 		PxArray<PxgSoftBody>	mSoftBodiesToFree;
 		PxArray<PxgFEMCloth>	mClothsToFree;
+
+		PxgCopyManager							mKinematicTargetCopyManager;
+		Cm::PinnableArray<PxAlignedTransform>	mKinematicTargets;		// host-mapped, the sources of the copies
+		PxArray<PxU32>							mKinematicTargetNodes;	// the node index of each staged target
 #if PX_SUPPORT_OMNI_PVD
 		PxU64 getRigidBodyDataTypeElementSize(PxRigidDynamicGPUAPIWriteType::Enum dataType);
 		void ovdRigidBodyCallback(const void* PX_RESTRICT data, const PxRigidDynamicGPUIndex* PX_RESTRICT gpuIndices, PxRigidDynamicGPUAPIWriteType::Enum dataType, PxU32 nbElements);		
 		
 		Cm::PinnableArray<PxU8>	mOvdDataBuffer;
 		Cm::PinnableArray<PxU8>	mOvdIndexBuffer;
+		PxArray<PxU32> mOvdBatchPositions;
+		PxgTypedCudaBuffer<PxU8> mOvdReadbackDataBuffer;
 
 		// Scratch for the full-state snapshot force/torque readback (ovdSnapshotRigidDynamicForces).
 		PxgTypedCudaBuffer<PxRigidDynamicGPUIndex>	mOvdSnapshotIndexBuffer;	// device: gathered node indices, uploaded once per readback
 		PxgTypedCudaBuffer<PxVec3>					mOvdSnapshotDataBuffer;		// device: kernel output, one PxVec3 per index
-		PxArray<PxRigidDynamicGPUIndex>	mOvdSnapshotValidIndices;	// host: incoming indices, dropped if past the resident pool
+		Cm::PinnableArray<PxRigidDynamicGPUIndex> mOvdSnapshotValidIndices; // host: indices uploaded on the gather stream
 		Cm::PinnableArray<PxVec3>	mOvdSnapshotForce;			// host (pinned): force read back
 		Cm::PinnableArray<PxVec3>	mOvdSnapshotTorque;			// host (pinned): torque read back
 		PxArray<PxVec3>			mOvdSnapshotCompactData;	// host: non-zero values, compacted for emit

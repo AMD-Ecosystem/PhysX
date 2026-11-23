@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PxImmediateMode.h"
 #include "PxBroadPhase.h"
@@ -298,7 +275,7 @@ PxU32 immediate::PxBatchConstraintsTGS(const PxSolverConstraintDesc* solverConst
 
 bool immediate::PxCreateContactConstraints(PxConstraintBatchHeader* batchHeaders, PxU32 nbHeaders, PxSolverContactDesc* contactDescs,
 	PxConstraintAllocator& allocator, PxReal invDt, PxReal bounceThreshold, PxReal frictionOffsetThreshold, 
-	PxReal correlationDistance, PxSpatialVector* ZV)
+	PxReal correlationDistance, PxSpatialVector* /*ZV*/)
 {
 	PX_ASSERT(invDt > 0.0f && PxIsFinite(invDt));
 	PX_ASSERT(bounceThreshold < 0.0f);
@@ -343,11 +320,10 @@ bool immediate::PxCreateContactConstraints(PxConstraintBatchHeader* batchHeaders
 
 		if (state == Dy::SolverConstraintPrepState::eUNBATCHABLE)
 		{
-			Cm::SpatialVectorF* Z = reinterpret_cast<Cm::SpatialVectorF*>(ZV);
 			for(PxU32 a=0; a<batchHeader.stride; ++a)
 			{
 				Dy::createFinalizeSolverContacts(contactDescs[currentContactDescIdx + a], cb, invDt, dt, bounceThreshold, 
-					frictionOffsetThreshold, correlationDistance, biasCoefficients.rigidContact, allocator, Z);
+					frictionOffsetThreshold, correlationDistance, biasCoefficients.rigidContact, allocator);
 			}
 		}
 
@@ -653,7 +629,8 @@ void immediate::PxSolveConstraints(const PxConstraintBatchHeader* batchHeaders, 
 	cache.solverBodyArray = NULL;
 	cache.mThresholdStreamIndex = 0;
 	cache.mThresholdStreamLength = 0xFFFFFFF;
-		
+	cache.writeBackIteration = false;
+
 	PX_ASSERT(nbPositionIterations > 0);
 	PX_ASSERT(nbVelocityIterations > 0);
 
@@ -709,6 +686,8 @@ void immediate::PxSolveConstraints(const PxConstraintBatchHeader* batchHeaders, 
 
 	for(PxU32 i=nbVelocityIterations; i>1; --i)
 		PGS::runIter(batchHeaders, nbBatchHeaders, solverConstraintDescs, nbSolverArticulations, articulations, solveTable, cache, dt, invDt, true, true, biasCoefficients.articulation);
+
+	cache.writeBackIteration = true;
 	PGS::runIter(batchHeaders, nbBatchHeaders, solverConstraintDescs, nbSolverArticulations, articulations, solveWritebackTable, cache, dt, invDt, true, true, biasCoefficients.articulation);
 }
 
@@ -889,7 +868,8 @@ void immArticulation::initJointCore(Dy::ArticulationJointCore& core, const PxArt
 	{
 		core.setLimit(PxArticulationAxis::Enum(i), inboundJoint.limits[i]);
 		core.setDrive(PxArticulationAxis::Enum(i), inboundJoint.drives[i]);
-		core.setMaxJointVelocity(inboundJoint.maxJointVelocity[i]);
+		core.setMaxJointVelocity(PxArticulationAxis::Enum(i), inboundJoint.maxJointVelocity[i]);
+		core.setFrictionParams(PxArticulationAxis::Enum(i), inboundJoint.frictionParams[i]);
 
 		// See Sc::ArticulationJointCore::setTargetP and Sc::ArticulationJointCore::setTargetV
 		if(binP[i]!=0xffffffff)
@@ -906,7 +886,6 @@ void immArticulation::initJointCore(Dy::ArticulationJointCore& core, const PxArt
 		core.motion[i] = PxU8(inboundJoint.motion[i]);
 	}
 
-	core.setFrictionCoefficient(inboundJoint.frictionCoefficient);
 	core.setJointType(inboundJoint.type);
 }
 
@@ -988,7 +967,7 @@ void immArticulation::complete()
 	mImmDirty = false;
 
 	const PxU32 linkSize = mLinks.size();
-	setupLinks(linkSize, const_cast<ArticulationLink*>(mLinks.begin()));
+	setupLinks(linkSize, const_cast<ArticulationLink*>(mLinks.begin()), false);
 	jcalc<true>(mArticulationData);
 	mJCalcDirty = false;
 	initPathToRoot();
@@ -1270,7 +1249,6 @@ bool immediate::PxGetJointData(const PxArticulationLinkHandle& link, PxArticulat
 
 	data.parentPose				= core.parentPose;
 	data.childPose				= core.childPose;
-	data.frictionCoefficient	= core.frictionCoefficient;
 	data.type					= PxArticulationJointType::Enum(core.jointType);
 	for(PxU32 i=0;i<PxArticulationAxis::eCOUNT;i++)
 	{
@@ -1283,6 +1261,7 @@ bool immediate::PxGetJointData(const PxArticulationLinkHandle& link, PxArticulat
 		data.jointPos[i]	= core.jointPos[i];
 		data.jointVel[i]	= core.jointVel[i];
 		data.maxJointVelocity[i] = core.maxJointVelocity[i];
+		data.frictionParams[i] = core.frictionParams[i];
 	}
 	return true;
 }
@@ -1325,15 +1304,13 @@ bool immediate::PxSetJointData(const PxArticulationLinkHandle& link, const PxArt
 		immArt->mJCalcDirty = true;
 	}
 
-	// PT: TODO: do we need to recompute jcalc for these?
-	core.frictionCoefficient	= data.frictionCoefficient;
-
 	for(PxU32 i=0;i<PxArticulationAxis::eCOUNT;i++)
 	{
 		// PT: we don't need to recompute jcalc for these
 		core.limits[i]	= data.limits[i];
 		core.drives[i]	= data.drives[i];
 		core.maxJointVelocity[i] = data.maxJointVelocity[i];
+		core.frictionParams[i] = data.frictionParams[i];
 
 		core.jointPos[i] = data.jointPos[i];
 		core.jointVel[i] = data.jointVel[i];
@@ -1648,15 +1625,7 @@ void immediate::PxSolveConstraintsTGS(const PxConstraintBatchHeader* batchHeader
 	const Dy::TGSSolveConcludeMethod* solveConcludeTable = Dy::g_SolveConcludeTGSMethods;
 	const Dy::TGSWriteBackMethod* writebackTable = Dy::g_WritebackTGSMethods;
 
-	Dy::SolverContext cache;
-	cache.solverBodyArray = NULL;
-	cache.mThresholdStreamIndex = 0;
-	cache.mThresholdStreamLength = 0xFFFFFFF;
-
 	Cm::SpatialVectorF* deltaV = reinterpret_cast<Cm::SpatialVectorF*>(pxDeltaV);
-
-	cache.deltaV = deltaV;
-	cache.doFriction = true;
 
 	Dy::FeatherstoneArticulation** articulations = reinterpret_cast<Dy::FeatherstoneArticulation**>(solverArticulations);
 
@@ -1692,9 +1661,9 @@ void immediate::PxSolveConstraintsTGS(const PxConstraintBatchHeader* batchHeader
 		{
 			const PxConstraintBatchHeader& batch = batchHeaders[a];
 			if(nbPositionIterations)
-				solveTable[batch.constraintType](batch, solverConstraintDescs, txInertias, -PX_MAX_F32, elapsedTime, cache);
+				solveTable[batch.constraintType](batch, solverConstraintDescs, txInertias, -PX_MAX_F32, elapsedTime);
 			else
-				solveConcludeTable[batch.constraintType](batch, solverConstraintDescs, txInertias, elapsedTime, cache);
+				solveConcludeTable[batch.constraintType](batch, solverConstraintDescs, txInertias, elapsedTime);
 		}
 
 		{
@@ -1724,9 +1693,9 @@ void immediate::PxSolveConstraintsTGS(const PxConstraintBatchHeader* batchHeader
 		for(PxU32 a=0; a<nbBatchHeaders; ++a)
 		{
 			const PxConstraintBatchHeader& batch = batchHeaders[a];
-			solveTable[batch.constraintType](batch, solverConstraintDescs, txInertias, 0.0f, elapsedTime, cache);
+			solveTable[batch.constraintType](batch, solverConstraintDescs, txInertias, 0.0f, elapsedTime);
 			if(!nbVelocityIterations)
-				writebackTable[batch.constraintType](batch, solverConstraintDescs, &cache);
+				writebackTable[batch.constraintType](batch, solverConstraintDescs, txInertias);
 		}
 	}
 }
@@ -1787,7 +1756,7 @@ namespace
 		virtual	PxU64						getContextID()														const	PX_OVERRIDE	PX_FINAL;
 		virtual	void						setScratchBlock(void* scratchBlock, PxU32 size)								PX_OVERRIDE	PX_FINAL;
 		virtual	void						update(const PxBroadPhaseUpdateData& updateData, PxBaseTask* continuation)	PX_OVERRIDE	PX_FINAL;
-		virtual	void						fetchResults(PxBroadPhaseResults& results)									PX_OVERRIDE	PX_FINAL;
+		virtual	void						fetchResults(PxBroadPhaseResults& results)									PX_OVERRIDE;
 		//~PxBroadPhase
 
 		// PxBroadPhaseRegions
@@ -1922,7 +1891,7 @@ void ImmCPUBP::update(const PxBroadPhaseUpdateData& updateData, PxBaseTask* cont
 	mBroadPhase->preBroadPhase(defaultUpdateData);	// ### could be skipped for CPU BPs
 
 	// PT: BP UPDATE CALL
-	mBroadPhase->update(&mScratchAllocator, defaultUpdateData, continuation);
+	mBroadPhase->update(0, NULL, &mScratchAllocator, defaultUpdateData, continuation);
 
 	mBroadPhase->fetchBroadPhaseResults();	// ### could be skipped for CPU BPs
 }
@@ -1933,6 +1902,7 @@ void ImmCPUBP::fetchResults(PxBroadPhaseResults& results)
 	PX_ASSERT(mBroadPhase);
 
 	// PT: TODO: flags to skip the copies (PX-2929)
+	// ImmGPUBP::fetchResults() removes the duplicate pairs from the copies, so the GPU broadphase needs them.
 	if(0)
 	{
 		results.mCreatedPairs = reinterpret_cast<const PxBroadPhasePair*>(mBroadPhase->getCreatedPairs(results.mNbCreatedPairs));
@@ -2024,6 +1994,7 @@ const PxU32* ImmCPUBP::getOutOfBoundsObjects()	const
 
 #if PX_SUPPORT_GPU_PHYSX
 #include "PxPhysXGpu.h"
+#include "CmRadixSort.h"
 
 namespace
 {
@@ -2039,7 +2010,8 @@ namespace
 		//~PxAllocatorCallback
 
 		// PxBroadPhase
-		virtual	PxAllocatorCallback*			getAllocator()	PX_OVERRIDE	PX_FINAL;
+		virtual	PxAllocatorCallback*			getAllocator()								PX_OVERRIDE	PX_FINAL;
+		virtual	void							fetchResults(PxBroadPhaseResults& results)	PX_OVERRIDE	PX_FINAL;
 		//~PxBroadPhase
 
 		// ImmCPUBP
@@ -2050,6 +2022,9 @@ namespace
 				PxsMemoryManager*				mMemoryManager;
 				PxsKernelWranglerManager*		mGpuWranglerManagers;
 				PxsHeapMemoryAllocatorManager*	mHeapMemoryAllocationManager;
+				PxCudaContextManager*			mContextManager;
+
+				void							purgeDuplicatePairs(PxArray<PxBroadPhasePair>& pairs);
 	};
 }
 
@@ -2060,7 +2035,8 @@ ImmGPUBP::ImmGPUBP(const PxBroadPhaseDesc& desc) :
 	mPxGpu						(NULL),
 	mMemoryManager				(NULL),
 	mGpuWranglerManagers		(NULL),
-	mHeapMemoryAllocationManager(NULL)
+	mHeapMemoryAllocationManager(NULL),
+	mContextManager				(NULL)
 {
 }
 
@@ -2069,6 +2045,11 @@ ImmGPUBP::~ImmGPUBP()
 	releaseBP();	// PT: must release the BP first, before the base dtor is called
 	PX_DELETE(mHeapMemoryAllocationManager);
 	PX_DELETE(mMemoryManager);
+
+	// OMPE-93952: release the reference taken in init(). Null if init() bailed out first.
+	if(mContextManager)
+		mContextManager->release();
+
 	//PX_RELEASE(mPxGpu);
 	PxvReleasePhysXGpu(mPxGpu);
 	mPxGpu = NULL;
@@ -2093,6 +2074,76 @@ PxAllocatorCallback* ImmGPUBP::getAllocator()
 	return this;
 }
 
+// Sorts the pairs and removes duplicates. The GPU broadphase stores each pair with the smaller index first,
+// so the duplicates of a pair are identical.
+void ImmGPUBP::purgeDuplicatePairs(PxArray<PxBroadPhasePair>& pairs)
+{
+	const PxU32 nbPairs = pairs.size();
+	if(nbPairs<2)
+		return;
+
+	// The scratch allocator takes 32-bit sizes, so larger buffers come from the heap. Its free() releases heap memory as well.
+	const size_t bufferSize = sizeof(PxU32)*nbPairs*4;
+	void* buffer = bufferSize<=PX_MAX_U32 ? mScratchAllocator.alloc(PxU32(bufferSize), true) : PX_ALLOC(bufferSize, "ImmGPUBP::purgeDuplicatePairs");
+	// The allocator reports a failure. The duplicates are then kept.
+	if(!buffer)
+		return;
+
+	PxU32* keys0 = reinterpret_cast<PxU32*>(buffer);
+	PxU32* keys1 = keys0 + nbPairs;
+	PxU32* ranks0 = keys1 + nbPairs;
+	PxU32* ranks1 = ranks0 + nbPairs;
+	for(PxU32 i=0;i<nbPairs;i++)
+	{
+		PX_ASSERT(pairs[i].mID0<pairs[i].mID1);
+		keys0[i] = pairs[i].mID0;
+		keys1[i] = pairs[i].mID1;
+	}
+
+	// The second sort is stable and starts from the order of the first one, so the pairs are sorted by mID0, then by mID1.
+	Cm::RadixSort rs;
+	PxU32 histogram[1024];
+	PxU32* links[256];
+	rs.SetBuffers(ranks0, ranks1, histogram, links);
+	const PxU32* sorted = rs.Sort(keys1, nbPairs, Cm::RADIX_UNSIGNED).Sort(keys0, nbPairs, Cm::RADIX_UNSIGNED).GetRanks();
+
+	// The keys are a copy of the pairs, so the unique pairs are written back in place.
+	PxU32 nbUniquePairs = 0;
+	for(PxU32 i=0;i<nbPairs;i++)
+	{
+		const PxU32 id0 = keys0[sorted[i]];
+		const PxU32 id1 = keys1[sorted[i]];
+		if(!nbUniquePairs || id0!=pairs[nbUniquePairs-1].mID0 || id1!=pairs[nbUniquePairs-1].mID1)
+		{
+			pairs[nbUniquePairs].mID0 = id0;
+			pairs[nbUniquePairs].mID1 = id1;
+			nbUniquePairs++;
+		}
+	}
+	pairs.forceSize_Unsafe(nbUniquePairs);
+
+	mScratchAllocator.free(keys0);
+}
+
+void ImmGPUBP::fetchResults(PxBroadPhaseResults& results)
+{
+	ImmCPUBP::fetchResults(results);
+
+	// The results point to the copies of the pairs, from which the duplicates are removed below.
+	PX_ASSERT(results.mCreatedPairs==mCreatedPairs.begin() && results.mDeletedPairs==mDeletedPairs.begin());
+
+	// The GPU broadphase can report a pair twice in an update, for example when both objects moved a long
+	// distance. The scene's AABB manager removes these duplicates as well.
+	{
+		PX_PROFILE_ZONE("ImmGPUBP::purgeDuplicatePairs", mContextID);
+		purgeDuplicatePairs(mCreatedPairs);
+		purgeDuplicatePairs(mDeletedPairs);
+	}
+
+	results.mNbCreatedPairs = mCreatedPairs.size();
+	results.mNbDeletedPairs = mDeletedPairs.size();
+}
+
 bool ImmGPUBP::init(const PxBroadPhaseDesc& desc)
 {
 	PX_ASSERT(desc.mType==PxBroadPhaseType::eGPU);
@@ -2111,6 +2162,10 @@ bool ImmGPUBP::init(const PxBroadPhaseDesc& desc)
 		return false;
 
 	const PxU32 gpuComputeVersion = 0;
+
+	// OMPE-93952: keep the context manager alive for the GPU objects below. Released in ~ImmGPUBP().
+	mContextManager = contextManager;
+	mContextManager->acquireReference();
 
 	// PT: what's the difference between the "GPU memory manager" and the "GPU heap memory allocator manager" ?
 	mMemoryManager = mPxGpu->createGpuMemoryManager(contextManager);

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 cmake_minimum_required(VERSION 3.16)
 project(OmniPvdRecordingCpp CXX)
 
@@ -16,4 +19,7 @@ target_compile_definitions(omnipvd_recording_cpp PRIVATE
 )
 if(WIN32)
     ovphysx_copy_runtime_dlls(omnipvd_recording_cpp)
+    # OVStage is not copied (it loads its plugins relative to itself), so its
+    # directories have to reach the process through PATH.
+    ovphysx_set_ovstage_runtime_env(omnipvd_recording_cpp)
 endif()

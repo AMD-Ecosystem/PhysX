@@ -25,8 +25,10 @@ if [[ -f "${OMNI_REPO_ROOT}/repo-cache.json" ]]; then
     # PM_PACKAGES_ROOT is present in the config file. We set this early
     # so Packman will reference our cached package repository.
     if [[ -n "${PM_PACKAGES_ROOT}" ]]; then
-        # Use eval to resolve ~ and perform parameter expansion
-        RESOLVED_PACKAGES_ROOT=$(eval echo "$PM_PACKAGES_ROOT")
+        # Expand a leading ~ to $HOME. We deliberately avoid `eval` here:
+        # PM_PACKAGES_ROOT comes from repo-cache.json, and running it through
+        # the shell would let a crafted cache file execute arbitrary commands.
+        RESOLVED_PACKAGES_ROOT="${PM_PACKAGES_ROOT/#\~/$HOME}"
 
         if [[ "${RESOLVED_PACKAGES_ROOT}" != /* ]]; then
             # PM_PACKAGES_ROOT is not an abs path, assumption is then

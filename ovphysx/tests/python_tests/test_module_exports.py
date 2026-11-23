@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
+
+# PARTIALLY DEPRECATED (tensor-binding-deprecation): the TensorType, BindingPrimMode, and TensorBindingSpec export/value checks retire with the binding. The ApiStatus / LogLevel / SceneQuery / PhysX / DLPack / version checks stay.
 
 from ovphysx.types import (
     ApiStatus,
@@ -18,20 +20,23 @@ def test_module_all_exports():
 
     expected_exports = [
         "PhysX",
+        "Task",
+        "TaskError",
+        "TaskTimeoutError",
         "TensorType",
+        "ArticulationKinematicFlag",
         "ApiStatus",
+        "OmniPvdDestination",
         "LogLevel",
+        "CompiledStageCacheMode",
         "BindingPrimMode",
         "SceneQueryMode",
         "SceneQueryGeometryType",
-        "ContactEventHeader",
-        "ContactPoint",
         "TensorBindingSpec",
         "DLDevice",
         "DLDataType",
         "DLTensor",
-        "codeless_schema_paths",
-        "codeless_schema_root",
+        "newton_schema_root",
     ]
 
     for export in expected_exports:
@@ -42,16 +47,31 @@ def test_intenum_types_importable_without_native():
     """TensorType and friends must be importable without triggering native loading."""
     from ovphysx.types import (
         ApiStatus,
+        ArticulationKinematicFlag,
         BindingPrimMode,
+        CompiledStageCacheMode,
+        GlobalConfigKey,
         LogLevel,
         SceneQueryGeometryType,
         SceneQueryMode,
         TensorType,
     )
 
+    assert GlobalConfigKey.COMPILED_STAGE_CACHE == 0x0000000E
+    assert CompiledStageCacheMode.AUTOMATIC == 0
+    assert CompiledStageCacheMode.DISABLED == 1
+    assert CompiledStageCacheMode.READ_ONLY == 2
+    assert CompiledStageCacheMode.READ_WRITE == 3
     assert TensorType.ARTICULATION_ROOT_POSE == 10
+    assert ArticulationKinematicFlag.POSITION == 1
+    assert ArticulationKinematicFlag.VELOCITY == 2
     assert ApiStatus.SUCCESS == 0
-    assert LogLevel.WARNING == 2
+    assert LogLevel.DEFAULT == 0
+    assert LogLevel.VERBOSE == 1
+    assert LogLevel.INFO == 2
+    assert LogLevel.WARNING == 3
+    assert LogLevel.ERROR == 4
+    assert LogLevel.NONE == 5
     assert BindingPrimMode.EXISTING_ONLY == 0
     assert SceneQueryMode.CLOSEST == 0
     assert SceneQueryGeometryType.SPHERE == 0
@@ -97,12 +117,13 @@ def test_tensor_type_iteration():
     assert len(members) > 40
 
 
-def test_operation_index_constants():
-    """Test OP_INDEX_ALL is accessible via lazy loading."""
-    import ovphysx
+def test_task_types_are_exported():
+    """Task receipt and exception types are available from the package."""
+    from ovphysx import Task, TaskError, TaskTimeoutError
 
-    assert hasattr(ovphysx, "OP_INDEX_ALL")
-    assert isinstance(ovphysx.OP_INDEX_ALL, int)
+    assert isinstance(Task, type)
+    assert issubclass(TaskError, RuntimeError)
+    assert issubclass(TaskTimeoutError, TimeoutError)
 
 
 def test_module_has_version_attribute():
@@ -137,11 +158,9 @@ def test_dlpack_structures_importable():
         DLDevice,
         DLManagedTensor,
         DLTensor,
-        ManagedDLTensor,
     )
 
     assert DLDevice is not None
     assert DLDataType is not None
     assert DLTensor is not None
     assert DLManagedTensor is not None
-    assert ManagedDLTensor is not None

@@ -1,40 +1,14 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
-// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
-
-// SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
-//
 
 #include "PvdDom.h"
 #include "PvdDomParserConfig.h"
 
 #include "PvdDomUtils.h"
+#include <memory>
 
 OmniPvdAttributeDef::OmniPvdAttributeDef()
 {
@@ -175,9 +149,10 @@ void OmniPvdUniqueList::addElement(const uint8_t *data, uint32_t dataLen)
     if (it == mElements.end())
     {
         // Add this element
-        OmniPvdUniqueListElement *elem = new OmniPvdUniqueListElement();
+        std::unique_ptr<OmniPvdUniqueListElement> elem(new OmniPvdUniqueListElement());
         elem->set(data, dataLen);
-        mElements.emplace_back(elem);
+        mElements.emplace_back(elem.get());
+        elem.release();
     }
 }
 // Remove any element that has the same data
@@ -204,6 +179,7 @@ OmniPvdClass::OmniPvdClass()
     mIsBitFieldEnum = true;
     mNextObjectId = 1;
     mIsDefaultParsed = true;
+    mIsSceneClass = false;
     mPhysXLeafClassId = OmniPvdPhysXClassEnum::ePxUndefined;
 }
 
@@ -229,18 +205,37 @@ OmniPvdObject::OmniPvdObject()
     mOmniPvdClass = 0;
 
     mWasSDFCreated = false;
+    mIsSupersedeRecreate = false;
+    mRecordingSegmentId = 0;
 
     mAncestor =  nullptr;
     mFirstChild = nullptr;
     mLastChild = nullptr;
     mPrevSibling = nullptr;
     mNextSibling = nullptr;
+    mSkipMembershipTraversal = false;
+    mFirstMembershipChild = nullptr;
+    mLastMembershipChild = nullptr;
+    mPrevMembershipSibling = nullptr;
+    mNextMembershipSibling = nullptr;
 
     mIsReferenced = false;
 
     mUID = 0;
 
     mFrameId = 0;
+    mActortype = 0;
+    mActortypeSet = false;
+    mReopenable = false;
+    mWasDestroyed = false;
+}
+
+OmniPvdObject::~OmniPvdObject()
+{
+    // Class-instance vectors are copied during construction. The object owns their lists.
+    for (const OmniPvdClassInstance& instance : mInheritedClassInstances)
+        for (OmniPvdAttributeInstList* list : instance.mClassAttributeLists)
+            delete list;
 }
 
 void OmniPvdObject::appendChild(OmniPvdObject* child)
@@ -264,6 +259,14 @@ void OmniPvdObject::appendChild(OmniPvdObject* child)
     mLastChild = child;
     child->mAncestor = this;
     child->mNextSibling = nullptr;
+    if (!child->mSkipMembershipTraversal)
+    {
+        child->mPrevMembershipSibling = mLastMembershipChild;
+        child->mNextMembershipSibling = nullptr;
+        if (mLastMembershipChild) mLastMembershipChild->mNextMembershipSibling = child;
+        else mFirstMembershipChild = child;
+        mLastMembershipChild = child;
+    }
 }
 
 void OmniPvdObject::insertChildFirst(OmniPvdObject* child)
@@ -289,6 +292,14 @@ void OmniPvdObject::insertChildFirst(OmniPvdObject* child)
     mFirstChild = child;
     child->mAncestor = this;
     child->mPrevSibling = nullptr;
+    if (!child->mSkipMembershipTraversal)
+    {
+        child->mPrevMembershipSibling = nullptr;
+        child->mNextMembershipSibling = mFirstMembershipChild;
+        if (mFirstMembershipChild) mFirstMembershipChild->mPrevMembershipSibling = child;
+        else mLastMembershipChild = child;
+        mFirstMembershipChild = child;
+    }
 }
 
 void OmniPvdObject::removeChild(OmniPvdObject* child)
@@ -319,8 +330,20 @@ void OmniPvdObject::removeChild(OmniPvdObject* child)
         mLastChild = nullptr;
     }
 
+    if (!child->mSkipMembershipTraversal)
+    {
+        if (child->mPrevMembershipSibling)
+            child->mPrevMembershipSibling->mNextMembershipSibling = child->mNextMembershipSibling;
+        else mFirstMembershipChild = child->mNextMembershipSibling;
+        if (child->mNextMembershipSibling)
+            child->mNextMembershipSibling->mPrevMembershipSibling = child->mPrevMembershipSibling;
+        else mLastMembershipChild = child->mPrevMembershipSibling;
+    }
+
     child->mPrevSibling = nullptr;
     child->mNextSibling = nullptr;
+    child->mPrevMembershipSibling = nullptr;
+    child->mNextMembershipSibling = nullptr;
     child->mAncestor = nullptr;
 }
 
@@ -333,24 +356,14 @@ OmniPvdObject* OmniPvdObject::getChild(const std::string& name) {
     return child;
 }
 
-OmniPvdObject* OmniPvdObject::findAncestorWithClass(OmniPvdClass *omniPvdClass)
-{
-    if (!mAncestor) return nullptr;
-    OmniPvdObject* ancestor = mAncestor;
-    while (ancestor)
-    {
-        if (ancestor->mOmniPvdClass == omniPvdClass)
-        {
-            return ancestor;
-        }
-        ancestor = ancestor->mAncestor;
-    }
-    return nullptr;
-}
-
 OmniPvdDOMState::OmniPvdDOMState()
 {
+#if defined(PVDDOM_INSPECTION_ENABLED)
+    try { initPvdDomState(*this); }
+    catch (...) { releaseOwnedStorage(); throw; }
+#else
     initPvdDomState(*this);
+#endif
 }
 
 template<typename Map>
@@ -375,6 +388,11 @@ void deletePointerContainer(Map& map)
 }
 
 OmniPvdDOMState::~OmniPvdDOMState()
+{
+    releaseOwnedStorage();
+}
+
+void OmniPvdDOMState::releaseOwnedStorage()
 {
     // TODO : do automatically
     // Cleanup on isle 12!

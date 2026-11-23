@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef OVPHYSX_CARBONITE_LOADER_HPP
 #define OVPHYSX_CARBONITE_LOADER_HPP
@@ -15,20 +15,46 @@ namespace omni { namespace physx { class IPhysxSimulation; } }
 namespace ovphysx
 {
 
+// What the loader actually bound for this epoch. Getters report this instead of
+// re-reading OVPHYSX_PROFILER after the first successful bind.
+struct BoundProfilerState
+{
+    bool active = false;
+    bool bindFailed = false;
+    bool hostOwned = false;
+    int32_t backend = 0;
+    bool outputPathCaptured = false;
+    std::string outputPath;
+};
+
+BoundProfilerState boundProfilerState();
+// True when the local UJITSO datastore is enabled with a non-empty directory that is
+// not the process-private fallback, i.e. an application-configured cooked-collider
+// cache directory that persists across runs; the datastore was built from the directory
+// the setting names now; and, on POSIX, that directory is private: the directory it was
+// then, not a symlink, owned by this user, closed to its group and others, and inside
+// directories that no other user can replace it in. Logs why at INFO when a configured
+// directory fails either check. Safe to call without loader locks.
+bool usesConfiguredCookedColliderCache();
+// True when an explicitly enabled compiled stage cache has no datastore it may use:
+// collision cooking is off, no cache directory is configured and a host owns the
+// framework. Safe to call without loader locks.
+bool compiledStageCacheUnavailable();
+// Called after the last instance and the direct runtime have drained.
+void shutdownCarbonite();
+
 /**
  * @brief Bootstraps Carbonite dependencies and starts the linked PhysX runtime.
  * 
- * Simplified loader for flat _install/plugins/ structure.
+ * Loader for the flat _install/plugins/ layout.
  * 
  * Expected layout:
  *   _install/
  *   |-- lib/libovphysx.so
- *   `-- plugins/           <- remaining Carbonite and USD dependency libraries
- *       |-- usd/           <- USD plugInfo.json registry
+ *   |-- schemas/physx/     <- codeless PhysX USD schemas (data only, never loaded here)
+ *   `-- plugins/           <- Carbonite and PhysX dependency libraries
  *       `-- bin/deps/      <- Vulkan/CUDA libraries
  * 
- * Environment variables:
- * - OVPHYSX_DISABLE_GPU: If set, skip loading GPU plugins (CPU-only mode)
  */
 class CarboniteLoader
 {
@@ -36,7 +62,6 @@ public:
     CarboniteLoader();
     ~CarboniteLoader();
     
-    // Non-copyable
     CarboniteLoader(const CarboniteLoader&) = delete;
     CarboniteLoader& operator=(const CarboniteLoader&) = delete;
 
@@ -47,26 +72,10 @@ public:
      * Carbonite remains responsible for dependency-plugin registration and
      * interface-version compatibility while ovphysx prepares the SDK plugin search paths.
      *
-     * This loads only the base Carbonite plugins. The USD dependencies and linked
-     * PhysX runtime are prepared by the remaining loader phases.
+     * This loads only the base Carbonite plugins. The linked PhysX runtime is
+     * prepared by loadPhysxPlugins().
      */
     bool initialize();
-
-    /**
-     * Make the namespaced USD runtime available to later plugin loads.
-     *
-     * If another OV library already loaded the same namespaced USD monolith, reuse
-     * that loaded image. Otherwise, load ovphysx's packaged namespaced USD library.
-     */
-    bool preloadUsdLibraries();
-
-    /**
-     * Load Carbonite plugins that need USD.
-     *
-     * This must run after preloadUsdLibraries() so these plugins bind to the same
-     * namespaced USD runtime that ovrtx or another OV library may already use.
-     */
-    bool loadUsdDependentPlugins();
 
     /**
      * Load ovphysx's bundled PhysX dependency plugins and start the static runtime.
@@ -83,21 +92,6 @@ public:
      * callers get the specific reason instead of a generic bootstrap failure.
      */
     const std::string& getLastError() const;
-
-    /**
-     * Configure the internal Carbonite GPU-plugin bootstrap sentinel.
-     *
-     * Current ovphysx callers pass -2 before initialize() to skip Carbonite GPU
-     * plugins that PhysX does not use. This does not select the PhysX CUDA
-     * ordinal; active_cuda_gpus is applied immediately before scene attachment.
-     * Values other than -2 are currently unused by ovphysx; that branch is
-     * retained to preserve existing internal CarboniteLoader behavior.
-     *
-     * Note: /physics/suppressReadback (DirectGPU-API mode) is NOT managed
-     * here — it is opt-in by the host. Callers who want DirectGPU set the
-     * Carbonite setting themselves before any ovphysx call.
-     */
-    static void setStartupCudaDevice(int32_t cudaDevice);
 
     /**
      * Shutdown (called automatically by destructor).

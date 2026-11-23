@@ -1,10 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+// @implements REQ-ATTACH-LIFETIME-001
+// @covers AC-3 AC-4
+
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1
+
+/**
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-15 AC-42 AC-44
+ */
 
 #pragma once
 
 #include <carb/Defines.h>
 #include <carb/Types.h>
+
+#include <omni/physics/AttachHandle.h>
+#include <omni/physx/RuntimeResult.h>
+#include <omni/physics/parse/Handles.h> // ObjectKey
 
 #include "PhysxConvexMesh.h"
 #include "PhysxCookingParams.h"
@@ -19,11 +34,13 @@ namespace physx
 {
 
 /// Cooking finished callback
-/// \param[in] stageId Stage id of the processed stage
-/// \param[in] primPath USD prim path
+/// \param[in] attachHandle Attach the cooking request was issued for (matches @ref
+/// IPhysxSimulation::attachOvstage()); kNoAttach when the request was not tied to an attach
+/// \param[in] primKey Handle of the cooked mesh object (@ref
+/// omni::physics::parse::ObjectKey::handle), not a USD path encoding (ADR-0019)
 /// \param[in] userData User data passed to IPhysxCookingCallback struct
-typedef void (*PhysxCookingFinishedCallback)(uint64_t stageId,
-                                             uint64_t primPath,
+typedef void (*PhysxCookingFinishedCallback)(AttachHandle attachHandle,
+                                             uint64_t primKey,
                                              PhysxCookingResult::Enum result,
                                              void* userData);
 
@@ -96,15 +113,19 @@ struct PhysxCollisionRepresentationRequest
     Options options; //!< Options for the request (async / no-async)
 
 
-    uint64_t stageId = 0; //!< Stage containing the prim for which to request the collision representation
-    uint64_t collisionPrimId = 0; //!< Prim path containing the Collision API
+    AttachHandle attachHandle = kNoAttach; //!< Exact live attachment; zero and stale handles fail admission.
+    uint64_t collisionPrimId = 0; //!< Collision primitive's source-local ObjectKey::handle in that attachment.
+
 };
 
 /// Task object returned by IPhysxCooking::requestConvexCollisionRepresentation that can potentially be used to
 /// cancel the task by calling IPhysxCooking::cancelCollisionRepresentationTask
 struct PhysxCollisionRepresentationTask
 {
-    void* handle = nullptr;
+    void* handle = nullptr; // Opaque runtime token, never a native task pointer; never reused.
+    // Non-success means admission failed: no task was queued and onResult was not called.
+    // Success means the request was accepted; its completion/error is delivered through onResult.
+    RuntimeResult admission = RuntimeResult::eSuccess;
 };
 
 /// omni.physx cooking interface
@@ -112,11 +133,11 @@ struct IPhysxCooking
 {
     // Creates a convex mesh approximation of a given mesh. The mesh is not scaled by the USD mesh scale.
     //
-    //\param[in] path Mesh path
+    //\param[in] key Mesh's ObjectKey
     //\param[in] vertexLimit Convex mesh vertex limit in a range <4, 255>
     //\param[out] meshData Convex mesh data output
     //\return True if cooking succeeded
-    bool(CARB_ABI* createConvexMesh)(const PXR_NS::SdfPath& path, uint32_t vertexLimit, ConvexMeshData& meshData);
+    bool(CARB_ABI* createConvexMesh)(omni::physics::AttachHandle attach, omni::physics::parse::ObjectKey key, uint32_t vertexLimit, ConvexMeshData& meshData);
 
     /// Empty the local mesh cache contents, that will force any mesh to be cooked again when requested 
     void(CARB_ABI* releaseLocalMeshCache)();
@@ -180,26 +201,34 @@ struct IPhysxCooking
                                                 const int voxelResolution,
                                                 void* (*allocateBytes)(size_t));
 
-    /// Precook mesh with a given cooking parameters
-    //\param[in] stageId USD stageId
-    //\param[in] meshPath path to UsdGeomMesh prim
-    //\param[in] cookingParams cooking parameters
-    //\param[in] cb Optional cooking/result callback, if nullptr is passed then the call is a blocking call
-    bool(CARB_ABI* precookMesh)(uint64_t stageId,
-                                uint64_t meshPath,
+    /// Precook a mesh owned by an exact live attachment.
+    /// Invalid handles, pending simulation or callback reentry return false without
+    /// dispatch or callback delivery. Accepted callbacks reject physics reentry.
+    /// \param[in] attachHandle Exact attachment returned by creation; no active sentinel.
+    /// \param[in] meshKey Source-local ObjectKey of the mesh.
+    /// \param[in] cookingParams Cooking parameters.
+    /// \param[in] cb Optional result/completion callbacks; nullptr requests a blocking cook.
+    bool(CARB_ABI* precookMesh)(AttachHandle attachHandle,
+                                omni::physics::parse::ObjectKey meshKey,
                                 const CookingParams& cookingParams,
                                 IPhysxCookingCallback* cb);
 
-    /// Cancel a collision representation request previously issued
+    /// Cancel a collision representation request previously issued.
+    /// Returns eBusy during execution or callback reentry; otherwise cancellation
+    /// is idempotent and returns eSuccess, including for a null task.
     //\ param[in] task                  The non-null task returned by requestConvexCollisionRepresentation to cancel
     //\ param[in] invokeCallbackAnyway  If the onResult callback should be invoked anyway even if the task is cancelled
-    void(CARB_ABI* cancelCollisionRepresentationTask)(PhysxCollisionRepresentationTask task, bool invokeCallbackAnyway);
+    RuntimeResult(CARB_ABI* cancelCollisionRepresentationTask)(PhysxCollisionRepresentationTask task, bool invokeCallbackAnyway);
 
-    /// Request a convex collision representation for a given prim, both during and outside of simulation.
+    /// Request a convex collision representation for a primitive in a live attachment.
+    /// Admission fails with eInvalidAttachment for zero/stale/sentinel handles and
+    /// eBusy during an outstanding simulation interval or callback reentry. Rejected
+    /// requests queue no task and invoke no completion callback. Accepted requests
+    /// retain their owning cooking context through completion or owner retirement.
     /// The collision representation is a vector of convexes and works on prims with CollisionAPI marked with
     /// Convex Hull or Convex Decomposition approximation.
     /// Any other approximation will return an error result (in the callback)
-    //\param[in] request    The request object with the stage and prim path
+    //\param[in] request    The request with an exact attachment and source-local primitive key
     //\param[in] onResult   The callback to be called with collision representation data
     //\returns              A null task handle if:
     //                          - The request has been fullfilled immediately (onResult has been called immediately)
@@ -211,9 +240,9 @@ struct IPhysxCooking
         const PhysxCollisionRepresentationRequest& request,
         PhysxCollisionRepresentationConvexResult::CallbackType onResult);
 
-    // Cooks deformable body with PhysxSchemaPhysxAutoDeformableBodyAPI for given USD path
-    //\param[in] deformableBodyPath path to primitive with UsdPhysicsDeformableBodyAPI
-    bool(CARB_ABI* cookAutoDeformableBody)(const PXR_NS::SdfPath& deformableBodyPath);
+    // Cooks deformable body with PhysxSchemaPhysxAutoDeformableBodyAPI for given object
+    //\param[in] deformableBodyKey ObjectKey of the primitive with UsdPhysicsDeformableBodyAPI
+    bool(CARB_ABI* cookAutoDeformableBody)(omni::physics::AttachHandle attach, omni::physics::parse::ObjectKey deformableBodyKey);
 
 };
 

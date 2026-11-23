@@ -1,7 +1,24 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1 AC-2 AC-4
+
+// @implements REQ-ATTACH-LIFETIME-001
+// @covers AC-3 AC-4
+
+// @implements REQ-ATTACH-RESOLVE-001
+// @covers AC-5
+
+/**
+ * @implements REQ-PARSE-CONTACTREPORT-001
+ * @covers AC-1 AC-2 AC-3
+ *
+ * @implements REQ-SIM-OBJECTDB-001
+ * @covers AC-1
+ */
+
+#include <omni/physics/parse/KnownTokens.h>
 
 #include "ContactReport.h"
 #include "internal/InternalScene.h"
@@ -14,9 +31,6 @@
 
 #include <private/omni/physx/PhysxUsd.h>
 
-#include <common/utilities/Utilities.h>
-
-using namespace PXR_NS;
 using namespace carb;
 using namespace ::physx;
 using namespace omni::physx::usdparser;
@@ -28,8 +42,8 @@ namespace physx
 {
     std::atomic<size_t> ContactReport::s_liveInstanceCount{ 0 };
 
-    ContactReport::ContactReport()
-        : mCurrentReportData(nullptr), mCurrentDataVector(nullptr), mReportFlushed(false)
+    ContactReport::ContactReport(AttachedStage& attachedStage)
+        : mAttachedStage(attachedStage), mCurrentReportData(nullptr), mCurrentDataVector(nullptr), mReportFlushed(false)
     {
         s_liveInstanceCount.fetch_add(1, std::memory_order_relaxed);
     }
@@ -41,11 +55,11 @@ namespace physx
     }
 
     void ContactReport::resolvePairs()
-    {        
+    {
         const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-        const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+        const internal::InternalPhysXDatabase& db = mAttachedStage.getInternalPhysXDatabase();
         UnresolvedContactPairsMap::iterator itUnresolved = mUnresolvedContactPairsMap.begin();
-        AttachedStage* attachedStage = UsdLoad::getUsdLoad()->getActiveAttachedStage();
+        AttachedStage* attachedStage = &mAttachedStage;
         if(!attachedStage)
             return;
 
@@ -57,7 +71,7 @@ namespace physx
             // report target has no object-DB entry yet (parsed later). Clearing
             // those here would silently and permanently lose the report.
             bool resolved = true;
-            if (itUnresolved->second.first == SdfPath())
+            if (!itUnresolved->second.first.valid())
             {
                 mContactPairsMap.insert(std::make_pair(itUnresolved->first, std::make_pair(nullptr, itUnresolved->second.second)));
             }
@@ -73,6 +87,15 @@ namespace physx
                     ObjectIdMap::const_iterator it = entries->begin();
                     while (it != entries->end())
                     {
+                        // The object database can hold a kInvalidObjectId entry, and getRecords() is
+                        // only CARB_ASSERT-guarded - a no-op in release. Skip ids that cannot index
+                        // the record array instead of reading far out of bounds.
+                        if (size_t(it->second) >= db.getRecords().size())
+                        {
+                            it++;
+                            continue;
+                        }
+
                         const InternalDatabase::Record& rec = db.getRecords()[size_t(it->second)];
                         if (rec.mType == ePTActor)
                         {
@@ -136,8 +159,8 @@ namespace physx
         }
     }
 
-    bool isCompoundReport(const AttachedStage* attachedStage, const std::vector<InternalDatabase::Record>& records, const void* shape0UserData, const void* shape1UserData,
-        Pair<void*>& compoundPair, PXR_NS::SdfPath& shape0Path, PXR_NS::SdfPath& shape1Path)
+    bool isCompoundReport(const std::vector<InternalDatabase::Record>& records, const void* shape0UserData, const void* shape1UserData,
+        Pair<void*>& compoundPair, omni::physics::parse::ObjectKey& shape0Key, omni::physics::parse::ObjectKey& shape1Key)
     {
         const size_t index0 = (size_t)shape0UserData;
         CARB_ASSERT(index0 < records.size());
@@ -153,7 +176,7 @@ namespace physx
         if (index0 && index0 < records.size())
         {
             const InternalDatabase::Record& record = records[index0];
-            shape0Path = attachedStage->pathFor(record.mKey);
+            shape0Key = record.mKey;
 
             if (record.mType == ePTCompoundShape)
             {
@@ -165,7 +188,7 @@ namespace physx
         if (index1 && index1 < records.size())
         {
             const InternalDatabase::Record& record = records[index1];
-            shape1Path = attachedStage->pathFor(record.mKey);
+            shape1Key = record.mKey;
 
             if (record.mType == ePTCompoundShape)
             {
@@ -179,55 +202,63 @@ namespace physx
         return shape0Compound || shape1Compound;
     }
 
-    PXR_NS::SdfPath getSdfPath(const AttachedStage* attachedStage, const std::vector<InternalDatabase::Record>& records, const void* userData, uint32_t& protoIndex)
+    // ObjectKey siblings of the former getSdfPath/createEventFromSdfPath helpers
+    // (pre-ADR-0019 residue): records[index].mKey is already the identity these
+    // call sites need, so no pathFor round trip through SdfPath is required.
+    omni::physics::parse::ObjectKey getObjectKey(const std::vector<InternalDatabase::Record>& records, const void* userData, uint32_t& protoIndex)
     {
-        SdfPath path;
+        omni::physics::parse::ObjectKey key;
         const size_t index = (size_t)userData;
         CARB_ASSERT(index < records.size());
 
         if (index && index < records.size())
         {
             const InternalDatabase::Record& record = records[index];
-            path = attachedStage->pathFor(record.mKey);
+            key = record.mKey;
             if (record.mType == ePTActor)
             {
                 protoIndex = ((InternalActor*)record.mInternalPtr)->mInstanceIndex;
-            }            
+            }
         }
-        return path;
+        return key;
     }
 
-    PXR_NS::SdfPath getSdfPath(const AttachedStage* attachedStage, const std::vector<InternalDatabase::Record>& records, const void* userData)
+    omni::physics::parse::ObjectKey getObjectKey(const std::vector<InternalDatabase::Record>& records, const void* userData)
     {
-        SdfPath path;
+        omni::physics::parse::ObjectKey key;
         const size_t index = (size_t)userData;
         CARB_ASSERT(index < records.size());
 
         if (index && index < records.size())
         {
-            const InternalDatabase::Record& record = records[index];
-            path = attachedStage->pathFor(record.mKey);
+            key = records[index].mKey;
         }
-        return path;
+        return key;
     }
 
-    PXR_NS::SdfPath createEventFromSdfPath(carb::events::IEventPtr& eventPtr,
-                                           carb::cpp::string_view itemName,
-                                           dictionary::IDictionary* dict,
-                                           const AttachedStage* attachedStage,
-                                           const std::vector<InternalDatabase::Record>& records,
-                                           const void* userData)
+    // ContactEvent.h's actor0/actor1/collider0/collider1/material0/material1 fields are
+    // uint64_t, not ObjectKey (unlike IPhysxSceneQuery.h's hit-result fields, which this
+    // same round DID retype to ObjectKey) -- their wire format is the legacy
+    // asInt(ObjectKey) encoding (key.handle), decoded via keyFromLegacyId()/textFor() by
+    // every consumer (production: tensors/base/BaseRigidContactView.cpp; test:
+    // TestContactReport.cpp, TestContactAndCleanupCoverage.cpp, and others -- test-side
+    // decode fixups deferred to the end-of-session sweep, see AGENTS.md direction).
+    // TODO: retype ContactEvent.h itself to ObjectKey directly; the bookkeeping above
+    // (map keys, CompoundShapeReportData) is already ObjectKey-native internally.
+    uint64_t keyToLegacyPathInt(const AttachedStage* attachedStage, omni::physics::parse::ObjectKey key)
     {
-        SdfPath path;
-        uint64_t ui64Path = 0;
-        const size_t index = (size_t)userData;
-        CARB_ASSERT(index < records.size());
+        return attachedStage ? key.handle : 0;
+    }
 
-        if (index && index < records.size())
-        {
-            path = attachedStage->pathFor(records[index].mKey);
-            ui64Path = asInt(path);
-        }
+    void createEventFromKey(carb::events::IEventPtr& eventPtr,
+                            carb::cpp::string_view itemName,
+                            dictionary::IDictionary* dict,
+                            const AttachedStage* attachedStage,
+                            const std::vector<InternalDatabase::Record>& records,
+                            const void* userData)
+    {
+        omni::physics::parse::ObjectKey key = getObjectKey(records, userData);
+        const uint64_t ui64Path = keyToLegacyPathInt(attachedStage, key);
 
         // Preserve the event payload contract: low 32 bits, then high 32 bits.
         const int32_t splitPath[]{
@@ -237,8 +268,6 @@ namespace physx
         carb::dictionary::Item* item =
             dict->createItem(eventPtr->payload, itemName, carb::dictionary::ItemType::eDictionary);
         dict->setArray<int32_t>(item, splitPath);
-
-        return path;
     }
 
 
@@ -307,19 +336,26 @@ namespace physx
         const std::vector<PxContactPairFrictionAnchor>& frictionAnchors)
     {
         const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-        const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+        const internal::InternalPhysXDatabase& db = mAttachedStage.getInternalPhysXDatabase();
         const std::vector<InternalDatabase::Record>& records = db.getRecords();
-        const int64_t stageId = UsdLoad::getUsdLoad()->getActiveStageId();
-        const AttachedStage* attachedStage = UsdLoad::getUsdLoad()->getAttachedStage(stageId);
+        const AttachedStage* attachedStage = &mAttachedStage;
+        const AttachHandle attachHandle = attachedStage ? attachedStage->getAttachHandle() : kNoAttach;
 
         Pair<void*> shapePair(nullptr, nullptr);
-        SdfPath shape0Path;
-        SdfPath shape1Path;
-        const bool compoundReport = isCompoundReport(attachedStage, records, shape0->userData, shape1->userData, shapePair, shape0Path, shape1Path);
+        omni::physics::parse::ObjectKey shape0Key;
+        omni::physics::parse::ObjectKey shape1Key;
+        const bool compoundReport = isCompoundReport(records, shape0->userData, shape1->userData, shapePair, shape0Key, shape1Key);
         uint32_t protoIndex0 = kInvalidUint32_t;
         uint32_t protoIndex1 = kInvalidUint32_t;
-        const SdfPath actor0Path = getSdfPath(attachedStage, records, actor0->userData, protoIndex0);
-        const SdfPath actor1Path = getSdfPath(attachedStage, records, actor1->userData, protoIndex1);
+        const omni::physics::parse::ObjectKey actor0Key = getObjectKey(records, actor0->userData, protoIndex0);
+        const omni::physics::parse::ObjectKey actor1Key = getObjectKey(records, actor1->userData, protoIndex1);
+
+        // Legacy asInt(ObjectKey)-encoded ids for the public ContactEventHeader (see
+        // keyToLegacyPathInt's comment); everything above stays ObjectKey-native.
+        const uint64_t actor0PathInt = keyToLegacyPathInt(attachedStage, actor0Key);
+        const uint64_t actor1PathInt = keyToLegacyPathInt(attachedStage, actor1Key);
+        const uint64_t shape0PathInt = keyToLegacyPathInt(attachedStage, shape0Key);
+        const uint64_t shape1PathInt = keyToLegacyPathInt(attachedStage, shape1Key);
 
         const ContactEventType::Enum type = (event == eContactFound) ? ContactEventType::eCONTACT_FOUND :
                                             (event == eContactLost)  ? ContactEventType::eCONTACT_LOST :
@@ -338,11 +374,14 @@ namespace physx
                 {
                     mCurrentReportData = &mCompoundShapeBufferedData[shapePair];
 
-                    mCurrentReportData->mActor0Path = actor0Path;
-                    mCurrentReportData->mActor1Path = actor1Path;
+                    // Internal bookkeeping only (see CompoundShapeReportData); already
+                    // resolved as ObjectKey by isCompoundReport/getObjectKey above, no
+                    // AttachedStage needed here.
+                    mCurrentReportData->mActor0Path = actor0Key;
+                    mCurrentReportData->mActor1Path = actor1Key;
 
-                    mCurrentReportData->mShape0Path = shape0Path;
-                    mCurrentReportData->mShape1Path = shape1Path;
+                    mCurrentReportData->mShape0Path = shape0Key;
+                    mCurrentReportData->mShape1Path = shape1Key;
 
                     mCurrentReportData->mEvent = event;
                 }
@@ -350,18 +389,18 @@ namespace physx
 
             // store the data for batch report
             {
-                Pair<uint64_t> compoundShapePair(asInt(shape0Path), asInt(shape1Path));
+                Pair<uint64_t> compoundShapePair(shape0Key.handle, shape1Key.handle);
                 PairContactDataMap::iterator fit = mPairContactDataMap.find(compoundShapePair);
                 if (fit == mPairContactDataMap.end())
                 {
                     ContactEventStruct& contactEventStruct = mPairContactDataMap[compoundShapePair];
                     contactEventStruct.mContactHeader = {
                         type,
-                        stageId,
-                        asInt(actor0Path),
-                        asInt(actor1Path),
-                        asInt(shape0Path),
-                        asInt(shape1Path),
+                        attachHandle,
+                        actor0PathInt,
+                        actor1PathInt,
+                        shape0PathInt,
+                        shape1PathInt,
                         0,
                         contactCount,
                         0,
@@ -418,7 +457,7 @@ namespace physx
             // store the data for batch report
             mContactHeaderVector.push_back(
                 {
-                    type, stageId, asInt(actor0Path), asInt(actor1Path), asInt(shape0Path), asInt(shape1Path),
+                    type, attachHandle, actor0PathInt, actor1PathInt, shape0PathInt, shape1PathInt,
                     uint32_t(mContactDataVector.size()), contactCount, uint32_t(frictionAnchorsOffset), uint32_t(frictionAnchorsSize), protoIndex0, protoIndex1
                 }
             );
@@ -428,55 +467,55 @@ namespace physx
     void ContactReport::reportContactShapeRemoved(const ::physx::PxActor* actor0, const ::physx::PxShape* shape0, const ::physx::PxActor* actor1, const ::physx::PxShape* shape1, const PxContactPairFlags contactFlags)
     {
         OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-        const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+        const internal::InternalPhysXDatabase& db = mAttachedStage.getInternalPhysXDatabase();
 
         ReleasedObjectsMap::const_iterator actor0it = mReleaseActorsMap.find(actor0);
         ReleasedObjectsMap::const_iterator actor1it = mReleaseActorsMap.find(actor1);
         ReleasedObjectsMap::const_iterator shape0it = mReleaseShapesMap.find(shape0);
         ReleasedObjectsMap::const_iterator shape1it = mReleaseShapesMap.find(shape1);
         const std::vector<InternalDatabase::Record>& records = db.getRecords();
-        const AttachedStage* attachedStage = UsdLoad::getUsdLoad()->getActiveAttachedStage();
+        const AttachedStage* attachedStage = &mAttachedStage;
 
         // we need to send contact lost report for deleted objects
-        SdfPath collider0Path;
-        SdfPath collider1Path;
-        SdfPath actor0Path;
-        SdfPath actor1Path;
+        omni::physics::parse::ObjectKey collider0Key;
+        omni::physics::parse::ObjectKey collider1Key;
+        omni::physics::parse::ObjectKey actor0Key;
+        omni::physics::parse::ObjectKey actor1Key;
         if (actor0it != mReleaseActorsMap.end())
         {
-            actor0Path = actor0it->second;
+            actor0Key = actor0it->second;
         }
         else
         {
-            actor0Path = (contactFlags & PxContactPairFlag::eREMOVED_SHAPE_0) ? SdfPath() : getSdfPath(attachedStage, records, actor0->userData);
+            actor0Key = (contactFlags & PxContactPairFlag::eREMOVED_SHAPE_0) ? omni::physics::parse::ObjectKey() : getObjectKey(records, actor0->userData);
         }
         if (actor1it != mReleaseActorsMap.end())
         {
-            actor1Path = actor1it->second;
+            actor1Key = actor1it->second;
         }
         else
         {
-            actor1Path = (contactFlags & PxContactPairFlag::eREMOVED_SHAPE_1) ? SdfPath() : getSdfPath(attachedStage, records, actor1->userData);
-        }        
+            actor1Key = (contactFlags & PxContactPairFlag::eREMOVED_SHAPE_1) ? omni::physics::parse::ObjectKey() : getObjectKey(records, actor1->userData);
+        }
         if (shape0it != mReleaseShapesMap.end())
         {
-            collider0Path = shape0it->second;
+            collider0Key = shape0it->second;
         }
         else
         {
-            collider0Path = (contactFlags & PxContactPairFlag::eREMOVED_SHAPE_0) ? SdfPath() : getSdfPath(attachedStage, records, shape0->userData);
+            collider0Key = (contactFlags & PxContactPairFlag::eREMOVED_SHAPE_0) ? omni::physics::parse::ObjectKey() : getObjectKey(records, shape0->userData);
         }
         if (shape1it != mReleaseShapesMap.end())
         {
-            collider1Path = shape1it->second;
+            collider1Key = shape1it->second;
         }
         else
         {
-            collider1Path = (contactFlags & PxContactPairFlag::eREMOVED_SHAPE_1) ? SdfPath() : getSdfPath(attachedStage, records, shape1->userData);
+            collider1Key = (contactFlags & PxContactPairFlag::eREMOVED_SHAPE_1) ? omni::physics::parse::ObjectKey() : getObjectKey(records, shape1->userData);
         }
 
-        const int64_t stageId = UsdLoad::getUsdLoad()->getActiveStageId();
-        const Pair<uint64_t> colliderPair(asInt(collider0Path), asInt(collider1Path));
+        const AttachHandle attachHandle = attachedStage ? attachedStage->getAttachHandle() : kNoAttach;
+        const Pair<uint64_t> colliderPair(collider0Key.handle, collider1Key.handle);
         if (mDeletedEventsSet.find(colliderPair) == mDeletedEventsSet.end())
         {
             mDeletedEventsSet.insert(colliderPair);
@@ -486,11 +525,11 @@ namespace physx
         {
             mPairContactDataMap[colliderPair].mContactHeader = {
                 ContactEventType::eCONTACT_LOST,
-                stageId,
-                asInt(actor0Path),
-                asInt(actor1Path),
-                asInt(collider0Path),
-                asInt(collider1Path),
+                attachHandle,
+                keyToLegacyPathInt(attachedStage, actor0Key),
+                keyToLegacyPathInt(attachedStage, actor1Key),
+                keyToLegacyPathInt(attachedStage, collider0Key),
+                keyToLegacyPathInt(attachedStage, collider1Key),
                 0,
                 0,
                 0,
@@ -504,18 +543,23 @@ namespace physx
     void ContactReport::reportContactPoint(const PhysXScene* scene, const ::physx::PxVec3& position, const ::physx::PxVec3& normal, const ::physx::PxVec3& impulse, float separation,
         uint32_t faceIndex0, uint32_t faceIndex1, const PxMaterial* material0, const PxMaterial* material1, bool batch)
     {
-        OmniPhysX& omniPhysX = OmniPhysX::getInstance();        
-        const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+        OmniPhysX& omniPhysX = OmniPhysX::getInstance();
+        const internal::InternalPhysXDatabase& db = mAttachedStage.getInternalPhysXDatabase();
         carb::dictionary::IDictionary* iDictionary = omniPhysX.getIDictionary();
         const std::vector<InternalDatabase::Record>& records = db.getRecords();
         const AttachedStage* attachedStage = &scene->getAttachedStage();
 
-        const SdfPath material0Path =
-            (material0 && material0->userData != nullptr) ? getSdfPath(attachedStage, records, material0->userData) :
+        const omni::physics::parse::ObjectKey material0Key =
+            (material0 && material0->userData != nullptr) ? getObjectKey(records, material0->userData) :
             scene->getDefaultMaterialPath();
-        const SdfPath material1Path =
-            (material1 && material1->userData != nullptr) ? getSdfPath(attachedStage, records, material1->userData) :
+        const omni::physics::parse::ObjectKey material1Key =
+            (material1 && material1->userData != nullptr) ? getObjectKey(records, material1->userData) :
             scene->getDefaultMaterialPath();
+
+        // Legacy asInt(ObjectKey)-encoded ids for the public ContactData (see
+        // keyToLegacyPathInt's comment).
+        const uint64_t material0PathInt = keyToLegacyPathInt(attachedStage, material0Key);
+        const uint64_t material1PathInt = keyToLegacyPathInt(attachedStage, material1Key);
 
         // check if we just buffer data or send directly
         if (mCurrentReportData && mCurrentDataVector)
@@ -527,17 +571,17 @@ namespace physx
 
             mCurrentDataVector->push_back({ (const carb::Float3&)position, (const carb::Float3&)normal,
                                             (const carb::Float3&)impulse, separation, faceIndex0, faceIndex1,
-                                            asInt(material0Path), asInt(material1Path) });
+                                            material0PathInt, material1PathInt });
 
         }
         else
-        {            
+        {
             if (batch)
             {
                 mContactDataVector.push_back(
                     {
                         (const carb::Float3&)position, (const carb::Float3&)normal, (const carb::Float3&)impulse,
-                        separation, faceIndex0, faceIndex1, asInt(material0Path), asInt(material1Path)
+                        separation, faceIndex0, faceIndex1, material0PathInt, material1PathInt
                     }
                 );
             }
@@ -547,12 +591,10 @@ namespace physx
     void ContactReport::flushContactReports()
     {
         const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-        const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+        const internal::InternalPhysXDatabase& db = mAttachedStage.getInternalPhysXDatabase();
 
         const std::vector<InternalDatabase::Record>& records = db.getRecords();
         mCurrentReportData = nullptr;
-
-        const int64_t stageId = UsdLoad::getUsdLoad()->getActiveStageId();
 
         for (CompoundShapeBufferedData::const_reference& reportIterator : mCompoundShapeBufferedData)
         {
@@ -604,31 +646,35 @@ namespace physx
     {
         if (!mContactHeaderVector.empty() && !mReportFlushed)
         {
+            RuntimeCallbackScope callbackScope;
+            const OwnedContactRegistry& contacts = mAttachedStage.getSimulationCallbacks().getContactReportRegistry();
+            const OwnedFullContactRegistry& fullContacts = mAttachedStage.getSimulationCallbacks().getFullContactReportRegistry();
+            const OwnedContactRegistry::EventMap snapshot = contacts.snapshot();
+            const OwnedFullContactRegistry::EventMap fullSnapshot = fullContacts.snapshot();
+            for (const OwnedContactRegistry::EventMap::value_type& entry : snapshot)
             {
-                const ContactReportEventSubscriptionRegistry& contactReportRegistry =
-                    SimulationCallbacks::getSimulationCallbacks()->getContactReportRegistry();
-                ContactReportEventSubscriptionRegistry::EventMap::const_iterator it = contactReportRegistry.map.begin();
-                ContactReportEventSubscriptionRegistry::EventMap::const_iterator itEnd = contactReportRegistry.map.end();
-                while (it != itEnd)
+                if (!contacts.contains(entry.first))
+                    continue;
+                try
                 {
-                    it->second.first(mContactHeaderVector.data(), uint32_t(mContactHeaderVector.size()),
-                        mContactDataVector.data(), uint32_t(mContactDataVector.size()), it->second.second);
-                    it++;
+                    entry.second.first(mContactHeaderVector.data(), uint32_t(mContactHeaderVector.size()),
+                        mContactDataVector.data(), uint32_t(mContactDataVector.size()), entry.second.second);
                 }
+                catch (const std::exception& e) { CARB_LOG_ERROR("Physics contact callback threw: %s", e.what()); }
+                catch (...) { CARB_LOG_ERROR("Physics contact callback threw an unknown exception"); }
             }
-
+            for (const OwnedFullContactRegistry::EventMap::value_type& entry : fullSnapshot)
             {
-                const FullContactReportEventSubscriptionRegistry& contactReportRegistry =
-                    SimulationCallbacks::getSimulationCallbacks()->getFullContactReportRegistry();
-                FullContactReportEventSubscriptionRegistry::EventMap::const_iterator it = contactReportRegistry.map.begin();
-                FullContactReportEventSubscriptionRegistry::EventMap::const_iterator itEnd = contactReportRegistry.map.end();
-                while (it != itEnd)
+                if (!fullContacts.contains(entry.first))
+                    continue;
+                try
                 {
-                    it->second.first(mContactHeaderVector.data(), uint32_t(mContactHeaderVector.size()),
+                    entry.second.first(mContactHeaderVector.data(), uint32_t(mContactHeaderVector.size()),
                         mContactDataVector.data(), uint32_t(mContactDataVector.size()), mFrictionAnchorsDataVector.data(),
-                        uint32_t(mFrictionAnchorsDataVector.size()), it->second.second);
-                    it++;
+                        uint32_t(mFrictionAnchorsDataVector.size()), entry.second.second);
                 }
+                catch (const std::exception& e) { CARB_LOG_ERROR("Physics full-contact callback threw: %s", e.what()); }
+                catch (...) { CARB_LOG_ERROR("Physics full-contact callback threw an unknown exception"); }
             }
 
             mReportFlushed = true;
@@ -638,97 +684,128 @@ namespace physx
     void ContactReport::reportJointBreak(const ::physx::PxJoint* joint)
     {
         OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-        const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+        const internal::InternalPhysXDatabase& db = mAttachedStage.getInternalPhysXDatabase();
 
         const std::vector<InternalDatabase::Record>& records = db.getRecords();
-        const AttachedStage* attachedStage = UsdLoad::getUsdLoad()->getActiveAttachedStage();
         carb::dictionary::IDictionary* iDictionary = omniPhysX.getIDictionary();
+        const AttachedStage* attachedStage = &mAttachedStage;
 
         carb::events::IEventPtr eventPtr = omniPhysX.createSimulationEventV2(eJointBreak);
-        createEventFromSdfPath(eventPtr, "jointKey", iDictionary, attachedStage, records, joint->userData);
+        createEventFromKey(eventPtr, "jointKey", iDictionary, attachedStage, records, joint->userData);
 
         omniPhysX.getSimulationEventStreamV2()->push(eventPtr.get());
     }
 
-    void setupContactReportToArticulation(PhysXScene* ps, const PhysxSchemaPhysxContactReportAPI& contactReportAPI, PxArticulationReducedCoordinate& art)
+    // Contact-report parameters for `key`, read through the parse source rather than
+    // off a UsdPrim, so they resolve under any backend (ovstage publishes
+    // PhysxContactReportAPI). Returns false when the API is not applied there;
+    // `outThreshold` is only overwritten when the resolved value differs from the raw
+    // schema fallback (see the ambiguous-fallback-collapse note below).
+    static bool readContactReportParams(const AttachedStage& attachedStage,
+                                        omni::physics::parse::ObjectKey key,
+                                        float& outThreshold,
+                                        std::vector<omni::physics::parse::ObjectKey>& outPairs,
+                                        bool& outTargetsAuthored)
     {
-        float contactThreshold = 1.0f * OmniPhysX::getInstance().getPhysXSetup().getPhysics()->getTolerancesScale().length;
-        const UsdAttribute threshold = contactReportAPI.GetThresholdAttr();
-        if (threshold && threshold.HasAuthoredValue())
+        outTargetsAuthored = false;
+        const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
+        if (!src || !src->exists(key))
+            return false;
+
+        const omni::physics::parse::KnownTokens& tok = attachedStage.getKnownTokens();
+
+        if (!src->hasSchema(key, tok.physxContactReportAPI))
+            return false;
+
+        // The caller's default is units-scaled (tolerances length), which the schema
+        // fallback (raw 1.0) cannot express -- so an unauthored threshold must leave it
+        // alone. ovstage's hasAuthoredAttribute is unconditionally true (ADR-0020), so a
+        // read landing exactly on the raw schema default (1.0) is indistinguishable from
+        // unauthored and collapses to it (ADR-0002 invariant 1), same shape as
+        // parsePhysXCharacterControllerDesc's contactOffset/stepOffset.
+        const float rawSchemaThreshold = 1.0f;
+        if (src->hasAuthoredAttribute(key, tok.physxContactReportThreshold))
         {
-            threshold.Get(&contactThreshold);
+            float threshold = rawSchemaThreshold;
+            if (getValue<float>(attachedStage, key, tok.physxContactReportThreshold,
+                                omni::physics::parse::ReadTime::defaultTime(), threshold) &&
+                threshold != rawSchemaThreshold)
+            {
+                outThreshold = threshold;
+            }
         }
 
-        SdfPathVector targets;
-        const UsdRelationship rel = contactReportAPI.GetReportPairsRel();
-        if (rel)
+        // hasRelationship distinguishes "no reportPairs relationship authored at all"
+        // (the wildcard/report-all-contacts case) from "authored but empty" --
+        // getRelationshipTargets alone reports empty for both (IPhysicsSource.h), so a
+        // caller that must tell them apart (see addContactReportPairs below) needs this.
+        outTargetsAuthored = src->hasRelationship(key, tok.physxContactReportReportPairs);
+        src->getRelationshipTargets(key, tok.physxContactReportReportPairs, outPairs);
+        return true;
+    }
+
+    // Register `actor` for every reported pair, or once against the invalid key when the
+    // relationship names no targets at all (which is what "report all contacts" means
+    // here). `targetsAuthored` distinguishes that legitimate no-targets-authored case from
+    // a restricted filter whose authored targets all failed to resolve to a live object
+    // (`pairs` empty too, but for a different reason): the latter must not silently widen
+    // into the all-contacts wildcard, so it registers nothing instead.
+    static void addContactReportPairs(PhysXScene* ps,
+                                      PxRigidActor* actor,
+                                      const std::vector<omni::physics::parse::ObjectKey>& pairs,
+                                      float contactThreshold,
+                                      bool targetsAuthored)
+    {
+        if (pairs.empty())
         {
-            rel.GetTargets(&targets);
+            if (!targetsAuthored)
+            {
+                ps->getContactReport()->addActorPair(actor, omni::physics::parse::ObjectKey(), contactThreshold);
+            }
+            return;
         }
+        for (const omni::physics::parse::ObjectKey& pair : pairs)
+        {
+            ps->getContactReport()->addActorPair(actor, pair, contactThreshold);
+        }
+    }
+
+    void setupContactReportToArticulation(PhysXScene* ps,
+                                          const AttachedStage& attachedStage,
+                                          omni::physics::parse::ObjectKey key,
+                                          PxArticulationReducedCoordinate& art)
+    {
+        float contactThreshold = 1.0f * OmniPhysX::getInstance().getPhysXSetup().getPhysics()->getTolerancesScale().length;
+        std::vector<omni::physics::parse::ObjectKey> targets;
+        bool targetsAuthored = false;
+        if (!readContactReportParams(attachedStage, key, contactThreshold, targets, targetsAuthored))
+            return;
 
         for (PxU32 i = 0; i < art.getNbLinks(); i++)
         {
             PxArticulationLink* link;
             art.getLinks(&link, 1, i);
-
-            if (targets.empty())
-            {
-                ps->getContactReport()->addActorPair(link, SdfPath(), contactThreshold);
-            }
-            else
-            {
-                for (size_t i = 0; i < targets.size(); i++)
-                {
-                    ps->getContactReport()->addActorPair(link, targets[i], contactThreshold);
-                }
-            }
+            addContactReportPairs(ps, link, targets, contactThreshold, targetsAuthored);
         }
     }
 
-    void setupContactReport(PhysXScene* ps, AttachedStage& attachedStage, PxRigidActor& rigidActor, const SdfPath& usdPrimPath)
+    void setupContactReport(PhysXScene* ps, AttachedStage& attachedStage, PxRigidActor& rigidActor, omni::physics::parse::ObjectKey key)
     {
-        const PhysxSchemaPhysxContactReportAPI contactReportAPI = PhysxSchemaPhysxContactReportAPI::Get(attachedStage.getStage(), usdPrimPath);
-        if (contactReportAPI)
-        {
-            attachedStage.getPhysXPhysicsInterface()->setDirty(true);
+        float contactThreshold = 1.0f * OmniPhysX::getInstance().getPhysXSetup().getPhysics()->getTolerancesScale().length;
+        std::vector<omni::physics::parse::ObjectKey> targets;
+        bool targetsAuthored = false;
+        if (!readContactReportParams(attachedStage, key, contactThreshold, targets, targetsAuthored))
+            return;
 
-            float contactThreshold = 1.0f * OmniPhysX::getInstance().getPhysXSetup().getPhysics()->getTolerancesScale().length;
-            const UsdAttribute threshold = contactReportAPI.GetThresholdAttr();
-            if (threshold && threshold.HasAuthoredValue())
-            {
-                threshold.Get(&contactThreshold);
-            }
-
-            const UsdRelationship rel = contactReportAPI.GetReportPairsRel();
-            if (rel)
-            {
-                SdfPathVector targets;
-                rel.GetTargets(&targets);
-
-                if (targets.empty())
-                {
-                    ps->getContactReport()->addActorPair(&rigidActor, SdfPath(), contactThreshold);
-                }
-                else
-                {
-                    for (size_t i = 0; i < targets.size(); i++)
-                    {
-                        ps->getContactReport()->addActorPair(&rigidActor, targets[i], contactThreshold);
-                    }
-                }
-            }
-            else
-            {
-                ps->getContactReport()->addActorPair(&rigidActor, SdfPath(), contactThreshold);
-            }
-        }
+        attachedStage.getPhysXPhysicsInterface()->setDirty(attachedStage, true);
+        addContactReportPairs(ps, &rigidActor, targets, contactThreshold, targetsAuthored);
     }
-    void changeContactReport(usdparser::AttachedStage& attachedStage, const PXR_NS::SdfPath& path, bool removed)
+    void changeContactReport(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, bool removed)
     {
         OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-        InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+        InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
-        const ObjectIdMap* entries = attachedStage.getObjectDatabase()->getEntries(path);
+        const ObjectIdMap* entries = attachedStage.getObjectDatabase()->getEntries(key);
         if (entries && !entries->empty())
         {
             ObjectIdMap::const_iterator it = entries->begin();
@@ -744,8 +821,7 @@ namespace physx
                         PxArticulationReducedCoordinate* articulation = (PxArticulationReducedCoordinate*)objectRecord->mPtr;
                         if (articulation && articulation->getScene())
                         {
-                            PhysXScene* physxScene = OmniPhysX::getInstance().getPhysXSetup().getPhysXScene(size_t(articulation->getScene()->userData));
-                            const PhysxSchemaPhysxContactReportAPI contactReportAPI = PhysxSchemaPhysxContactReportAPI::Get(attachedStage.getStage(), path);
+                            PhysXScene* physxScene = OmniPhysX::getInstance().getPhysXSetup().findPhysXScene(articulation->getScene());
                             if (removed)
                             {
                                 if (physxScene)
@@ -755,15 +831,15 @@ namespace physx
                                     for (PxU32 i = 0; i < numLinks; i++)
                                     {
                                         articulation->getLinks(&link, 1, i);
-                                        physxScene->getContactReport()->removeActor(link, path);
+                                        physxScene->getContactReport()->removeActor(link, key);
                                     }
                                 }
                             }
                             else
                             {
-                                if (physxScene && contactReportAPI)
+                                if (physxScene)
                                 {
-                                    setupContactReportToArticulation(physxScene, contactReportAPI, *articulation);
+                                    setupContactReportToArticulation(physxScene, attachedStage, key, *articulation);
                                     physxScene->getContactReport()->resolvePairs();
                                 }
                             }
@@ -774,16 +850,16 @@ namespace physx
                         PxRigidActor* rigidActor = (PxRigidActor*)objectRecord->mPtr;
                         if (rigidActor && rigidActor->getScene())
                         {
-                            PhysXScene* physxScene = OmniPhysX::getInstance().getPhysXSetup().getPhysXScene(size_t(rigidActor->getScene()->userData));                                
+                            PhysXScene* physxScene = OmniPhysX::getInstance().getPhysXSetup().findPhysXScene(rigidActor->getScene());
                             if (physxScene)
                             {
                                 if (removed)
                                 {
-                                    physxScene->getContactReport()->removeActor(rigidActor, path);
+                                    physxScene->getContactReport()->removeActor(rigidActor, key);
                                 }
                                 else
                                 {
-                                    setupContactReport(physxScene, attachedStage, *rigidActor, path);
+                                    setupContactReport(physxScene, attachedStage, *rigidActor, key);
                                     physxScene->getContactReport()->resolvePairs();
                                 }
                             }
@@ -796,11 +872,11 @@ namespace physx
 
         if (removed)
         {
-            attachedStage.getObjectDatabase()->removeSchemaAPI(path, SchemaAPIFlag::eContactReportAPI);
+            attachedStage.getObjectDatabase()->removeSchemaAPI(key, SchemaAPIFlag::eContactReportAPI);
         }
         else
         {
-            attachedStage.getObjectDatabase()->addSchemaAPI(path, SchemaAPIFlag::eContactReportAPI);
+            attachedStage.getObjectDatabase()->addSchemaAPI(key, SchemaAPIFlag::eContactReportAPI);
         }
 
 

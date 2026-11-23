@@ -1,35 +1,8 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
-// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
-
-// SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
-//
 // Generate a sample .ovd file for testing PVD3 and pvddom.
 // Simulates a simple PhysX-like scene: 1 scene, 2 rigid dynamic boxes falling,
 // 1 static ground plane, with transforms updating over 10 frames.
@@ -37,25 +10,50 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "OmniPvdWriter.h"
 #include "OmniPvdFileWriteStream.h"
+#include "OmniPvdLibraryFunctions.h"
 #include "OmniPvdDefines.h"
-
-extern "C" {
-    OmniPvdWriter* OMNI_PVD_CALL createOmniPvdWriter();
-    void OMNI_PVD_CALL destroyOmniPvdWriter(OmniPvdWriter& writer);
-    OmniPvdFileWriteStream* OMNI_PVD_CALL createOmniPvdFileWriteStream();
-    void OMNI_PVD_CALL destroyOmniPvdFileWriteStream(OmniPvdFileWriteStream& stream);
-}
+#include "OmniPvdCommands.h"
+#include "numeric_fixture.h"
 
 struct Vec3 { float x, y, z; };
 struct Quat { float x, y, z, w; };
+
+static bool truncateFile(const char* path, long bytes)
+{
+    FILE* file = fopen(path, "r+b");
+    if (!file) return false;
+#ifdef _WIN32
+    const bool truncated = _chsize_s(_fileno(file), static_cast<unsigned long long>(bytes)) == 0;
+#else
+    const bool truncated = ftruncate(fileno(file), bytes) == 0;
+#endif
+    return fclose(file) == 0 && truncated;
+}
 
 int main(int argc, char** argv)
 {
     const char* outputPath = "test_scene.ovd";
     if (argc > 1) outputPath = argv[1];
+    const bool unknownDestroy = argc == 3 && std::strcmp(argv[2], "--unknown-destroy") == 0;
+    const bool missingOptionalRef = argc == 3 && std::strcmp(argv[2], "--missing-optional-ref") == 0;
+    const bool manyActors = argc == 3 && std::strcmp(argv[2], "--many-actors") == 0;
+    const bool unsupportedVersion = argc == 3 && std::strcmp(argv[2], "--unsupported-version") == 0;
+    const bool metricVariant = argc == 3 && std::strcmp(argv[2], "--metric-variant") == 0;
+    const bool truncatedTail = argc == 3 && std::strcmp(argv[2], "--truncated-tail") == 0;
+    const bool truncatedFirst = argc == 3 && std::strcmp(argv[2], "--truncated-first") == 0;
+    const bool largeTail = argc == 3 && std::strcmp(argv[2], "--truncated-large-payload") == 0;
+    const bool deepPath = argc == 3 && std::strcmp(argv[2], "--deep-path") == 0;
+    const bool numeric = argc == 3 && PvdDomTest::numericFixtureOption(argv[2]);
+    if (argc > 3 || (argc == 3 && !unknownDestroy && !missingOptionalRef && !manyActors &&
+        !unsupportedVersion && !metricVariant && !truncatedTail && !truncatedFirst && !largeTail && !deepPath && !numeric)) return 2;
 
     OmniPvdWriter* writer = createOmniPvdWriter();
     OmniPvdFileWriteStream* fileStream = createOmniPvdFileWriteStream();
@@ -69,15 +67,24 @@ int main(int argc, char** argv)
     }
 
     fileStream->setFileName(const_cast<char*>(outputPath));
-    if (!fileStream->openFile())
+    if (!fileStream->openStream())
     {
         printf("Failed to open %s for writing\n", outputPath);
-        destroyOmniPvdFileWriteStream(*fileStream);
         destroyOmniPvdWriter(*writer);
+        destroyOmniPvdFileWriteStream(*fileStream);
         return 1;
     }
 
     writer->setWriteStream(*fileStream);
+
+    if (numeric)
+    {
+        PvdDomTest::writeNumericFixture(*writer, argv[2]);
+        destroyOmniPvdWriter(*writer);
+        const bool closed = fileStream->closeStream();
+        destroyOmniPvdFileWriteStream(*fileStream);
+        return closed ? 0 : 1;
+    }
 
     const OmniPvdContextHandle ctx = 1;
 
@@ -99,11 +106,17 @@ int main(int argc, char** argv)
 
     // RigidActor (inherits from Actor)
     OmniPvdClassHandle rigidActorClass = writer->registerClass("PxRigidActor", actorClass);
-    OmniPvdAttributeHandle globalPoseAttr = writer->registerAttribute(rigidActorClass, "globalPose", OmniPvdDataType::eFLOAT32, 7); // pos(3) + quat(4)
+    OmniPvdAttributeHandle globalPoseAttr = writer->registerAttribute(rigidActorClass, "globalPose", OmniPvdDataType::eFLOAT32, 7); // quat(4) + pos(3)
 
     // RigidDynamic (inherits from RigidActor)
     OmniPvdClassHandle rigidDynamicClass = writer->registerClass("PxRigidDynamic", rigidActorClass);
     OmniPvdAttributeHandle linearVelAttr = writer->registerAttribute(rigidDynamicClass, "linearVelocity", OmniPvdDataType::eFLOAT32, 3);
+    OmniPvdAttributeHandle debugVectorAttr = 0;
+    if (manyActors || metricVariant)
+    {
+        debugVectorAttr = writer->registerAttribute(rigidDynamicClass, "debugVector", OmniPvdDataType::eFLOAT32, 3);
+        writer->registerAttribute(rigidDynamicClass, "reservedVector", OmniPvdDataType::eFLOAT32, 3);
+    }
 
     // RigidStatic (inherits from RigidActor)
     OmniPvdClassHandle rigidStaticClass = writer->registerClass("PxRigidStatic", rigidActorClass);
@@ -145,7 +158,7 @@ int main(int argc, char** argv)
     writer->createObject(ctx, rigidStaticClass, groundHandle, "GroundPlane");
     uint32_t staticType = 0;
     writer->setAttribute(ctx, groundHandle, actorTypeAttr, reinterpret_cast<const uint8_t*>(&staticType), sizeof(uint32_t));
-    float groundPose[7] = { 0, 0, 0, 0, 0, 0, 1 }; // pos + identity quat
+    float groundPose[7] = { 0, 0, 0, 1, 0, 0, 0 }; // identity quat + pos
     writer->setAttribute(ctx, groundHandle, globalPoseAttr, reinterpret_cast<const uint8_t*>(groundPose), sizeof(groundPose));
 
     // Ground shape
@@ -153,7 +166,7 @@ int main(int argc, char** argv)
     writer->createObject(ctx, shapeClass, groundShapeHandle, "GroundShape");
     uint8_t isExclusive = 1;
     writer->setAttribute(ctx, groundShapeHandle, shapeIsExclusiveAttr, &isExclusive, sizeof(uint8_t));
-    float shapeIdentityPose[7] = { 0, 0, 0, 0, 0, 0, 1 };
+    float shapeIdentityPose[7] = { 0, 0, 0, 1, 0, 0, 0 };
     writer->setAttribute(ctx, groundShapeHandle, shapeLocalPoseAttr, reinterpret_cast<const uint8_t*>(shapeIdentityPose), sizeof(shapeIdentityPose));
 
     // Add ground to scene
@@ -187,7 +200,7 @@ int main(int argc, char** argv)
             reinterpret_cast<const uint8_t*>(&dynamicType), sizeof(uint32_t));
 
         // Initial pose
-        float pose[7] = { box.startX, box.startY, 0.0f, 0, 0, 0, 1 };
+        float pose[7] = { 0, 0, 0, 1, box.startX, box.startY, 0.0f };
         writer->setAttribute(ctx, box.actorHandle, globalPoseAttr,
             reinterpret_cast<const uint8_t*>(pose), sizeof(pose));
 
@@ -216,6 +229,27 @@ int main(int argc, char** argv)
         writer->addToUniqueListAttribute(ctx, box.actorHandle, actorShapesAttr,
             reinterpret_cast<const uint8_t*>(&box.shapeHandle), sizeof(OmniPvdObjectHandle));
     }
+    if (manyActors || metricVariant)
+    {
+        for (int i = 0; i < 120; ++i)
+        {
+            const OmniPvdObjectHandle extraHandle = OmniPvdObjectHandle(1000 + i);
+            char name[64];
+            snprintf(name, sizeof(name), "ExtraActor_%03d", i);
+            writer->createObject(ctx, rigidDynamicClass, extraHandle, name);
+            const float debugVector[3] = {float(i + (metricVariant && i == 100 ? 3 : 0)),
+                metricVariant && i == 100 ? 5.0f : 1.0f, 2.0f};
+            writer->setAttribute(ctx, extraHandle, debugVectorAttr,
+                reinterpret_cast<const uint8_t*>(debugVector), sizeof(debugVector));
+            writer->addToUniqueListAttribute(ctx, sceneHandle, sceneActorsAttr,
+                reinterpret_cast<const uint8_t*>(&extraHandle), sizeof(extraHandle));
+        }
+        const auto lateList = writer->registerUniqueListAttribute(rigidDynamicClass, "debugList", OmniPvdDataType::eOBJECT_HANDLE);
+        const OmniPvdObjectHandle target = 401;
+        writer->removeFromUniqueListAttribute(ctx, 1100, lateList, reinterpret_cast<const uint8_t*>(&target), sizeof(target));
+        writer->addToUniqueListAttribute(ctx, 1101, lateList, reinterpret_cast<const uint8_t*>(&target), sizeof(target));
+        writer->removeFromUniqueListAttribute(ctx, 1101, lateList, reinterpret_cast<const uint8_t*>(&target), sizeof(target));
+    }
 
     // ---- Simulate 10 frames ----
     const float dt = 1.0f / 60.0f;
@@ -233,7 +267,14 @@ int main(int argc, char** argv)
     for (int frame = 0; frame < 10; frame++)
     {
         uint64_t timestamp = frame + 1;
-        writer->startFrame(ctx, timestamp);
+        writer->startFrame(sceneHandle, timestamp);
+        if ((manyActors || metricVariant) && frame == 0)
+        {
+            const float debugVector[3] = {metricVariant ? 103.0f : 100.0f,
+                metricVariant ? 5.0f : 1.0f, 2.0f};
+            writer->setAttribute(ctx, 1100, debugVectorAttr,
+                reinterpret_cast<const uint8_t*>(debugVector), sizeof(debugVector));
+        }
 
         for (int i = 0; i < 2; i++)
         {
@@ -251,9 +292,16 @@ int main(int argc, char** argv)
             }
 
             float pose[7] = {
-                positions[i][0], positions[i][1], positions[i][2],
-                0, 0, 0, 1
+                0, 0, 0, 1,
+                positions[i][0], positions[i][1], positions[i][2]
             };
+            if (metricVariant && i == 0)
+            {
+                pose[2] = 0.7071067811865476f;
+                pose[3] = 0.7071067811865476f;
+                pose[4] += 3.0f;
+                pose[5] += 4.0f;
+            }
             writer->setAttribute(ctx, boxes[i].actorHandle, globalPoseAttr,
                 reinterpret_cast<const uint8_t*>(pose), sizeof(pose));
 
@@ -261,14 +309,61 @@ int main(int argc, char** argv)
                 reinterpret_cast<const uint8_t*>(velocities[i]), sizeof(float) * 3);
         }
 
-        writer->stopFrame(ctx, timestamp);
+        writer->stopFrame(sceneHandle, timestamp);
     }
 
-    // ---- Cleanup ----
-    fileStream->closeFile();
-    destroyOmniPvdFileWriteStream(*fileStream);
-    destroyOmniPvdWriter(*writer);
+    if (missingOptionalRef)
+    {
+        const OmniPvdObjectHandle missingShape = 9999;
+        for (const auto& box : boxes)
+            writer->addToUniqueListAttribute(ctx, box.actorHandle, actorShapesAttr,
+                reinterpret_cast<const uint8_t*>(&missingShape), sizeof(missingShape));
+    }
+    if (unknownDestroy) writer->destroyObject(ctx, 9999);
 
+    // ---- Cleanup ----
+    destroyOmniPvdWriter(*writer);
+    const bool streamClosed = fileStream->closeStream();
+    destroyOmniPvdFileWriteStream(*fileStream);
+
+    if (!streamClosed)
+    {
+        fprintf(stderr, "Failed to finalize %s\n", outputPath);
+        return 1;
+    }
+    if (unsupportedVersion)
+    {
+        FILE* file = fopen(outputPath, "r+b");
+        if (!file) return 1;
+        const bool changed = fputc(1, file) != EOF;
+        const bool closed = fclose(file) == 0;
+        if (!changed || !closed) return 1;
+    }
+    if (largeTail || deepPath)
+    {
+        FILE* file = fopen(outputPath, "ab");
+        if (!file) return 1;
+        const auto put = [file](const auto& value) { return fwrite(&value, sizeof(value), 1, file) == 1; };
+        bool written = put(uint8_t(OmniPvdCommand::eSET_ATTRIBUTE)) && put(uint64_t(1)) && put(uint64_t(1)) &&
+            put(uint8_t(deepPath ? 33 : 1));
+        if (largeTail)
+        {
+            const uint8_t residual[10] = {};
+            written = written && put(uint32_t(0)) && put(uint32_t(100000000)) &&
+                fwrite(residual, 1, sizeof(residual), file) == sizeof(residual);
+        }
+        const bool closed = fclose(file) == 0;
+        if (!written || !closed) return 1;
+    }
+    if (truncatedTail || truncatedFirst)
+    {
+        FILE* file = fopen(outputPath, "rb");
+        if (!file || fseek(file, 0, SEEK_END) != 0) { if (file) fclose(file); return 1; }
+        const long size = ftell(file);
+        const bool closed = fclose(file) == 0;
+        const long newSize = truncatedFirst ? long(sizeof(OmniPvdVersionType) * 3 + 1) : size - 1;
+        if (!closed || size <= newSize || !truncateFile(outputPath, newSize)) return 1;
+    }
     printf("Generated %s successfully\n", outputPath);
     return 0;
 }

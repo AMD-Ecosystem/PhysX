@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "NpAggregate.h"
 #include "PxActor.h"
@@ -121,7 +98,15 @@ void NpAggregate::scRemoveActor(NpActor& actor, bool reinsert)
 	ac.setAggregateID(PX_INVALID_U32);
 		
 	if(getNpScene() && reinsert)
+	{
+#if PX_SUPPORT_GPU_PHYSX
+		detachStaticElementFilters(actor);
+#endif
 		ac.reinsertShapes();
+#if PX_SUPPORT_GPU_PHYSX
+		attachStaticElementFilters(actor);
+#endif
+	}
 
 	//Update pvd status
 	PvdDetachActorFromAggregate( this, &actor );
@@ -133,7 +118,7 @@ void NpAggregate::removeAndReinsert(PxActor& actor, bool reinsert)
 	NpActor& np = NpActor::getFromPxActor(actor);
 
 	np.setAggregate(NULL, actor);
-	
+
 	scRemoveActor(np, reinsert);
 }
 
@@ -296,8 +281,6 @@ bool NpAggregate::addActor(PxActor& actor, const PxBVH* bvh)
 
 	mNbShapes += numShapes;
 
-	OMNI_PVD_ADD(OMNI_PVD_CONTEXT_HANDLE, PxAggregate, actors, static_cast<PxAggregate&>(*this), actor);
-
 	// PT: when an object is added to a aggregate at runtime, i.e. when the aggregate has already been added to the scene,
 	// we need to immediately add the newcomer to the scene as well.
 	if(npScene)
@@ -315,6 +298,8 @@ bool NpAggregate::addActor(PxActor& actor, const PxBVH* bvh)
 			NpActor::getFromPxActor(actor).addConnector(NpConnectorType::eBvh, bvhMutable, "PxBVH already added to the PxActor!");
 		}
 	}
+	// Emit membership after scene insertion so the selection sees the actor's current scene.
+	OMNI_PVD_ADD(OMNI_PVD_CONTEXT_HANDLE, PxAggregate, actors, static_cast<PxAggregate&>(*this), actor);
 	return true;
 }
 
@@ -437,6 +422,14 @@ bool NpAggregate::addArticulation(PxArticulationReducedCoordinate& art)
 		NP_CHECK_SCENE_CUDA_ABORT_AND_SET_CORRUPTION(npScene)
 	}
 
+#if PX_SUPPORT_OMNI_PVD
+	// Emit membership after scene insertion so the selection sees each link's current scene.
+	for(PxU32 i=0; i<nbLinks; i++)
+	{
+		OMNI_PVD_ADD(OMNI_PVD_CONTEXT_HANDLE, PxAggregate, actors,
+			static_cast<PxAggregate&>(*this), static_cast<PxActor&>(*links[i]));
+	}
+#endif
 	return true;
 }
 
@@ -452,6 +445,7 @@ bool NpAggregate::removeArticulationAndReinsert(PxArticulationReducedCoordinate&
 			mNbShapes -= static_cast<NpArticulationLink*>(mActors[idx])->getNbShapes();
 			mActors[idx] = mActors[--mNbActors];
 			removeAndReinsert(*a, reinsert);
+			OMNI_PVD_REMOVE(OMNI_PVD_CONTEXT_HANDLE, PxAggregate, actors, static_cast<PxAggregate&>(*this), *a);
 			found = true;
 		}
 		else

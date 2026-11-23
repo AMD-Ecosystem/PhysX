@@ -1,21 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (c) 2019-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-// This include must come first
-// clang-format off
-#include "UsdPCH.h"
-// clang-format on
+/**
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-27 AC-29
+ *
+ * @implements REQ-PARSE-VEH-CONTROLLER-001
+ * @covers AC-1 AC-2
+ */
+
 #include "Vehicle.h"
 #include "LoadUsd.h"
 #include "PhysXTools.h"
 
-#include <common/foundation/TypeCast.h>
+#include <omni/physics/parse/KnownTokens.h>
+
 #include <common/utilities/Utilities.h>
 
 #include <carb/Types.h>
 #include <carb/logging/Log.h>
 
-using namespace PXR_NS;
 using namespace carb;
 
 namespace omni
@@ -26,22 +30,26 @@ namespace usdparser
 {
 
 // Source-read mirror of SafeGetAttribute (resolved value incl. schema fallback);
-// getValue's bool matches UsdAttribute::HasValue().
+// getValue's bool matches UsdAttribute::HasValue(). Takes an already-interned
+// TokenId (via KnownTokens) rather than a TfToken -- every call site here is a
+// schema-token-table lookup.
 template <typename T>
-static bool srcGet(const AttachedStage& as, omni::physics::parse::ObjectKey key, const TfToken& attr, T& out)
+static bool srcGet(const AttachedStage& as, omni::physics::parse::ObjectKey key, omni::physics::parse::TokenId attr, T& out)
 {
-    return omni::physx::internal::getValue(as, key, attr, UsdTimeCode::Default(), out);
+    return omni::physx::internal::getValue(as, key, attr, omni::physics::parse::ReadTime::defaultTime(), out);
 }
 
 // Source-read mirror of SafeGetAuthoredAttribute (authored-only).
+// A failed read is not a value. getValue leaves the output untouched, and
+// VehicleControllerDesc's deprecated floats are not initialized, so the caller
+// must take the absent-attribute path instead of warning on or storing that float.
 template <typename T>
-static bool srcGetAuthored(const AttachedStage& as, omni::physics::parse::ObjectKey key, const TfToken& attr, T& out)
+static bool srcGetAuthored(const AttachedStage& as, omni::physics::parse::ObjectKey key, omni::physics::parse::TokenId attr, T& out)
 {
     const omni::physics::parse::IPhysicsSource* src = as.getSource();
-    if (!src || !src->hasAuthoredAttribute(key, src->internToken(attr.GetString())))
+    if (!src || !src->hasAuthoredAttribute(key, attr))
         return false;
-    omni::physx::internal::getValue(as, key, attr, UsdTimeCode::Default(), out);
-    return true;
+    return omni::physx::internal::getValue(as, key, attr, omni::physics::parse::ReadTime::defaultTime(), out);
 }
 
 template <typename T>
@@ -102,15 +110,17 @@ VehicleComponentTracker::~VehicleComponentTracker()
 // read them through the source by ObjectKey.
 bool parseWheelController(AttachedStage& as, omni::physics::parse::ObjectKey key, WheelControllerDesc& out)
 {
-    const SdfPath path = as.pathFor(key);
-    out.path = path;
-    const std::string nameStr = path.GetName();
-    const char* primName = nameStr.c_str();
+    out.key = key;
+    // Diagnostics-only identity (ADR-0018): textFor avoids building a real SdfPath just to
+    // print the prim's path.
+    const char* primName = as.textFor(key);
 
-    if (!srcGet(as, key, PhysxSchemaTokens->physxVehicleWheelControllerDriveTorque, out.driveTorque))
+    const omni::physics::parse::KnownTokens& tok = as.getKnownTokens();
+
+    if (!srcGet(as, key, tok.physxVehicleWheelControllerDriveTorque, out.driveTorque))
         out.driveTorque = 0.0f;
 
-    if (srcGet(as, key, PhysxSchemaTokens->physxVehicleWheelControllerBrakeTorque, out.brakeTorque))
+    if (srcGet(as, key, tok.physxVehicleWheelControllerBrakeTorque, out.brakeTorque))
     {
         if (!checkParamInRange(out.brakeTorque, 0.0f, FLT_MAX, "brakeTorque", primName))
             return false;
@@ -118,7 +128,7 @@ bool parseWheelController(AttachedStage& as, omni::physics::parse::ObjectKey key
     else
         out.brakeTorque = 0.0f;
 
-    if (!srcGet(as, key, PhysxSchemaTokens->physxVehicleWheelControllerSteerAngle, out.steerAngle))
+    if (!srcGet(as, key, tok.physxVehicleWheelControllerSteerAngle, out.steerAngle))
         out.steerAngle = 0.0f;
 
     return true;
@@ -126,12 +136,28 @@ bool parseWheelController(AttachedStage& as, omni::physics::parse::ObjectKey key
 
 static constexpr uint32_t maxForwardGearCount = GearsDesc::maxNumberOfGears - 2;  // without reverse and neutral
 
+// A resolved 0 is the schema fallback and the same command as an unauthored
+// attribute. Ovstage reports every published value as authored (ADR-0020), so
+// warn only when the value is an actual input the user can migrate.
+static void warnDeprecatedControllerInput(const char* primName, const char* attrName, float value, const char* replacement)
+{
+    if (value != 0.0f)
+    {
+        CARB_LOG_WARN("Usd Physics: vehicle controller \"%s\": attribute \"%s\" is deprecated. "
+            "Please use %s instead.\n",
+            primName, attrName, replacement);
+    }
+}
+
 static bool parseVehicleController(AttachedStage& as, omni::physics::parse::ObjectKey key, VehicleControllerDesc& out)
 {
-    const std::string nameStr = as.pathFor(key).GetName();
-    const char* primName = nameStr.c_str();
+    // Diagnostics-only identity (ADR-0018): textFor avoids building a real SdfPath just to
+    // print the prim's path.
+    const char* primName = as.textFor(key);
 
-    if (srcGet(as, key, PhysxSchemaTokens->physxVehicleControllerAccelerator, out.accelerator))
+    const omni::physics::parse::KnownTokens& tok = as.getKnownTokens();
+
+    if (srcGet(as, key, tok.physxVehicleControllerAccelerator, out.accelerator))
     {
         if (!checkParamInRange(out.accelerator, 0.0f, 1.0f + FLT_EPSILON, "accelerator", primName))
             return false;
@@ -139,7 +165,7 @@ static bool parseVehicleController(AttachedStage& as, omni::physics::parse::Obje
     else
         out.accelerator = 0.0f;
 
-    if (srcGet(as, key, PhysxSchemaTokens->physxVehicleControllerBrake0, out.brake0))
+    if (srcGet(as, key, tok.physxVehicleControllerBrake0, out.brake0))
     {
         if (!checkParamInRange(out.brake0, 0.0f, 1.0f + FLT_EPSILON, "brake0", primName))
             return false;
@@ -147,7 +173,7 @@ static bool parseVehicleController(AttachedStage& as, omni::physics::parse::Obje
     else
         out.brake0 = 0.0f;
 
-    if (srcGet(as, key, PhysxSchemaTokens->physxVehicleControllerBrake1, out.brake1))
+    if (srcGet(as, key, tok.physxVehicleControllerBrake1, out.brake1))
     {
         if (!checkParamInRange(out.brake1, 0.0f, 1.0f + FLT_EPSILON, "brake1", primName))
             return false;
@@ -155,11 +181,9 @@ static bool parseVehicleController(AttachedStage& as, omni::physics::parse::Obje
     else
         out.brake1 = 0.0f;
 
-    if (srcGetAuthored(as, key, PhysxSchemaTokens->physxVehicleControllerBrake, out.brake))
+    if (srcGetAuthored(as, key, tok.physxVehicleControllerBrake, out.brake))
     {
-        CARB_LOG_WARN("Usd Physics: vehicle controller \"%s\": attribute \"brake\" is deprecated. "
-            "Please use brake0 or brake1 instead.\n",
-            primName);
+        warnDeprecatedControllerInput(primName, "brake", out.brake, "brake0 or brake1");
 
         if (!checkParamInRange(out.brake, 0.0f, 1.0f + FLT_EPSILON, "brake", primName))
             return false;
@@ -167,11 +191,9 @@ static bool parseVehicleController(AttachedStage& as, omni::physics::parse::Obje
     else
         out.brake = 0.0f;
 
-    if (srcGetAuthored(as, key, PhysxSchemaTokens->physxVehicleControllerHandbrake, out.handbrake))
+    if (srcGetAuthored(as, key, tok.physxVehicleControllerHandbrake, out.handbrake))
     {
-        CARB_LOG_WARN("Usd Physics: vehicle controller \"%s\": attribute \"handbrake\" is deprecated. "
-            "Please use brake0 or brake1 instead.\n",
-            primName);
+        warnDeprecatedControllerInput(primName, "handbrake", out.handbrake, "brake0 or brake1");
 
         if (!checkParamInRange(out.handbrake, 0.0f, 1.0f + FLT_EPSILON, "handbrake", primName))
             return false;
@@ -179,7 +201,7 @@ static bool parseVehicleController(AttachedStage& as, omni::physics::parse::Obje
     else
         out.handbrake = 0.0f;
 
-    if (srcGet(as, key, PhysxSchemaTokens->physxVehicleControllerSteer, out.steer))
+    if (srcGet(as, key, tok.physxVehicleControllerSteer, out.steer))
     {
         if (!checkParamInRange(out.steer, -1.0f, 1.0f + FLT_EPSILON, "steer", primName))
             return false;
@@ -187,11 +209,9 @@ static bool parseVehicleController(AttachedStage& as, omni::physics::parse::Obje
     else
         out.steer = 0.0f;
 
-    if (srcGetAuthored(as, key, PhysxSchemaTokens->physxVehicleControllerSteerLeft, out.steerLeft))
+    if (srcGetAuthored(as, key, tok.physxVehicleControllerSteerLeft, out.steerLeft))
     {
-        CARB_LOG_WARN("Usd Physics: vehicle controller \"%s\": attribute \"steerLeft\" is deprecated. "
-            "Please use steer instead.\n",
-            primName);
+        warnDeprecatedControllerInput(primName, "steerLeft", out.steerLeft, "steer");
 
         if (!checkParamInRange(out.steerLeft, 0.0f, 1.0f + FLT_EPSILON, "steerLeft", primName))
             return false;
@@ -199,11 +219,9 @@ static bool parseVehicleController(AttachedStage& as, omni::physics::parse::Obje
     else
         out.steerLeft = 0.0f;
 
-    if (srcGetAuthored(as, key, PhysxSchemaTokens->physxVehicleControllerSteerRight, out.steerRight))
+    if (srcGetAuthored(as, key, tok.physxVehicleControllerSteerRight, out.steerRight))
     {
-        CARB_LOG_WARN("Usd Physics: vehicle controller \"%s\": attribute \"steerRight\" is deprecated. "
-            "Please use steer instead.\n",
-            primName);
+        warnDeprecatedControllerInput(primName, "steerRight", out.steerRight, "steer");
 
         if (!checkParamInRange(out.steerRight, 0.0f, 1.0f + FLT_EPSILON, "steerRight", primName))
             return false;
@@ -211,7 +229,7 @@ static bool parseVehicleController(AttachedStage& as, omni::physics::parse::Obje
     else
         out.steerRight = 0.0f;
 
-    if (srcGet(as, key, PhysxSchemaTokens->physxVehicleControllerTargetGear, out.targetGear))
+    if (srcGet(as, key, tok.physxVehicleControllerTargetGear, out.targetGear))
     {
         if ((out.targetGear != VehicleControllerDesc::automaticGearValue) &&
             !checkParamInRange(out.targetGear, -1, static_cast<int>(maxForwardGearCount + 1),
@@ -228,10 +246,13 @@ static bool parseVehicleTankController(AttachedStage& as, omni::physics::parse::
 {
     if (parseVehicleController(as, key, out))
     {
-        const std::string nameStr = as.pathFor(key).GetName();
-        const char* primName = nameStr.c_str();
+        // Diagnostics-only identity (ADR-0018): textFor avoids building a real SdfPath just to
+        // print the prim's path.
+        const char* primName = as.textFor(key);
 
-        if (srcGet(as, key, PhysxSchemaTokens->physxVehicleTankControllerThrust0, out.thrust0))
+        const omni::physics::parse::KnownTokens& tok = as.getKnownTokens();
+
+        if (srcGet(as, key, tok.physxVehicleTankControllerThrust0, out.thrust0))
         {
             if (!checkParamInRange(out.thrust0, -1.0f, 1.0f + FLT_EPSILON, "thrust0", primName))
                 return false;
@@ -239,7 +260,7 @@ static bool parseVehicleTankController(AttachedStage& as, omni::physics::parse::
         else
             out.thrust0 = 0.0f;
 
-        if (srcGet(as, key, PhysxSchemaTokens->physxVehicleTankControllerThrust1, out.thrust1))
+        if (srcGet(as, key, tok.physxVehicleTankControllerThrust1, out.thrust1))
         {
             if (!checkParamInRange(out.thrust1, -1.0f, 1.0f + FLT_EPSILON, "thrust1", primName))
                 return false;
@@ -309,19 +330,25 @@ bool parseVehicle(AttachedStage& attachedStage,
     vehicleControllerType = eUndefined;
 
     const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
-    if (!src || !omni::physx::internal::hasAppliedSchema<PhysxSchemaPhysxVehicleAPI>(*src, vehicleKey))
+    if (!src)
         return false;
 
-    const SdfPath vehiclePath = attachedStage.pathFor(vehicleKey);
-    const std::string vehNameStr = vehiclePath.GetName();
-    const char* vehName = vehNameStr.c_str();
+    const omni::physics::parse::KnownTokens& tok = attachedStage.getKnownTokens();
 
-    if (!omni::physx::internal::hasAppliedSchema<UsdPhysicsRigidBodyAPI>(*src, vehicleKey))
+    if (!src->hasSchema(vehicleKey, tok.physxVehicleAPI))
+        return false;
+
+    // Diagnostic prints the full path text now (textFor), not just the prim's leaf
+    // name (SdfPath::GetName()) as before -- no leaf-name accessor exists for a
+    // bare ObjectKey; the message content is otherwise unchanged.
+    const char* vehName = attachedStage.textFor(vehicleKey);
+
+    if (!src->hasSchema(vehicleKey, tok.physicsRigidBodyAPI))
     {
         CARB_LOG_ERROR("Usd Physics: vehicle \"%s\" needs to have RigidBodyAPI applied.\n", vehName);
         return false;
     }
-    if (!src->isA(vehicleKey, omni::physx::internal::schemaTypeToken<UsdGeomXformable>(*src)))
+    if (!src->isA(vehicleKey, tok.xformableType))
     {
         CARB_LOG_ERROR("Usd Physics: vehicle \"%s\" needs to be a UsdGeomXformable.\n", vehName);
         return false;
@@ -329,7 +356,7 @@ bool parseVehicle(AttachedStage& attachedStage,
 
     // Walker-side pre-pop is the only path that fills VehicleDesc. A side-table
     // miss means processScannedDescs:vehicle dropped this prim (already logged).
-    auto vehicleByPathIt = vehicleComponentTracker.mVehicleByPath.find(vehiclePath);
+    auto vehicleByPathIt = vehicleComponentTracker.mVehicleByPath.find(vehicleKey);
     if (vehicleByPathIt == vehicleComponentTracker.mVehicleByPath.end())
         return false;
 
@@ -363,7 +390,7 @@ bool parseVehicle(AttachedStage& attachedStage,
     bool isValid = true;
 
     bool rigidBodyEnabled = true;
-    srcGet(attachedStage, vehicleKey, UsdPhysicsTokens->physicsRigidBodyEnabled, rigidBodyEnabled);
+    srcGet(attachedStage, vehicleKey, tok.physicsRigidBodyEnabled, rigidBodyEnabled);
     if (!rigidBodyEnabled)
     {
         CARB_LOG_ERROR("Usd Physics: vehicle \"%s\": the attribute \"rigidBodyEnabled\" of RigidBodyAPI is false "
@@ -372,7 +399,7 @@ bool parseVehicle(AttachedStage& attachedStage,
     }
 
     bool kinematicEnabled = false;
-    srcGet(attachedStage, vehicleKey, UsdPhysicsTokens->physicsKinematicEnabled, kinematicEnabled);
+    srcGet(attachedStage, vehicleKey, tok.physicsKinematicEnabled, kinematicEnabled);
     if (kinematicEnabled && vehicleDesc.enabled)
     {
         CARB_LOG_ERROR("Usd Physics: vehicle \"%s\": the attribute \"kinematicEnabled\" of RigidBodyAPI is true. "
@@ -389,14 +416,14 @@ bool parseVehicle(AttachedStage& attachedStage,
     uint32_t encounteredAttachmentIndices = 0;
 
     // Wheel attachments via the scanned per-vehicle association (no GetDescendants).
-    auto attIt = vehicleComponentTracker.mVehicleWheelAttachments.find(vehiclePath);
+    auto attIt = vehicleComponentTracker.mVehicleWheelAttachments.find(vehicleKey);
     if (attIt != vehicleComponentTracker.mVehicleWheelAttachments.end())
     {
-        for (const SdfPath& attachPath : attIt->second)
+        for (const omni::physics::parse::ObjectKey attachKey : attIt->second)
         {
             if (nbWheels < VehicleDesc::maxNumberOfWheels)
             {
-                auto waIt = vehicleComponentTracker.mWheelAttachmentByPath.find(attachPath);
+                auto waIt = vehicleComponentTracker.mWheelAttachmentByPath.find(attachKey);
                 if (waIt != vehicleComponentTracker.mWheelAttachmentByPath.end())
                 {
                     WheelAttachmentDesc wheelAttachment = *waIt->second;  // pre-popped from scan
@@ -422,16 +449,17 @@ bool parseVehicle(AttachedStage& attachedStage,
 
                     if ((!isScaleUniform) && (!toPhysXQuat(wheelAttachment.suspensionFrameOrientation).isIdentity()))
                     {
+                        // Diagnostic prints the full path text (textFor), not just the leaf
+                        // name -- see the vehName comment above.
                         CARB_LOG_WARN("Usd Physics: vehicle \"%s\", wheel attachment \"%s\": ScaleOrientation in suspension frame is not supported. "
                             "You may ignore this if the vehicle frame scale is close to uniform.\n",
-                            vehName, attachPath.GetName().c_str());
+                            vehName, attachedStage.textFor(attachKey));
                         isValid = false;
                     }
 
                     vehicleDesc.wheelAttachments.push_back(wheelAttachment);
 
-                    const omni::physics::parse::ObjectKey attachKey = attachedStage.keyFor(attachPath);
-                    if (omni::physx::internal::hasAppliedSchema<PhysxSchemaPhysxVehicleWheelControllerAPI>(*src, attachKey))
+                    if (src->hasSchema(attachKey, tok.physxVehicleWheelControllerAPI))
                     {
                         if (!vehicleDesc.drive)
                         {
@@ -446,7 +474,7 @@ bool parseVehicle(AttachedStage& attachedStage,
                             CARB_LOG_ERROR(
                                 "Usd Physics: vehicle \"%s\" has a drive specified but wheel attachment \"%s\" has "
                                 "PhysxVehicleWheelControllerAPI applied. This is an illegal configuration.\n",
-                                vehName, attachPath.GetName().c_str());
+                                vehName, attachedStage.textFor(attachKey));
                             isValid = false;
                         }
                     }
@@ -587,12 +615,12 @@ bool parseVehicle(AttachedStage& attachedStage,
         }
     }
 
-    if (isValid && omni::physx::internal::hasAppliedSchema<PhysxSchemaPhysxVehicleControllerAPI>(*src, vehicleKey))
+    if (isValid && src->hasSchema(vehicleKey, tok.physxVehicleControllerAPI))
     {
         if (!vehicleDesc.wheelControllers.size())
         {
             bool controllerParseSuccess;
-            if (!omni::physx::internal::hasAppliedSchema<PhysxSchemaPhysxVehicleTankControllerAPI>(*src, vehicleKey))
+            if (!src->hasSchema(vehicleKey, tok.physxVehicleTankControllerAPI))
             {
                 vehicleControllerType = eVehicleControllerStandard;
                 controllerParseSuccess = parseVehicleController(attachedStage, vehicleKey, vehicleControllerDesc);

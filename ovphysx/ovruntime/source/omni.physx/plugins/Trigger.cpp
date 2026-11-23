@@ -1,16 +1,30 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
-#include <common/utilities/SdfPathEncoding.h>
+// @implements REQ-EVENT-QUEUE-001
+// @covers AC-2 AC-4
 
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1 AC-2 AC-4
+
+// @implements REQ-ATTACH-LIFETIME-001
+// @covers AC-3 AC-4
+
+/**
+ * @implements REQ-ATTACH-RESOLVE-001
+ * @covers AC-12
+ */
 
 #include "Trigger.h"
 #include "Setup.h"
 #include "OmniPhysX.h"
 
 #include "internal/InternalScene.h"
+#include "internal/InternalActor.h"
 #include "usdLoad/AttachedStage.h"
+#include "usdLoad/LoadUsd.h"
+
+#include <omni/physics/parse/IPhysicsDataWrite.h>
 
 #include <carb/logging/Log.h>
 #include <carb/tokens/ITokens.h>
@@ -19,7 +33,6 @@
 
 #include <iostream>
 
-using namespace PXR_NS;
 using namespace physx;
 using namespace omni::physx::internal;
 using namespace omni::physx::usdparser;
@@ -29,6 +42,15 @@ namespace omni
 namespace physx
 {
 
+namespace
+{
+uint32_t triggerInstanceIndex(const InternalDatabase::Record* record)
+{
+    return record && (record->mType == ePTActor || record->mType == ePTLink) && record->mInternalPtr ?
+        static_cast<const InternalActor*>(record->mInternalPtr)->mInstanceIndex : UINT32_MAX;
+}
+}
+
 TriggerManager::TriggerManager()
 {
     carb::Framework* framework = carb::getFramework();
@@ -36,14 +58,12 @@ TriggerManager::TriggerManager()
 
 void TriggerManager::release()
 {
-    clearTriggers();
     mTriggerSubscriptions.clear();
-    mTriggerSubscriptionsMap.clear();
 }
 
-void TriggerManager::onTriggerEnterEvent(const usdparser::AttachedStage& attachedStage, const ::physx::PxShape* triggerShape, const ::physx::PxShape* otherShape)
+void TriggerManager::onTriggerEnterEvent(const usdparser::AttachedStage& attachedStage, const ::physx::PxShape* triggerShape, const ::physx::PxShape* otherShape, uint64_t triggerActorId, uint64_t otherActorId)
 {
-    const InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    const InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType triggerType = ePTRemoved;
     const InternalDatabase::Record* triggerRecord = db.getFullRecord(triggerType, (ObjectId)triggerShape->userData);
@@ -56,43 +76,49 @@ void TriggerManager::onTriggerEnterEvent(const usdparser::AttachedStage& attache
     if (!(otherRecord && (otherType == ePTShape || otherType == ePTCompoundShape)))
         return;
     
-    processTriggerStateApiEnterEvent(attachedStage.pathFor(triggerRecord->mKey), attachedStage.pathFor(otherRecord->mKey), otherShape);
-    if (triggerShape->getActor() && otherShape->getActor()
-        && (size_t)triggerShape->getActor()->userData < db.getRecords().size()
-        && (size_t)otherShape->getActor()->userData < db.getRecords().size())
+    processTriggerStateApiEnterEvent(attachedStage, triggerRecord->mKey, otherRecord->mKey, otherShape);
+    // Shared point-instancer shapes have no unique getActor(). Use the actor
+    // record identities captured from PxTriggerPair at callback production.
+    if (!triggerActorId && triggerShape->getActor()) triggerActorId = uint64_t(triggerShape->getActor()->userData);
+    if (!otherActorId && otherShape->getActor()) otherActorId = uint64_t(otherShape->getActor()->userData);
+    if (triggerActorId && otherActorId && triggerActorId < db.getRecords().size() && otherActorId < db.getRecords().size())
     {
-        const InternalDatabase::Record& triggerBodyRecord = db.getRecords()[(size_t)triggerShape->getActor()->userData];
-        const InternalDatabase::Record& otherBodyRecord = db.getRecords()[(size_t)otherShape->getActor()->userData];
-        processNativeEvent(attachedStage, attachedStage.pathFor(triggerRecord->mKey), attachedStage.pathFor(otherRecord->mKey), TriggerEventType::eTRIGGER_ON_ENTER,
-            attachedStage.pathFor(triggerBodyRecord.mKey), attachedStage.pathFor(otherBodyRecord.mKey));
+        const omni::physx::internal::InternalDatabase::Record & triggerBodyRecord = db.getRecords()[triggerActorId];
+        const omni::physx::internal::InternalDatabase::Record & otherBodyRecord = db.getRecords()[otherActorId];
+        processNativeEvent(attachedStage, triggerRecord->mKey, otherRecord->mKey, TriggerEventType::eTRIGGER_ON_ENTER,
+            triggerBodyRecord.mKey, otherBodyRecord.mKey,
+            triggerInstanceIndex(&triggerBodyRecord), triggerInstanceIndex(&otherBodyRecord));
     }
 }
 
-void TriggerManager::processTriggerStateApiEnterEvent(const PXR_NS::SdfPath& triggerPath, const PXR_NS::SdfPath& otherPath, const ::physx::PxShape* otherShape)
+void TriggerManager::processTriggerStateApiEnterEvent(const usdparser::AttachedStage& attachedStage,
+                                                      omni::physics::parse::ObjectKey triggerKey,
+                                                      omni::physics::parse::ObjectKey otherKey,
+                                                      const ::physx::PxShape* otherShape)
 {
-    TriggerUsdOutputMap::iterator fit = mTriggerOutputMap.find(triggerPath);
-    if (fit != mTriggerOutputMap.end())
+    (void)attachedStage;
+    TriggerUsdOutputMap::iterator fit = attachedStage.getTriggerState().output.find(triggerKey);
+    if (fit != attachedStage.getTriggerState().output.end())
     {
-        const PXR_NS::SdfPath collisionPath = otherPath;
         UsdOutput& usdOutput = fit->second;
         usdOutput.dirty = true;
-        TriggerCollisionMap::const_iterator fit = usdOutput.triggerCollisionmap.find(collisionPath);
+        TriggerCollisionMap::const_iterator fit = usdOutput.triggerCollisionmap.find(otherKey);
         if (fit == usdOutput.triggerCollisionmap.end())
-        {            
-            usdOutput.triggerCollisionmap.insert(std::make_pair(collisionPath, std::make_pair(otherShape, usdOutput.triggeredCollisions.size())));
-            usdOutput.triggeredCollisions.push_back(collisionPath);
+        {
+            usdOutput.triggerCollisionmap.insert(std::make_pair(otherKey, std::make_pair(otherShape, usdOutput.triggeredCollisions.size())));
+            usdOutput.triggeredCollisions.push_back(otherKey);
         }
         else
         {
             // another one for the compound shape
-            usdOutput.triggerCollisionmap.insert(std::make_pair(collisionPath, std::make_pair(otherShape, fit->second.second)));
+            usdOutput.triggerCollisionmap.insert(std::make_pair(otherKey, std::make_pair(otherShape, fit->second.second)));
         }
     }
 }
 
-void TriggerManager::onTriggerLeaveEvent(const usdparser::AttachedStage& attachedStage, const ::physx::PxShape* triggerShape, const ::physx::PxShape* otherShape)
+void TriggerManager::onTriggerLeaveEvent(const usdparser::AttachedStage& attachedStage, const ::physx::PxShape* triggerShape, const ::physx::PxShape* otherShape, uint64_t triggerActorId, uint64_t otherActorId)
 {
-    const InternalPhysXDatabase& db = OmniPhysX::getInstance().getInternalPhysXDatabase();
+    const InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType triggerType = ePTRemoved;
     const InternalDatabase::Record* triggerRecord = db.getFullRecord(triggerType, (ObjectId)triggerShape->userData);
@@ -105,38 +131,43 @@ void TriggerManager::onTriggerLeaveEvent(const usdparser::AttachedStage& attache
     if (!(otherRecord && (otherType == ePTShape || otherType == ePTCompoundShape || otherType == ePTRemoved)))
         return;
     
-    processTriggerStateApiLeaveEvent(attachedStage.pathFor(triggerRecord->mKey), attachedStage.pathFor(otherRecord->mKey), otherShape);
+    processTriggerStateApiLeaveEvent(attachedStage, triggerRecord->mKey, otherRecord->mKey, otherShape);
 
+    if (!triggerActorId && triggerShape->getActor()) triggerActorId = uint64_t(triggerShape->getActor()->userData);
     PhysXType triggerBodyType = ePTRemoved;
     const InternalDatabase::Record* triggerBodyRecord =
-        db.getFullRecord(triggerBodyType, (ObjectId)triggerShape->getActor()->userData);
-    if (!(triggerBodyRecord && (triggerBodyType == ePTActor)))
+        db.getFullRecord(triggerBodyType, triggerActorId);
+    if (!(triggerBodyRecord && (triggerBodyType == ePTActor || triggerBodyType == ePTLink)))
         return;
     const InternalDatabase::Record* otherBodyRecord = nullptr;
     PhysXType otherBodyType = ePTRemoved;
     if (otherType != ePTRemoved)
     {
-        otherBodyRecord = db.getFullRecord(otherBodyType, (ObjectId)otherShape->getActor()->userData);
-        if (!(otherBodyRecord && (otherBodyType == ePTActor)))
+        if (!otherActorId && otherShape->getActor()) otherActorId = uint64_t(otherShape->getActor()->userData);
+        otherBodyRecord = db.getFullRecord(otherBodyType, otherActorId);
+        if (!(otherBodyRecord && (otherBodyType == ePTActor || otherBodyType == ePTLink)))
             return;
     }
-    processNativeEvent(attachedStage, attachedStage.pathFor(triggerRecord->mKey), attachedStage.pathFor(otherRecord->mKey), TriggerEventType::eTRIGGER_ON_LEAVE,
-        attachedStage.pathFor(triggerBodyRecord->mKey),
-                       otherBodyRecord ? attachedStage.pathFor(otherBodyRecord->mKey) : SdfPath());
+    processNativeEvent(attachedStage, triggerRecord->mKey, otherRecord->mKey, TriggerEventType::eTRIGGER_ON_LEAVE,
+        triggerBodyRecord->mKey, otherBodyRecord ? otherBodyRecord->mKey : omni::physics::parse::ObjectKey{},
+        triggerInstanceIndex(triggerBodyRecord), triggerInstanceIndex(otherBodyRecord));
 }
 
-void TriggerManager::processTriggerStateApiLeaveEvent(const PXR_NS::SdfPath& triggerPath, const PXR_NS::SdfPath& otherPath, const ::physx::PxShape* otherShape)
+void TriggerManager::processTriggerStateApiLeaveEvent(const usdparser::AttachedStage& attachedStage,
+                                                      omni::physics::parse::ObjectKey triggerKey,
+                                                      omni::physics::parse::ObjectKey otherKey,
+                                                      const ::physx::PxShape* otherShape)
 {
-    TriggerUsdOutputMap::iterator fit = mTriggerOutputMap.find(triggerPath);
-    if (fit != mTriggerOutputMap.end())
+    (void)attachedStage;
+    TriggerUsdOutputMap::iterator fit = attachedStage.getTriggerState().output.find(triggerKey);
+    if (fit != attachedStage.getTriggerState().output.end())
     {
-        const PXR_NS::SdfPath collisionPath = otherPath;
         UsdOutput& usdOutput = fit->second;
         usdOutput.dirty = true;
-        TriggerCollisionMap::iterator cf = usdOutput.triggerCollisionmap.find(collisionPath);
+        TriggerCollisionMap::iterator cf = usdOutput.triggerCollisionmap.find(otherKey);
         size_t pathIndex = 0;
         bool indexFound = false;
-        while (cf != usdOutput.triggerCollisionmap.end() && cf->first == collisionPath)
+        while (cf != usdOutput.triggerCollisionmap.end() && cf->first == otherKey)
         {
             if (cf->second.first == otherShape)
             {
@@ -151,68 +182,74 @@ void TriggerManager::processTriggerStateApiLeaveEvent(const PXR_NS::SdfPath& tri
         // check if all shapes are gone (can be same path for convex decomposion)
         if (indexFound)
         {
-            cf = usdOutput.triggerCollisionmap.find(collisionPath);
+            cf = usdOutput.triggerCollisionmap.find(otherKey);
             if (cf == usdOutput.triggerCollisionmap.end())
             {
                 usdOutput.triggeredCollisions[pathIndex] = usdOutput.triggeredCollisions.back();
                 usdOutput.triggeredCollisions.pop_back();
                 if (!usdOutput.triggeredCollisions.empty())
                 {
-                    const SdfPath& movedPath = usdOutput.triggeredCollisions[pathIndex];
-                    TriggerCollisionMap::iterator cfb = usdOutput.triggerCollisionmap.find(movedPath);
-                    while (cfb != usdOutput.triggerCollisionmap.end() && cfb->first == movedPath)
+                    // The moved-in entry IS the ObjectKey it was filed under in
+                    // triggerCollisionmap -- no path round-trip needed to find it.
+                    const omni::physics::parse::ObjectKey movedKey = usdOutput.triggeredCollisions[pathIndex];
+                    TriggerCollisionMap::iterator cfb = usdOutput.triggerCollisionmap.find(movedKey);
+                    while (cfb != usdOutput.triggerCollisionmap.end() && cfb->first == movedKey)
                     {
                         cfb->second.second = pathIndex;
                         cfb++;
-                    }                    
+                    }
                 }
             }
         }
     }
 }
 
-void TriggerManager::bufferTriggerEvent(const ::physx::PxShape* triggerShape, const ::physx::PxShape* otherShape, TriggerEventType::Enum triggerEvent)
+void TriggerManager::bufferTriggerEvent(const usdparser::AttachedStage& attachedStage, const ::physx::PxShape* triggerShape, const ::physx::PxShape* otherShape, TriggerEventType::Enum triggerEvent, uint64_t triggerActorId, uint64_t otherActorId)
 {
-    mInvokedTriggers.push_back({ triggerShape, otherShape, triggerEvent });
+    attachedStage.getTriggerState().invoked.push_back({ triggerShape, otherShape, triggerEvent, triggerActorId, otherActorId });
 }
 
-void TriggerManager::clearBufferedShape(const ::physx::PxShape* shape)
+void TriggerManager::clearBufferedShape(const usdparser::AttachedStage& attachedStage, const ::physx::PxShape* shape)
 {
-    for (size_t i = mInvokedTriggers.size(); i-- ;)
+    for (size_t i = attachedStage.getTriggerState().invoked.size(); i-- ;)
     {
-        const InvokedTrigger& tr = mInvokedTriggers[i];
+        const InvokedTrigger& tr = attachedStage.getTriggerState().invoked[i];
         if (tr.mTriggerShape == shape || tr.mOtherShape == shape)
         {
-            mInvokedTriggers[i] = mInvokedTriggers.back();
-            mInvokedTriggers.pop_back();
+            attachedStage.getTriggerState().invoked[i] = attachedStage.getTriggerState().invoked.back();
+            attachedStage.getTriggerState().invoked.pop_back();
         }
     }
 }
 
 void TriggerManager::fireTriggerEvents(const usdparser::AttachedStage& attachedStage)
 {
-    for (size_t i = 0; i < mInvokedTriggers.size(); i++)
+    for (size_t i = 0; i < attachedStage.getTriggerState().invoked.size(); i++)
     {
-        const InvokedTrigger& trigger = mInvokedTriggers[i];
+        const InvokedTrigger& trigger = attachedStage.getTriggerState().invoked[i];
         if (trigger.mTriggerEvent == TriggerEventType::eTRIGGER_ON_ENTER)
         {
-            onTriggerEnterEvent(attachedStage, trigger.mTriggerShape, trigger.mOtherShape);
+            onTriggerEnterEvent(attachedStage, trigger.mTriggerShape, trigger.mOtherShape, trigger.mTriggerActorId, trigger.mOtherActorId);
         }
         else if(trigger.mTriggerEvent == TriggerEventType::eTRIGGER_ON_LEAVE)
         {
-            onTriggerLeaveEvent(attachedStage, trigger.mTriggerShape, trigger.mOtherShape);
+            onTriggerLeaveEvent(attachedStage, trigger.mTriggerShape, trigger.mOtherShape, trigger.mTriggerActorId, trigger.mOtherActorId);
         }
     }
-    mInvokedTriggers.clear();
+    attachedStage.getTriggerState().invoked.clear();
 
-    for (TriggerUsdOutputMap::reference ref : mTriggerOutputMap)
+    // The attachment owns the mutable output sink; this callback only holds a const owner reference.
+    omni::physics::parse::IPhysicsDataWrite* dataWrite =
+        const_cast<omni::physics::parse::IPhysicsDataWrite*>(attachedStage.getDataWrite());
+    for (TriggerUsdOutputMap::reference ref : attachedStage.getTriggerState().output)
     {
         UsdOutput& usdOutput = ref.second;
         if (usdOutput.dirty)
         {
-            if (usdOutput.triggerStateAPI)
+            if (usdOutput.eligible && dataWrite)
             {
-                usdOutput.triggerStateAPI.GetTriggeredCollisionsRel().SetTargets(usdOutput.triggeredCollisions);
+                dataWrite->writeTriggerCollisions(
+                    ref.first, usdOutput.triggeredCollisions.data(), usdOutput.triggeredCollisions.size());
             }
             usdOutput.dirty = false;
         }
@@ -220,123 +257,88 @@ void TriggerManager::fireTriggerEvents(const usdparser::AttachedStage& attachedS
 }
 
 
-void TriggerManager::preloadTrigger(const PXR_NS::UsdPrim& triggerPrim, bool usdOutput)
+void TriggerManager::preloadTrigger(const usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey triggerKey, bool usdOutput)
 {
-    if (usdOutput)
-    {
-        UsdOutput usdOutput;
-        usdOutput.dirty = false;
-        usdOutput.triggerStateAPI =
-            PhysxSchemaPhysxTriggerStateAPI::Get(triggerPrim.GetStage(), triggerPrim.GetPrimPath());
-        mTriggerOutputMap[triggerPrim.GetPrimPath()] = usdOutput;
-    }
-}
-
-void TriggerManager::clearTriggers()
-{
-    mInvokedTriggers.clear();
-
-    for (TriggerUsdOutputMap::reference ref : mTriggerOutputMap)
-    {
-        UsdOutput& usdOutput = ref.second;
-        if (usdOutput.triggerStateAPI)
-        {
-            usdOutput.triggerStateAPI.GetTriggeredCollisionsRel().ClearTargets(true);
-        }
-    }
-
-    mTriggerOutputMap.clear();
-}
-
-omni::physx::SubscriptionId TriggerManager::registerNativeCallback(TriggerSubscriptionEntry triggerSubscription)
-{
-    omni::physx::SubscriptionId subId = mTriggerSubscriptions.addEvent(triggerSubscription);
-    PXR_NS::SdfPath triggerPrimPath = omni::physx::intToSdfPath(triggerSubscription.triggerColliderPrimId);
-    mTriggerSubscriptionsMap.insert(std::make_pair(triggerPrimPath, subId));
-    return subId;
-}
-
-void TriggerManager::unregisterNativeCallback(omni::physx::SubscriptionId subscriptionID)
-{
-    auto it = mTriggerSubscriptions.map.find(subscriptionID);
-    if(it == mTriggerSubscriptions.map.end())
+    if (!usdOutput)
         return;
-    TriggerSubscriptionEntry triggerSubscription = it->second;
-    PXR_NS::SdfPath triggerPrimPath = omni::physx::intToSdfPath(triggerSubscription.triggerColliderPrimId);
-    mTriggerSubscriptions.removeEvent(subscriptionID);
-    for (auto it = mTriggerSubscriptionsMap.begin(); it != mTriggerSubscriptionsMap.end(); ++it)
+
+    UsdOutput usdOutputEntry;
+    usdOutputEntry.dirty = false;
+    if (omni::physics::parse::IPhysicsDataWrite* dataWrite =
+            const_cast<omni::physics::parse::IPhysicsDataWrite*>(attachedStage.getDataWrite()))
+        dataWrite->prepareTriggerWrite(&triggerKey, 1, &usdOutputEntry.eligible);
+    attachedStage.getTriggerState().output[triggerKey] = usdOutputEntry;
+}
+
+void TriggerManager::clearTriggers(const usdparser::AttachedStage& attachedStage)
+{
+    attachedStage.getTriggerState().invoked.clear();
+
+    omni::physics::parse::IPhysicsDataWrite* dataWrite =
+        const_cast<omni::physics::parse::IPhysicsDataWrite*>(attachedStage.getDataWrite());
+    if (dataWrite)
     {
-        if (it->second == subscriptionID)
+        for (TriggerUsdOutputMap::reference ref : attachedStage.getTriggerState().output)
         {
-            mTriggerSubscriptionsMap.erase(it);
-            break;
+            if (ref.second.eligible)
+                dataWrite->releaseTriggerWrite(&ref.first, 1);
         }
     }
+
+    attachedStage.getTriggerState().output.clear();
+}
+
+omni::physx::SubscriptionId TriggerManager::registerNativeCallback(TriggerSubscriptionEntry subscription)
+{
+    return mTriggerSubscriptions.addEvent(subscription);
+}
+
+void TriggerManager::unregisterNativeCallback(omni::physx::SubscriptionId id)
+{
+    mTriggerSubscriptions.removeEvent(id);
+}
+
+void TriggerManager::retireSubscriptions(AttachHandle attach)
+{
+    mTriggerSubscriptions.removeIf([attach](const TriggerSubscriptionEntry& subscription) {
+        return subscription.attachHandle == attach;
+    });
 }
 
 void TriggerManager::processNativeEvent(const usdparser::AttachedStage& attachedStage,
-                                        const PXR_NS::SdfPath& triggerColliderPath,
-                                        const PXR_NS::SdfPath& otherColliderPath,
+                                        omni::physics::parse::ObjectKey triggerColliderKey,
+                                        omni::physics::parse::ObjectKey otherColliderKey,
                                         TriggerEventType::Enum eventType,
-                                        const PXR_NS::SdfPath& triggerBodyPath, 
-                                        const PXR_NS::SdfPath& otherBodyPath)
+                                        omni::physics::parse::ObjectKey triggerBodyKey,
+                                        omni::physics::parse::ObjectKey otherBodyKey,
+                                        uint32_t triggerInstance, uint32_t otherInstance)
 {
-    const uint64_t stageId = attachedStage.getStageId();
+    const AttachHandle attachHandle = attachedStage.getAttachHandle();
     TriggerEventData triggerData;
-    triggerData.stageId = stageId;
-    triggerData.triggerColliderPrimId = omni::physx::sdfPathToInt(triggerColliderPath);
-    triggerData.otherColliderPrimId = omni::physx::sdfPathToInt(otherColliderPath);
-    triggerData.triggerBodyPrimId = omni::physx::sdfPathToInt(triggerBodyPath);
-    triggerData.otherBodyPrimId = omni::physx::sdfPathToInt(otherBodyPath);
+    triggerData.attachHandle = attachHandle;
+    triggerData.triggerColliderPrimKey = triggerColliderKey;
+    triggerData.otherColliderPrimKey = otherColliderKey;
+    triggerData.triggerBodyPrimKey = triggerBodyKey;
+    triggerData.otherBodyPrimKey = otherBodyKey;
     triggerData.eventType = eventType;
 
-    // 1. Report the trigger pair for all subscription that have explicitly been watching this specific path
-    // Need to use equal_range instead of find to get all subscriptions for a given USD path (potentially > 1)
-    auto triggerColliderSubscriptions = mTriggerSubscriptionsMap.equal_range(triggerColliderPath);
-    for (auto it = triggerColliderSubscriptions.first; it != triggerColliderSubscriptions.second; ++it)
+    RuntimeCallbackScope callbackScope;
+    // Snapshot matching keys only, preserving collider/body/wildcard order.
+    const omni::physics::parse::ObjectKey filters[] = { triggerColliderKey, triggerBodyKey, {} };
+    const auto snapshot = mTriggerSubscriptions.snapshot(attachHandle, filters, 3);
+    for (const auto& entry : snapshot)
     {
-        omni::physx::SubscriptionId subId = it->second;
-        const TriggerSubscriptionEntry& subscription = mTriggerSubscriptions.map.at(subId);
-        // stageId == 0 means trigger is reported no matter what the stageId is
-        // stageId != 0 means it should match the stageId that was registered in the callback
-        if (subscription.stageId == 0 || subscription.stageId == stageId)
+        if (!mTriggerSubscriptions.contains(entry.first))
+            continue;
+        const TriggerSubscriptionEntry& subscription = entry.second;
+        triggerData.subscriptionId = entry.first;
+        try
         {
-            triggerData.subscriptionId = subId;
-            subscription.reportFn(&triggerData, subscription.userData);
+            if (subscription.detailedReport) subscription.detailedReport(&triggerData, triggerInstance, otherInstance);
+            else if (subscription.reportFn) subscription.reportFn(&triggerData, subscription.userData);
         }
-    }
-
-    // 2. If body and collider are not at the same USD path, check if we have listeners listening for body path
-    if(triggerColliderPath != triggerBodyPath)
-    {
-        auto triggerBodySubscription = mTriggerSubscriptionsMap.equal_range(triggerBodyPath);
-        for (auto it = triggerBodySubscription.first; it != triggerBodySubscription.second; ++it)
-        {
-            omni::physx::SubscriptionId subId = it->second;
-            const TriggerSubscriptionEntry& subscription = mTriggerSubscriptions.map.at(subId);
-            // stageId == 0 means trigger is reported no matter what the stageId is
-            // stageId != 0 means it should match the stageId that was registered in the callback
-            if (subscription.stageId == 0 || subscription.stageId == stageId)
-            {
-                triggerData.subscriptionId = subId;
-                subscription.reportFn(&triggerData, subscription.userData);
-            }
-        }
-    }
-
-    // 3. Report the trigger for all subs that have not indicated a specific path to listen for
-    auto allSubscriptionForEmptyPath = mTriggerSubscriptionsMap.equal_range(PXR_NS::SdfPath());
-    for (auto it = allSubscriptionForEmptyPath.first; it != allSubscriptionForEmptyPath.second; ++it)
-    {
-        omni::physx::SubscriptionId subId = it->second;
-        const TriggerSubscriptionEntry& subscription = mTriggerSubscriptions.map.at(subId);
-        // stageId == 0 means trigger is reported no matter what the stageId is
-        // stageId != 0 means it should match the stageId that was registered in the callback
-        if (subscription.stageId == 0 || subscription.stageId == stageId)
-        {
-            triggerData.subscriptionId = subId;
-            subscription.reportFn(&triggerData, subscription.userData);
-        }
+        catch (const std::exception& e) { CARB_LOG_ERROR("Physics trigger callback threw: %s", e.what()); }
+        catch (...) { CARB_LOG_ERROR("Physics trigger callback threw an unknown exception"); }
     }
 }
 

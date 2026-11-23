@@ -1,8 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1 AC-2
+
+/**
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-20 AC-22
+ */
 
 #pragma once
 
+#include <omni/physics/AttachHandle.h>
 #include <internal/Internal.h>
 #include "foundation/PxTransform.h"
 
@@ -121,11 +130,11 @@ void overlapTetMeshTriMeshAny(int32_t*& tetIds,
                               const uint32_t triIndicesSize,
                               const float overlapOffset,
                               void* (*allocateBytes)(size_t));
-void getClosestPoints(carb::Float3* closestPoints,
+void getClosestPoints(omni::physics::AttachHandle attach, carb::Float3* closestPoints,
                       float* dists,
                       const carb::Float3* points,
                       const uint32_t pointsSize,
-                      const PXR_NS::SdfPath& rigidPath);
+                      omni::physics::parse::ObjectKey rigidKey);
 const carb::Float3* getPoints(uint32_t& pointsSize, uint32_t& pointsByteStride, const uint64_t tetFinder);
 const uint32_t* getIndices(uint32_t& indicesSize, const uint64_t tetFinder);
 

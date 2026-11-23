@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "foundation/PxPreprocessor.h"
 
@@ -119,6 +96,9 @@ void Sc::DeformableVolumeCore::setSolverIterationCounts(const PxU16 c)
 {
 	mCore.solverIterationCounts = c;
 	mCore.dirty = true;
+	Sc::DeformableVolumeSim* sim = getSim();
+	if (sim)
+		sim->getScene().setDynamicsDirty();
 }
 
 void Sc::DeformableVolumeCore::setSleepThreshold(const PxReal v)
@@ -190,137 +170,114 @@ PxU32 Sc::DeformableVolumeCore::getGpuIndex() const
 	return sim ? sim->getGpuIndex() : 0xffffffff;
 }
 
-PxU32 Sc::DeformableVolumeCore::addRigidAttachment(Sc::BodyCore* core, PxU32 particleId, const PxVec3& actorSpacePose, bool doConversion)
+PxU32 Sc::DeformableVolumeCore::addRigidAttachments(Sc::BodyCore* core, PxDeformableAttachmentTargetType::Enum feature,
+	const PxU32* indices, const PxVec4* barycentrics, const PxTransform& frame, const PxVec4* coords, PxU32 count)
 {
 	Sc::DeformableVolumeSim* sim = getSim();
-	PxU32 handle = 0xFFFFFFFF;
-	if(sim)
-		handle = sim->getScene().addRigidAttachment(core, *sim, particleId, actorSpacePose, doConversion);
+	PxU32 handle = PX_INVALID_U32;
+	if (sim)
+		handle = sim->getScene().addVolumeRigidAttachments(core, *sim, feature, indices, barycentrics, frame, coords, count);
 
 	return handle;
 }
 
-void Sc::DeformableVolumeCore::removeRigidAttachment(Sc::BodyCore* core, PxU32 handle)
+void Sc::DeformableVolumeCore::removeRigidAttachments(Sc::BodyCore* core, PxU32 handle)
 {
 	Sc::DeformableVolumeSim* sim = getSim();
 	if (sim)
 	{
-		sim->getScene().removeRigidAttachment(core, *sim, handle);
+		sim->getScene().removeVolumeRigidAttachments(core, *sim, handle);
 		setWakeCounterInternal(ScInternalWakeCounterResetValue);
 	}
 }
 
+PxU32 Sc::DeformableVolumeCore::addVolumeAttachments(Sc::DeformableVolumeCore& core, PxDeformableAttachmentTargetType::Enum feature0,
+	const PxU32* indices0, const PxVec4* barycentrics0, PxDeformableAttachmentTargetType::Enum feature1,
+	const PxU32* indices1, const PxVec4* barycentrics1, PxU32 count)
+{
+	Sc::DeformableVolumeSim* sim = getSim();
+	PxU32 handle = PX_INVALID_U32;
+	if (sim)
+		handle = sim->getScene().addVolumeVolumeAttachments(core, feature0, indices0, barycentrics0, *sim, feature1,
+			indices1, barycentrics1, count);
 
-void Sc::DeformableVolumeCore::addTetRigidFilter(Sc::BodyCore* core, PxU32 tetIdx)
+	return handle;
+}
+
+void Sc::DeformableVolumeCore::removeVolumeAttachments(Sc::DeformableVolumeCore& core, PxU32 handle)
+{
+	Sc::DeformableVolumeSim* sim = getSim();
+	setWakeCounterInternal(ScInternalWakeCounterResetValue);
+	core.setWakeCounterInternal(ScInternalWakeCounterResetValue);
+	if (sim)
+		sim->getScene().removeVolumeVolumeAttachments(core, *sim, handle);
+}
+
+PxU32 Sc::DeformableVolumeCore::addSurfaceAttachments(Sc::DeformableSurfaceCore& core, PxDeformableAttachmentTargetType::Enum feature0,
+	const PxU32* indices0, const PxVec4* barycentrics0, PxDeformableAttachmentTargetType::Enum feature1,
+	const PxU32* indices1, const PxVec4* barycentrics1, PxU32 count)
+{
+	Sc::DeformableVolumeSim* sim = getSim();
+	PxU32 handle = PX_INVALID_U32;
+	if (sim)
+		handle = sim->getScene().addVolumeSurfaceAttachments(core, feature0, indices0, barycentrics0, *sim, feature1,
+			indices1, barycentrics1, count);
+
+	return handle;
+}
+
+void Sc::DeformableVolumeCore::removeSurfaceAttachments(Sc::DeformableSurfaceCore& core, PxU32 handle)
+{
+	Sc::DeformableVolumeSim* sim = getSim();
+	setWakeCounterInternal(ScInternalWakeCounterResetValue);
+	core.setWakeCounterInternal(ScInternalWakeCounterResetValue);
+	if (sim)
+		sim->getScene().removeVolumeSurfaceAttachments(core, *sim, handle);
+}
+
+void Sc::DeformableVolumeCore::addRigidFilters(Sc::RigidCore* core, PxU32* tetIndices, PxU32 tetIndicesSize)
 {
 	Sc::DeformableVolumeSim* sim = getSim();
 	if (sim)
-		sim->getScene().addTetRigidFilter(core, *sim, tetIdx);
+		sim->getScene().addVolumeRigidFilters(core, *sim, tetIndices, tetIndicesSize);
 }
 
-void Sc::DeformableVolumeCore::removeTetRigidFilter(Sc::BodyCore* core, PxU32 tetIdx)
+void Sc::DeformableVolumeCore::removeRigidFilters(Sc::RigidCore* core, PxU32* tetIndices, PxU32 tetIndicesSize)
 {
 	Sc::DeformableVolumeSim* sim = getSim();
 	if (sim)
 	{
-		sim->getScene().removeTetRigidFilter(core, *sim, tetIdx);
+		sim->getScene().removeVolumeRigidFilters(core, *sim, tetIndices, tetIndicesSize);
 	}
 }
 
-PxU32 Sc::DeformableVolumeCore::addTetRigidAttachment(Sc::BodyCore* core, PxU32 tetIdx, const PxVec4& barycentric,
-	const PxVec3& actorSpacePose, bool doConversion)
+void Sc::DeformableVolumeCore::addVolumeFilters(Sc::DeformableVolumeCore& core, PxU32* tetIndices0, PxU32* tetIndices1, PxU32 tetIndicesSize)
 {
 	Sc::DeformableVolumeSim* sim = getSim();
-	PxU32 handle = 0xFFFFFFFF;
 	if (sim)
-		handle = sim->getScene().addTetRigidAttachment(core, *sim, tetIdx, barycentric, actorSpacePose, doConversion);
-
-	return handle;
+		sim->getScene().addVolumeVolumeFilters(core, *sim, tetIndices0, tetIndices1, tetIndicesSize);
 }
 
-void Sc::DeformableVolumeCore::addSoftBodyFilter(Sc::DeformableVolumeCore& core, PxU32 tetIdx0, PxU32 tetIdx1)
+void Sc::DeformableVolumeCore::removeVolumeFilters(Sc::DeformableVolumeCore& core, PxU32* tetIndices0, PxU32* tetIndices1, PxU32 tetIndicesSize)
 {
 	Sc::DeformableVolumeSim* sim = getSim();
 	if (sim)
-		sim->getScene().addSoftBodyFilter(core, tetIdx0, *sim, tetIdx1);
+		sim->getScene().removeVolumeVolumeFilters(core, *sim, tetIndices0, tetIndices1, tetIndicesSize);
 }
 
-void Sc::DeformableVolumeCore::removeSoftBodyFilter(Sc::DeformableVolumeCore& core, PxU32 tetIdx0, PxU32 tetIdx1)
+void Sc::DeformableVolumeCore::addSurfaceFilters(Sc::DeformableSurfaceCore& core, PxU32* triIndices, PxU32* tetIndices, PxU32 indicesSize)
 {
 	Sc::DeformableVolumeSim* sim = getSim();
+
 	if (sim)
-		sim->getScene().removeSoftBodyFilter(core, tetIdx0, *sim, tetIdx1);
+		sim->getScene().addVolumeSurfaceFilters(core, triIndices, *sim, tetIndices, indicesSize);
 }
 
-void Sc::DeformableVolumeCore::addSoftBodyFilters(Sc::DeformableVolumeCore& core, PxU32* tetIndices0, PxU32* tetIndices1, PxU32 tetIndicesSize)
+void Sc::DeformableVolumeCore::removeSurfaceFilters(Sc::DeformableSurfaceCore& core, PxU32* triIndices, PxU32* tetIndices, PxU32 indicesSize)
 {
 	Sc::DeformableVolumeSim* sim = getSim();
 	if (sim)
-		sim->getScene().addSoftBodyFilters(core, *sim, tetIndices0, tetIndices1, tetIndicesSize);
-}
-
-void Sc::DeformableVolumeCore::removeSoftBodyFilters(Sc::DeformableVolumeCore& core, PxU32* tetIndices0, PxU32* tetIndices1, PxU32 tetIndicesSize)
-{
-	Sc::DeformableVolumeSim* sim = getSim();
-	if (sim)
-		sim->getScene().removeSoftBodyFilters(core, *sim, tetIndices0, tetIndices1, tetIndicesSize);
-}
-
-
-PxU32 Sc::DeformableVolumeCore::addSoftBodyAttachment(Sc::DeformableVolumeCore& core, PxU32 tetIdx0, const PxVec4& triBarycentric0, PxU32 tetIdx1, const PxVec4& tetBarycentric1,
-	bool doConversion)
-{
-	Sc::DeformableVolumeSim* sim = getSim();
-	PxU32 handle = 0xFFFFFFFF;
-	if (sim)
-		handle = sim->getScene().addSoftBodyAttachment(core, tetIdx0, triBarycentric0, *sim, tetIdx1, tetBarycentric1, doConversion);
-
-	return handle;
-}
-
-void Sc::DeformableVolumeCore::removeSoftBodyAttachment(Sc::DeformableVolumeCore& core, PxU32 handle)
-{
-	Sc::DeformableVolumeSim* sim = getSim();
-	setWakeCounterInternal(ScInternalWakeCounterResetValue);
-	core.setWakeCounterInternal(ScInternalWakeCounterResetValue);
-	if (sim)
-		sim->getScene().removeSoftBodyAttachment(core, *sim, handle);
-}
-
-
-void Sc::DeformableVolumeCore::addClothFilter(Sc::DeformableSurfaceCore& core, PxU32 triIdx, PxU32 tetIdx)
-{
-	Sc::DeformableVolumeSim* sim = getSim();
-
-	if (sim)
-		sim->getScene().addClothFilter(core, triIdx, *sim, tetIdx);
-}
-
-void Sc::DeformableVolumeCore::removeClothFilter(Sc::DeformableSurfaceCore& core, PxU32 triIdx, PxU32 tetIdx)
-{
-	Sc::DeformableVolumeSim* sim = getSim();
-	if (sim)
-		sim->getScene().removeClothFilter(core, triIdx, *sim, tetIdx);
-}
-
-PxU32 Sc::DeformableVolumeCore::addClothAttachment(Sc::DeformableSurfaceCore& core, PxU32 triIdx, const PxVec4& triBarycentric, PxU32 tetIdx, const PxVec4& tetBarycentric,
-	bool doConversion)
-{
-	Sc::DeformableVolumeSim* sim = getSim();
-	PxU32 handle = 0xFFFFFFFF;
-	if (sim)
-		handle = sim->getScene().addClothAttachment(core, triIdx, triBarycentric, *sim, tetIdx, tetBarycentric, doConversion);
-
-	return handle;
-}
-
-void Sc::DeformableVolumeCore::removeClothAttachment(Sc::DeformableSurfaceCore& core, PxU32 handle)
-{
-	Sc::DeformableVolumeSim* sim = getSim();
-	setWakeCounterInternal(ScInternalWakeCounterResetValue);
-	core.setWakeCounterInternal(ScInternalWakeCounterResetValue);
-	if (sim)
-		sim->getScene().removeClothAttachment(core, *sim, handle);
+		sim->getScene().removeVolumeSurfaceFilters(core, triIndices, *sim, tetIndices, indicesSize);
 }
 
 //---------------------------------------------------------------------------------

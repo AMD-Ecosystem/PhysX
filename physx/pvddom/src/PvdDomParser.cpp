@@ -1,48 +1,69 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
-// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
-
-// SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
-//
 
 #include "PvdDomParser.h"
 #include "PvdDomParserConfig.h"
 #include "PvdDomUtils.h"
 #include "PvdDomLog.h"
+#include "OmniPvdLibraryFunctions.h"
 #include "OmniPvdReader.h"
 #include "OmniPvdFileReadStream.h"
 
 #include <cstdio>
+#include <memory>
 #include <string.h>
 
 // OmniPvdMessage, OmniPvdMessages, gOmniPvdMessages defined in PvdDomParser.h
 OmniPvdMessages gOmniPvdMessages;
+
+template <typename T>
+static bool readAttributeValue(const uint8_t* data, uint32_t dataLen, T& value)
+{
+    if (!data || dataLen < sizeof(T))
+    {
+        PVDDOM_LOG_ERROR("   [b2s] Invalid attribute payload: expected at least %u bytes, got %u",
+                         static_cast<unsigned>(sizeof(T)), dataLen);
+        return false;
+    }
+    memcpy(&value, data, sizeof(T));
+    return true;
+}
+
+template <typename T>
+static bool readFirstAttributeValue(int32_t& attribIndex, int32_t& classIndex, const char* name,
+                                    OmniPvdObject* object, T& value)
+{
+    OmniPvdAttributeInstList* list = getAttribList(attribIndex, classIndex, name, object);
+    if (!list)
+        return false;
+    for (const OmniPvdAttributeInst* attribute = list->mFirst; attribute;
+         attribute = attribute->mNextAttribute)
+    {
+        const OmniPvdAttributeSample* sample = static_cast<const OmniPvdAttributeSample*>(attribute);
+        if (readAttributeValue(sample->mData, sample->mDataLen, value))
+            return true;
+    }
+    return false;
+}
+
+static bool attachChildObjectFromPayload(const std::string& name, OmniPvdCommand::Enum cmdType,
+                                         const OmniPvdAttributeDef* attributeDef, const uint8_t* data,
+                                         uint32_t dataLen, OmniPvdObject* object, OmniPvdDOMState* domState)
+{
+    if (cmdType != OmniPvdCommand::eSET_ATTRIBUTE ||
+        !isSameString(attributeDef->mAttributeName.c_str(), name.c_str()))
+        return true;
+
+    uint64_t childHandle;
+    if (!readAttributeValue(data, dataLen, childHandle))
+        return false;
+    attachChildObject(name, cmdType, attributeDef, &childHandle, object,
+                      domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
+    return true;
+}
 
 static inline bool largerOrEqualOVDIntegversion(uint32_t major, uint32_t minor, uint32_t majorStream, uint32_t minorStream)
 {
@@ -72,15 +93,17 @@ void handleClassRegistration(OmniPvdReader* reader, OmniPvdDOMState* domState)
         ////////////////////////////////////////////////////////////////////////////////
         // Create the OmniPvdClass object
         ////////////////////////////////////////////////////////////////////////////////
-        omniPvdClass = new OmniPvdClass();
+        std::unique_ptr<OmniPvdClass> newClass(new OmniPvdClass());
+        omniPvdClass = newClass.get();
         omniPvdClass->mOmniClassHandle = classHandle;
         omniPvdClass->mClassName = std::string(className);
 
         domState->mClassHandleToClassMap[classHandle] = omniPvdClass;
+        newClass.release();
 
         if (omniPvdClass->mClassName.compare("PxScene") == 0)
         {
-            domState->mPxSceneClass = omniPvdClass;
+            omniPvdClass->mIsSceneClass = true;
         }
         else if (omniPvdClass->mClassName.compare("PxArticulationReducedCoordinate") == 0)
         {
@@ -244,7 +267,8 @@ void handleAttributeRegistration(OmniPvdReader* reader, const OmniPvdCommand::En
                 }
                 else if (enumClass->mIsEnumClass && (cmdType == OmniPvdCommand::eREGISTER_ATTRIBUTE))
                 {
-                    omniPvdAttributeDef = new OmniPvdAttributeDef();
+                    std::unique_ptr<OmniPvdAttributeDef> newAttribute(new OmniPvdAttributeDef());
+                    omniPvdAttributeDef = newAttribute.get();
                     omniPvdAttributeDef->mOmniAttributeHandle = attributeHandle;
 
                     omniPvdAttributeDef->mIsUniqueList = 0;
@@ -259,8 +283,9 @@ void handleAttributeRegistration(OmniPvdReader* reader, const OmniPvdCommand::En
                     omniPvdAttributeDef->mClassOffset = (uint16_t)omniPvdClass->mAttributeDefinitions.size();
                     omniPvdAttributeDef->mClass = omniPvdClass;
                     omniPvdAttributeDef->mDerivedFromClass = enumClass;
-                    omniPvdClass->mAttributeDefinitions.push_back(omniPvdAttributeDef);
                     domState->mAttributeHandleToAttributeMap[attributeHandle] = omniPvdAttributeDef;
+                    newAttribute.release();
+                    omniPvdClass->mAttributeDefinitions.push_back(omniPvdAttributeDef);
                 }
             }
             else if (attributeDataType == OmniPvdDataType::eENUM_VALUE)
@@ -312,7 +337,8 @@ void handleAttributeRegistration(OmniPvdReader* reader, const OmniPvdCommand::En
                                 omniPvdClass->mIsBitFieldEnum = false;
                             }
 
-                            omniPvdAttributeDef = new OmniPvdAttributeDef();
+                            std::unique_ptr<OmniPvdAttributeDef> newAttribute(new OmniPvdAttributeDef());
+                            omniPvdAttributeDef = newAttribute.get();
                             omniPvdAttributeDef->mOmniAttributeHandle = attributeHandle;
 
                             omniPvdAttributeDef->mIsUniqueList = 0;
@@ -325,12 +351,12 @@ void handleAttributeRegistration(OmniPvdReader* reader, const OmniPvdCommand::En
 
                             omniPvdAttributeDef->mClassOffset = (uint16_t)omniPvdClass->mAttributeDefinitions.size();
                             omniPvdAttributeDef->mClass = omniPvdClass;
-                            omniPvdClass->mAttributeDefinitions.push_back(omniPvdAttributeDef);
-
                             ////////////////////////////////////////////////////////////////////////////////
                             // Update the OmniPvd DOM state
                             ////////////////////////////////////////////////////////////////////////////////
                             domState->mAttributeHandleToAttributeMap[attributeHandle] = omniPvdAttributeDef;
+                            newAttribute.release();
+                            omniPvdClass->mAttributeDefinitions.push_back(omniPvdAttributeDef);
                             if (isSameString(omniPvdClass->mClassName.c_str(),"actortype") || isSameString(omniPvdClass->mClassName.c_str(), "PxActorType")) // guard against case changes
                             {
                                 if (isSameString(omniPvdAttributeDef->mAttributeName.c_str(),"eRIGID_DYNAMIC"))
@@ -391,7 +417,8 @@ void handleAttributeRegistration(OmniPvdReader* reader, const OmniPvdCommand::En
             // Make sure that classes that are not Enum classes have no attributes that are of OmniPvdDataType::eENUM_VALUE
             else if (!omniPvdClass->mIsEnumClass)
             {
-                omniPvdAttributeDef = new OmniPvdAttributeDef();
+                std::unique_ptr<OmniPvdAttributeDef> newAttribute(new OmniPvdAttributeDef());
+                omniPvdAttributeDef = newAttribute.get();
                 omniPvdAttributeDef->mOmniAttributeHandle = attributeHandle;
                 if (cmdType == OmniPvdCommand::eREGISTER_ATTRIBUTE)
                 {
@@ -423,8 +450,9 @@ void handleAttributeRegistration(OmniPvdReader* reader, const OmniPvdCommand::En
 
                 omniPvdAttributeDef->mClassOffset = (uint16_t)omniPvdClass->mAttributeDefinitions.size();
                 omniPvdAttributeDef->mClass = omniPvdClass;
-                omniPvdClass->mAttributeDefinitions.push_back(omniPvdAttributeDef);
                 domState->mAttributeHandleToAttributeMap[attributeHandle] = omniPvdAttributeDef;
+                newAttribute.release();
+                omniPvdClass->mAttributeDefinitions.push_back(omniPvdAttributeDef);
             }
         }
     }
@@ -432,6 +460,204 @@ void handleAttributeRegistration(OmniPvdReader* reader, const OmniPvdCommand::En
     {
         PVDDOM_LOG_WARN("   [b2s] Error : attribute (attributeHandle: %d) already registered. Attribute registration skipped.", (int)attributeHandle);
     }
+}
+
+// Limit subtree walks for malformed cyclic input.
+static const int kMaxLifespanWalkNodes = 1 << 20;
+
+static void finishSupersedeSnapshots(OmniPvdDOMState* domState)
+{
+    for (OmniPvdObject* object : domState->mSupersedeSnapshotObjects)
+    {
+        object->mIsSupersedeRecreate = false;
+    }
+    domState->mSupersedeSnapshotObjects.clear();
+}
+
+static void beginRecordingSegment(OmniPvdDOMState* domState)
+{
+    if (!domState->mSawRecordingSegmentMetadata)
+    {
+        domState->mSawRecordingSegmentMetadata = true;
+        return;
+    }
+    finishSupersedeSnapshots(domState);
+    ++domState->mCurrentRecordingSegmentId;
+    domState->mRecordingSegmentMaxFrames.push_back(0);
+}
+
+// Reuse an open span or append a new residency span.
+static void openLifespan(OmniPvdObject* object, uint64_t openFrameId)
+{
+    if (object->mLifeSpans.empty() || (object->mLifeSpans.back().mFrameStop != 0))
+    {
+        object->mLifeSpans.resize(object->mLifeSpans.size() + 1);
+    }
+    object->mLifeSpans.back().mFrameStart = openFrameId;
+    object->mReopenable = false;
+}
+
+// Close the last open residency span.
+static void closeLifespan(OmniPvdObject* object, uint64_t closeFrameId)
+{
+    if (!object->mLifeSpans.empty() && (object->mLifeSpans.back().mFrameStop == 0))
+    {
+        object->mLifeSpans.back().mFrameStop = closeFrameId;
+    }
+}
+
+// Close open descendant spans when a subtree is removed.
+static void closeOpenDescendants(OmniPvdObject* subtreeRoot, uint64_t closeFrameId,
+                                 OmniPvdDOMState* supersedeState = nullptr)
+{
+    std::vector<OmniPvdObject*> stack;
+    if (subtreeRoot->mFirstChild)
+    {
+        stack.push_back(subtreeRoot->mFirstChild);
+    }
+    int visited = 0;
+    while (!stack.empty() && visited < kMaxLifespanWalkNodes)
+    {
+        OmniPvdObject* object = stack.back();
+        stack.pop_back();
+        ++visited;
+        if (!object->mLifeSpans.empty() && (object->mLifeSpans.back().mFrameStop == 0))
+        {
+            object->mLifeSpans.back().mFrameStop = supersedeState
+                ? getSupersedeCloseFrameId(object, supersedeState)
+                : closeFrameId;
+            object->mReopenable = true;
+        }
+        if (object->mNextSibling)
+        {
+            stack.push_back(object->mNextSibling);
+        }
+        if (object->mFirstChild)
+        {
+            stack.push_back(object->mFirstChild);
+        }
+    }
+    if (!stack.empty())
+    {
+        PVDDOM_LOG_WARN("   [b2s] Warning : subtree close walk truncated at %d nodes; remaining lifespans stay open", kMaxLifespanWalkNodes);
+    }
+}
+
+// Reopen descendants closed by the previous ancestor removal.
+static void reopenDescendantsClosedAt(OmniPvdObject* subtreeRoot, uint64_t closedAtFrameId, uint64_t openFrameId)
+{
+    std::vector<OmniPvdObject*> stack;
+    if (subtreeRoot->mFirstChild)
+    {
+        stack.push_back(subtreeRoot->mFirstChild);
+    }
+    int visited = 0;
+    while (!stack.empty() && visited < kMaxLifespanWalkNodes)
+    {
+        OmniPvdObject* object = stack.back();
+        stack.pop_back();
+        ++visited;
+        bool reopened = false;
+        if (object->mReopenable && !object->mLifeSpans.empty() && (object->mLifeSpans.back().mFrameStop == closedAtFrameId))
+        {
+            openLifespan(object, openFrameId);
+            object->mReopenable = false;
+            reopened = true;
+        }
+        if (object->mNextSibling)
+        {
+            stack.push_back(object->mNextSibling);
+        }
+        // Do not reopen descendants of a detached node.
+        if (reopened && object->mFirstChild)
+        {
+            stack.push_back(object->mFirstChild);
+        }
+    }
+    if (!stack.empty())
+    {
+        PVDDOM_LOG_WARN("   [b2s] Warning : subtree reopen walk truncated at %d nodes; remaining spans stay closed", kMaxLifespanWalkNodes);
+    }
+}
+
+// Move zero-based descendant spans to the scene join frame.
+static void restampZeroOpenDescendants(OmniPvdObject* subtreeRoot, uint64_t openFrameId)
+{
+    if (openFrameId == 0)
+    {
+        return;
+    }
+    std::vector<OmniPvdObject*> stack;
+    if (subtreeRoot->mFirstChild)
+    {
+        stack.push_back(subtreeRoot->mFirstChild);
+    }
+    int visited = 0;
+    while (!stack.empty() && visited < kMaxLifespanWalkNodes)
+    {
+        OmniPvdObject* object = stack.back();
+        stack.pop_back();
+        ++visited;
+        if (!object->mLifeSpans.empty() &&
+            (object->mLifeSpans.back().mFrameStart == 0) && (object->mLifeSpans.back().mFrameStop == 0))
+        {
+            object->mLifeSpans.back().mFrameStart = openFrameId;
+        }
+        if (object->mNextSibling)
+        {
+            stack.push_back(object->mNextSibling);
+        }
+        if (object->mFirstChild)
+        {
+            stack.push_back(object->mFirstChild);
+        }
+    }
+    if (!stack.empty())
+    {
+        PVDDOM_LOG_WARN("   [b2s] Warning : subtree restamp walk truncated at %d nodes; remaining opens stay at 0", kMaxLifespanWalkNodes);
+    }
+}
+
+// Detach the child and close its subtree.
+static void detachChildSubtree(OmniPvdObject* child, uint64_t closeFrameId)
+{
+    closeLifespan(child, closeFrameId);
+    closeOpenDescendants(child, closeFrameId);
+    child->mReopenable = false;
+}
+
+// Reattach the child and reopen its subtree.
+static void reattachChildSubtree(OmniPvdObject* child, uint64_t openFrameId)
+{
+    const uint64_t prevClose = child->mLifeSpans.empty() ? 0 : child->mLifeSpans.back().mFrameStop;
+    openLifespan(child, openFrameId);
+    restampZeroOpenDescendants(child, child->mLifeSpans.back().mFrameStart);
+    if (prevClose != 0)
+    {
+        reopenDescendantsClosedAt(child, prevClose, child->mLifeSpans.back().mFrameStart);
+    }
+}
+
+static void attachJointToScene(OmniPvdObject* joint, OmniPvdObject* scene, OmniPvdDOMState* domState)
+{
+    if (joint->mWasDestroyed || scene->mWasDestroyed || joint->mRecordingSegmentId != scene->mRecordingSegmentId) return;
+    ++domState->mJointLookupSteps;
+    OmniPvdObject* jointsNode = scene->mSceneJoints;
+    if (!jointsNode)
+    {
+        std::unique_ptr<OmniPvdObject> node(createNamedObject(domState->mAttributeNameClass, "Joints",
+                                                            scene->mRecordingSegmentId));
+        jointsNode = node.get();
+        jointsNode->mLifeSpans[0].mFrameStart = getLifespanOpenFrameId(scene, domState);
+        domState->mObjectCreations.push_back(jointsNode);
+        node.release();
+        scene->appendChild(jointsNode);
+        scene->mSceneJoints = jointsNode;
+    }
+    if (joint->mAncestor == jointsNode && !joint->mLifeSpans.empty() && !joint->mLifeSpans.back().mFrameStop) return;
+    openLifespan(joint, getLifespanOpenFrameId(scene, domState));
+    joint->mIsShared = false;
+    if (joint->mAncestor != jointsNode) jointsNode->appendChild(joint);
 }
 
 void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cmdType, OmniPvdDOMState* domState)
@@ -508,6 +734,13 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                     }
 
                     OmniPvdAttributeInstList *attributeList = inheritedClassAttributes.mClassAttributeLists[omniPvdAttributeDef->mClassOffset];
+                    const uint8_t *data = reader->getAttributeDataPointer();
+                    uint32_t dataLen = reader->getAttributeDataLength();
+                    if (!data && dataLen != 0)
+                    {
+                        PVDDOM_LOG_ERROR("   [b2s] Invalid attribute payload: nonzero length with null data");
+                        return;
+                    }
 
                     ////////////////////////////////////////////////////////////////////////////////
                     // Deduplication of attribute setting step
@@ -532,10 +765,12 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                         // Clean the flag values, to only contain registered values
                     }
 
-                    const uint8_t *data = reader->getAttributeDataPointer();
-
-                    uint32_t dataLen = reader->getAttributeDataLength();
-                    const uint64_t currentFrame = getFrameIdFromScene(omniPvdObject, domState);
+                    uint64_t currentFrame = getFrameIdFromScene(omniPvdObject, domState);
+                    // Keep sample timestamps monotonic.
+                    if (attributeList && attributeList->mLast && (currentFrame < attributeList->mLast->mTimeStamp))
+                    {
+                        currentFrame = attributeList->mLast->mTimeStamp;
+                    }
 
                     // No dedup: every write becomes its own keyframe with
                     // mTimeStamp == mEndTimeStamp == currentFrame. Earlier
@@ -620,14 +855,18 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                     {
                         if (isSameString(omniPvdAttributeDef->mAttributeName.c_str(),"type"))
                         {
-                            omniPvdObject->mActortype = *reinterpret_cast<const uint32_t*>(data);
+                            uint32_t actorType;
+                            if (!readAttributeValue(data, dataLen, actorType)) return;
+                            omniPvdObject->mActortype = actorType;
+                            omniPvdObject->mActortypeSet = true;
                         }
                         else if (isSameString(omniPvdAttributeDef->mAttributeName.c_str(),"shapes"))
                         {
                             // Parent shapes under deformable actors, following the ePxActor pattern
                             if (cmdType == OmniPvdCommand::eADD_TO_UNIQUE_LIST_ATTRIBUTE)
                             {
-                                uint64_t shapeHandle = *((uint64_t*)data);
+                                uint64_t shapeHandle;
+                                if (!readAttributeValue(data, dataLen, shapeHandle)) return;
                                 OmniPvdObject *childObject = findChildObject(&shapeHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (childObject)
                                 {
@@ -636,7 +875,7 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                                         // Use the deformable actor's own lifespan start so the shape
                                         // is visible from when the actor first appeared, not from when
                                         // the shapes ADD fires during fetchResults.
-                                        childObject->mLifeSpans[0].mFrameStart = omniPvdObject->mLifeSpans[0].mFrameStart;
+                                        reattachChildSubtree(childObject, omniPvdObject->mLifeSpans.back().mFrameStart);
                                         omniPvdObject->appendChild(childObject);
                                     }
                                     else
@@ -644,41 +883,42 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                                         OmniPvdObject *refObject = findOmniPvdRefObject(objectHandle, shapeHandle, domState->mActorSharedShapeToShapeRefMap);
                                         if (!refObject)
                                         {
-                                            refObject = createInternalObject(domState->mSharedShapeRefClass, 0);
-                                            refObject->mLifeSpans[0].mFrameStart = getFrameIdFromScene(omniPvdObject, domState);
-                                            omniPvdObject->appendChild(refObject);
+                                            std::unique_ptr<OmniPvdObject> newRef(createInternalObject(domState->mSharedShapeRefClass, 0,
+                                                                                                        omniPvdObject->mRecordingSegmentId));
+                                            refObject = newRef.get();
+                                            refObject->mLifeSpans[0].mFrameStart = getLifespanOpenFrameId(omniPvdObject, domState);
                                             refObject->mReferenceObject = childObject;
                                             domState->mObjectCreations.push_back(refObject);
+                                            omniPvdObject->appendChild(refObject);
+                                            newRef.release();
                                             std::pair<uint64_t, uint64_t> key = { objectHandle , shapeHandle };
                                             domState->mActorSharedShapeToShapeRefMap[key] = refObject;
                                         }
                                         else
                                         {
-                                            const int nbrLifeSpans = (int)refObject->mLifeSpans.size();
-                                            refObject->mLifeSpans.resize(nbrLifeSpans + 1);
-                                            refObject->mLifeSpans[nbrLifeSpans].mFrameStart = getFrameIdFromScene(omniPvdObject, domState);
+                                            refObject->mRecordingSegmentId = omniPvdObject->mRecordingSegmentId;
+                                            openLifespan(refObject, getLifespanOpenFrameId(omniPvdObject, domState));
                                         }
                                     }
                                 }
                             }
                             else if (cmdType == OmniPvdCommand::eREMOVE_FROM_UNIQUE_LIST_ATTRIBUTE)
                             {
-                                uint64_t shapeHandle = *((uint64_t*)data);
+                                uint64_t shapeHandle;
+                                if (!readAttributeValue(data, dataLen, shapeHandle)) return;
                                 OmniPvdObject *childObject = findChildObject(&shapeHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (childObject)
                                 {
                                     if (!childObject->mIsShared)
                                     {
-                                        childObject->mLifeSpans[0].mFrameStop = getFrameIdFromScene(omniPvdObject, domState);
+                                        detachChildSubtree(childObject, getLifespanCloseFrameId(omniPvdObject, domState));
                                     }
                                     else
                                     {
                                         OmniPvdObject *refObject = findOmniPvdRefObject(objectHandle, shapeHandle, domState->mActorSharedShapeToShapeRefMap);
                                         if (refObject)
                                         {
-                                            const int nbrLifeSpans = (int)refObject->mLifeSpans.size();
-                                            if (nbrLifeSpans > 0)
-                                                refObject->mLifeSpans[nbrLifeSpans - 1].mFrameStop = getFrameIdFromScene(omniPvdObject, domState);
+                                            closeLifespan(refObject, getLifespanCloseFrameId(omniPvdObject, domState));
                                         }
                                     }
                                 }
@@ -693,23 +933,30 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                             if (cmdType == OmniPvdCommand::eADD_TO_UNIQUE_LIST_ATTRIBUTE &&
                                 omniPvdObject->mOmniPvdClass->mPhysXBaseProcessingClassId == OmniPvdPhysXClassEnum::ePxDeformableVolume)
                             {
-                                uint64_t meshHandle = *((uint64_t*)data);
+                                uint64_t meshHandle;
+                                if (!readAttributeValue(data, dataLen, meshHandle)) return;
                                 OmniPvdObject* meshObject = findChildObject(&meshHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (meshObject && !omniPvdObject->getChild("SimulationMesh"))
                                 {
-                                    uint64_t frameStart = omniPvdObject->mLifeSpans[0].mFrameStart;
+                                    uint64_t frameStart = omniPvdObject->mLifeSpans.back().mFrameStart;
 
-                                    OmniPvdObject* simMeshNode = createNamedObject(domState->mSimulationMeshClass, "SimulationMesh");
+                                    std::unique_ptr<OmniPvdObject> newNode(createNamedObject(domState->mSimulationMeshClass, "SimulationMesh",
+                                                                                               omniPvdObject->mRecordingSegmentId));
+                                    OmniPvdObject* simMeshNode = newNode.get();
                                     simMeshNode->mLifeSpans[0].mFrameStart = frameStart;
-                                    omniPvdObject->appendChild(simMeshNode);
                                     domState->mObjectCreations.push_back(simMeshNode);
+                                    omniPvdObject->appendChild(simMeshNode);
+                                    newNode.release();
 
-                                    OmniPvdObject* refObject = createInternalObject(domState->mTetrahedronMeshRefClass, 0);
+                                    std::unique_ptr<OmniPvdObject> newRef(createInternalObject(domState->mTetrahedronMeshRefClass, 0,
+                                                                                                 omniPvdObject->mRecordingSegmentId));
+                                    OmniPvdObject* refObject = newRef.get();
                                     refObject->mLifeSpans[0].mFrameStart = frameStart;
                                     refObject->mReferenceObject = meshObject;
                                     meshObject->mIsReferenced = true;
-                                    simMeshNode->appendChild(refObject);
                                     domState->mObjectCreations.push_back(refObject);
+                                    simMeshNode->appendChild(refObject);
+                                    newRef.release();
                                 }
                             }
                         }
@@ -719,25 +966,12 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                     {
                         if (isSameString(omniPvdAttributeDef->mAttributeName.c_str(),"constraint"))
                         {
-                            uint64_t constraintHandle = *((uint64_t*)data);
-                            OmniPvdObject* scene = domState->mConstraintToSceneMap[constraintHandle];
-                            if (scene)
-                            {
-                                // Set the joint in the constraint->joint map
-                                domState->mConstraintToJointMap[constraintHandle] = omniPvdObject;
-                                // add the joint to the scene, in a joints reference list, how was it in PVD, per joint type?
-                                omniPvdObject->mLifeSpans[0].mFrameStart = getFrameIdFromScene(scene, domState); // PsScene
-                                omniPvdObject->mIsShared = false;
-                                // Does the scene have a Joints aggregation child? If not create it and parent the joint under it.
-                                OmniPvdObject* jointsNode = scene->getChild("Joints");
-                                if (!jointsNode) {
-                                    jointsNode = createNamedObject(domState->mAttributeNameClass, "Joints");
-                                    jointsNode->mLifeSpans[0].mFrameStart = getFrameIdFromScene(scene, domState); // PsScene
-                                    domState->mObjectCreations.push_back(jointsNode);
-                                    scene->appendChild(jointsNode);
-                                }
-                                jointsNode->appendChild(omniPvdObject);
-                            }
+                            uint64_t constraintHandle;
+                            if (!readAttributeValue(data, dataLen, constraintHandle)) return;
+                            domState->mConstraintToJointMap[constraintHandle] = omniPvdObject;
+                            const auto scene = domState->mConstraintToSceneMap.find(constraintHandle);
+                            if (scene != domState->mConstraintToSceneMap.end())
+                                attachJointToScene(omniPvdObject, scene->second, domState);
                         }
                     }
                     break;
@@ -752,17 +986,18 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                             ////////////////////////////////////////////////////////////////////////////////
                             // childLink->ancestor = parentLink
                             ////////////////////////////////////////////////////////////////////////////////
-                            uint64_t actorHandle = *((uint64_t*)data);
+                            uint64_t actorHandle;
+                            if (!readAttributeValue(data, dataLen, actorHandle)) return;
                             OmniPvdObject *childObject = findChildObject(&actorHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                             if (childObject)
                             {
                                 ////////////////////////////////////////////////////////////////////////////////
                                 // find the parentLink attribute data
                                 ////////////////////////////////////////////////////////////////////////////////
-                                uint8_t* attribData = getAttribData(parentLinkAttribIndex, parentLinkClassIndex, "parentLink", omniPvdObject);
-                                if (attribData)
+                                OmniPvdObjectHandle parentHandle;
+                                if (readFirstAttributeValue(parentLinkAttribIndex, parentLinkClassIndex,
+                                                            "parentLink", omniPvdObject, parentHandle))
                                 {
-                                    OmniPvdObjectHandle parentHandle = *(OmniPvdObjectHandle*)attribData;
                                     OmniPvdObject *ancestorObj = findChildObject(&parentHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                     if (ancestorObj)
                                     {
@@ -774,19 +1009,49 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                         }
                     }
                     break;
+                    case OmniPvdPhysXClassEnum::ePxPhysics:
+                    {
+                        if (isSameString(omniPvdAttributeDef->mAttributeName.c_str(),"scenes"))
+                        {
+                            // Parent each scene under its owning PxPhysics object.
+                            if (cmdType == OmniPvdCommand::eADD_TO_UNIQUE_LIST_ATTRIBUTE)
+                            {
+                                uint64_t sceneHandle;
+                                if (!readAttributeValue(data, dataLen, sceneHandle)) return;
+                                OmniPvdObject *sceneObject = findChildObject(&sceneHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
+                                if (sceneObject)
+                                {
+                                    omniPvdObject->appendChild(sceneObject);
+                                }
+                            }
+                        }
+                    }
+                    break;
                     case OmniPvdPhysXClassEnum::ePxScene:
                     {
                         if (isSameString(omniPvdAttributeDef->mAttributeName.c_str(),"actors"))
                         {
                             if (cmdType == OmniPvdCommand::eADD_TO_UNIQUE_LIST_ATTRIBUTE)
                             {
-                                uint64_t actorHandle = *((uint64_t*)data);
+                                uint64_t actorHandle;
+                                if (!readAttributeValue(data, dataLen, actorHandle)) return;
                                 OmniPvdObject *childObject = findChildObject(&actorHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (childObject)
                                 {
-                                    childObject->mLifeSpans[0].mFrameStart = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxScene
+                                    const uint64_t joinFrame = getLifespanOpenFrameId(omniPvdObject, domState); // omniPvdObject : PxScene
+                                    const uint64_t prevResidencyClose = childObject->mLifeSpans.empty() ? 0 : childObject->mLifeSpans.back().mFrameStop;
+                                    openLifespan(childObject, joinFrame);
+                                    restampZeroOpenDescendants(childObject, joinFrame);
+                                    if (prevResidencyClose != 0)
+                                    {
+                                        reopenDescendantsClosedAt(childObject, prevResidencyClose, joinFrame);
+                                    }
                                     OmniPvdObject *leAncestor = nullptr;
-                                    if (childObject->mActortype == domState->mActorTypeEnumRigidDynamic)
+                                    if (!childObject->mActortypeSet)
+                                    {
+                                        // Untyped actors use the scene fallback below.
+                                    }
+                                    else if (childObject->mActortype == domState->mActorTypeEnumRigidDynamic)
                                     {
                                         leAncestor = getRigidDynamicBranch(objectHandle, omniPvdObject, domState);
                                     }
@@ -806,18 +1071,23 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                                     {
                                         leAncestor = getDeformableSurfaceBranch(objectHandle, omniPvdObject, domState);
                                     }
-                                    if (leAncestor) {
-                                        leAncestor->appendChild(childObject);
+                                    if (!leAncestor)
+                                    {
+                                        // Parent untyped actors directly under the scene.
+                                        leAncestor = omniPvdObject;
                                     }
+                                    leAncestor->appendChild(childObject);
                                 }
                             }
                             else if (cmdType == OmniPvdCommand::eREMOVE_FROM_UNIQUE_LIST_ATTRIBUTE)
                             {
-                                uint64_t actorHandle = *((uint64_t*)data);
+                                uint64_t actorHandle;
+                                if (!readAttributeValue(data, dataLen, actorHandle)) return;
                                 OmniPvdObject *childObject = findChildObject(&actorHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (childObject)
                                 {
-                                    childObject->mLifeSpans[0].mFrameStop = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxScene
+                                    const uint64_t leaveFrame = getLifespanCloseFrameId(omniPvdObject, domState); // omniPvdObject : PxScene
+                                    detachChildSubtree(childObject, leaveFrame);
                                 }
                             }
                         }
@@ -825,11 +1095,19 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                         {
                             if (cmdType == OmniPvdCommand::eADD_TO_UNIQUE_LIST_ATTRIBUTE)
                             {
-                                uint64_t actorHandle = *((uint64_t*)data);
+                                uint64_t actorHandle;
+                                if (!readAttributeValue(data, dataLen, actorHandle)) return;
                                 OmniPvdObject *childObject = findChildObject(&actorHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (childObject)
                                 {
-                                    childObject->mLifeSpans[0].mFrameStart = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxScene
+                                    const uint64_t joinFrame = getLifespanOpenFrameId(omniPvdObject, domState); // omniPvdObject : PxScene
+                                    const uint64_t prevResidencyClose = childObject->mLifeSpans.empty() ? 0 : childObject->mLifeSpans.back().mFrameStop;
+                                    openLifespan(childObject, joinFrame);
+                                    restampZeroOpenDescendants(childObject, joinFrame);
+                                    if (prevResidencyClose != 0)
+                                    {
+                                        reopenDescendantsClosedAt(childObject, prevResidencyClose, joinFrame);
+                                    }
                                     OmniPvdObject *leAncestor = getArticulationBranch(objectHandle, omniPvdObject, domState);
                                     if (leAncestor)
                                     {
@@ -839,11 +1117,13 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                             }
                             else if (cmdType == OmniPvdCommand::eREMOVE_FROM_UNIQUE_LIST_ATTRIBUTE)
                             {
-                                uint64_t actorHandle = *((uint64_t*)data);
+                                uint64_t actorHandle;
+                                if (!readAttributeValue(data, dataLen, actorHandle)) return;
                                 OmniPvdObject *childObject = findChildObject(&actorHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (childObject)
                                 {
-                                    childObject->mLifeSpans[0].mFrameStop = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxScene
+                                    const uint64_t leaveFrame = getLifespanCloseFrameId(omniPvdObject, domState); // omniPvdObject : PxScene
+                                    detachChildSubtree(childObject, leaveFrame);
                                 }
                             }
                         }
@@ -851,18 +1131,24 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                         {
                             if (cmdType == OmniPvdCommand::eADD_TO_UNIQUE_LIST_ATTRIBUTE)
                             {
-                                uint64_t constraintHandle = *((uint64_t*)data);
+                                uint64_t constraintHandle;
+                                if (!readAttributeValue(data, dataLen, constraintHandle)) return;
                                 domState->mConstraintToSceneMap[constraintHandle] = omniPvdObject;
+                                const auto joint = domState->mConstraintToJointMap.find(constraintHandle);
+                                if (joint != domState->mConstraintToJointMap.end())
+                                    attachJointToScene(joint->second, omniPvdObject, domState);
                             }
                             else if (cmdType == OmniPvdCommand::eREMOVE_FROM_UNIQUE_LIST_ATTRIBUTE)
                             {
                                 // Find the joint in the constraint->joint map and remove the joint from the scene
-                                uint64_t constraintHandle = *((uint64_t*)data);
-                                OmniPvdObject* joint = domState->mConstraintToJointMap[constraintHandle];
-                                if (joint) {
+                                uint64_t constraintHandle;
+                                if (!readAttributeValue(data, dataLen, constraintHandle)) return;
+                                const auto joint = domState->mConstraintToJointMap.find(constraintHandle);
+                                if (joint != domState->mConstraintToJointMap.end()) {
                                     // remove the joint from the scene
-                                    joint->mLifeSpans[0].mFrameStop = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxScene
+                                    closeLifespan(joint->second, getLifespanCloseFrameId(omniPvdObject, domState));
                                 }
+                                domState->mConstraintToSceneMap.erase(constraintHandle);
                             }
                         }
                     }
@@ -877,13 +1163,14 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                                 // the child of the Actor object. However in the case it's a shared shape then the Actor must bridge this connection
                                 // with a reference object that points to a different layer
 
-                                uint64_t shapeHandle = *((uint64_t*)data);
+                                uint64_t shapeHandle;
+                                if (!readAttributeValue(data, dataLen, shapeHandle)) return;
                                 OmniPvdObject *childObject = findChildObject(&shapeHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (childObject)
                                 {
                                     if (!childObject->mIsShared)
                                     {
-                                        childObject->mLifeSpans[0].mFrameStart = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxActor
+                                        reattachChildSubtree(childObject, getLifespanOpenFrameId(omniPvdObject, domState)); // omniPvdObject : PxActor
                                         omniPvdObject->appendChild(childObject);
                                     }
                                     else
@@ -901,12 +1188,14 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                                         OmniPvdObject *refObject = findOmniPvdRefObject(objectHandle, shapeHandle, domState->mActorSharedShapeToShapeRefMap);
                                         if (!refObject)
                                         {
-                                            refObject = createInternalObject(domState->mSharedShapeRefClass, 0);
-                                            refObject->mLifeSpans[0].mFrameStart = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxActor
-                                            omniPvdObject->appendChild(refObject);
-
+                                            std::unique_ptr<OmniPvdObject> newRef(createInternalObject(domState->mSharedShapeRefClass, 0,
+                                                                                                        omniPvdObject->mRecordingSegmentId));
+                                            refObject = newRef.get();
+                                            refObject->mLifeSpans[0].mFrameStart = getLifespanOpenFrameId(omniPvdObject, domState); // omniPvdObject : PxActor
                                             refObject->mReferenceObject = childObject;
                                             domState->mObjectCreations.push_back(refObject);
+                                            omniPvdObject->appendChild(refObject);
+                                            newRef.release();
                                             // Insert the shape reference into the actor|sharedShape map
                                             std::pair<uint64_t, uint64_t> key = { objectHandle , shapeHandle };
                                             domState->mActorSharedShapeToShapeRefMap[key] = refObject;
@@ -914,30 +1203,29 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                                         else
                                         {
                                             // Create yet another life time key in the refObject
-                                            const int nbrLifeSpans = (int)refObject->mLifeSpans.size();
-                                            refObject->mLifeSpans.resize(nbrLifeSpans + 1);
-                                            refObject->mLifeSpans[nbrLifeSpans].mFrameStart = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxActor
+                                            refObject->mRecordingSegmentId = omniPvdObject->mRecordingSegmentId;
+                                            openLifespan(refObject, getLifespanOpenFrameId(omniPvdObject, domState)); // omniPvdObject : PxActor
                                         }
                                     }
                                 }
                             }
                             else if (cmdType == OmniPvdCommand::eREMOVE_FROM_UNIQUE_LIST_ATTRIBUTE)
                             {
-                                uint64_t shapeHandle = *((uint64_t*)data);
+                                uint64_t shapeHandle;
+                                if (!readAttributeValue(data, dataLen, shapeHandle)) return;
                                 OmniPvdObject *childObject = findChildObject(&shapeHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (childObject)
                                 {
                                     if (!childObject->mIsShared)
                                     {
-                                        childObject->mLifeSpans[0].mFrameStop = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxActor
+                                        detachChildSubtree(childObject, getLifespanCloseFrameId(omniPvdObject, domState)); // omniPvdObject : PxActor
                                     }
                                     else
                                     {
                                         OmniPvdObject *refObject = findOmniPvdRefObject(objectHandle, shapeHandle, domState->mActorSharedShapeToShapeRefMap);
                                         if (refObject)
                                         {
-                                            const int nbrLifeSpans = (int)refObject->mLifeSpans.size();
-                                            refObject->mLifeSpans[nbrLifeSpans - 1].mFrameStop = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxActor
+                                            closeLifespan(refObject, getLifespanCloseFrameId(omniPvdObject, domState)); // omniPvdObject : PxActor
                                         }
                                     }
                                 }
@@ -954,12 +1242,16 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                             //    fem_cloth
                             //    pbd_particlesystem
                             ////////////////////////////////////////////////////////////////////////////////
-                            omniPvdObject->mActortype = *reinterpret_cast<const uint32_t*>(data);
+                            uint32_t actorType;
+                            if (!readAttributeValue(data, dataLen, actorType)) return;
+                            omniPvdObject->mActortype = actorType;
+                            omniPvdObject->mActortypeSet = true;
                         }
                         else if (isSameString(omniPvdAttributeDef->mAttributeName.c_str(),"articulation"))
                         {
                             // which articulation to attach the link to
-                            uint64_t shapeHandle = *((uint64_t*)data);
+                            uint64_t shapeHandle;
+                            if (!readAttributeValue(data, dataLen, shapeHandle)) return;
                             OmniPvdObject *childObject = findChildObject(&shapeHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                             if (childObject)
                             {
@@ -973,17 +1265,18 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                             //   childLink : omniPvdObject <- append the childLink to the parentLink
                             //     joint   : jointObject  <- make sure that the joint appears first in the list of objects
                             ////////////////////////////////////////////////////////////////////////////////
-                            uint64_t jointHandle = *((uint64_t*)data);
+                            uint64_t jointHandle;
+                            if (!readAttributeValue(data, dataLen, jointHandle)) return;
                             OmniPvdObject *jointObject = findChildObject(&jointHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                             if (jointObject)
                             {
                                 ////////////////////////////////////////////////////////////////////////////////
                                 // Get the parentLink object
                                 ////////////////////////////////////////////////////////////////////////////////
-                                uint8_t* attribData = getAttribData(parentLinkAttribIndex, parentLinkClassIndex, "parentLink", jointObject);
-                                if (attribData)
+                                OmniPvdObjectHandle parentHandle;
+                                if (readFirstAttributeValue(parentLinkAttribIndex, parentLinkClassIndex,
+                                                            "parentLink", jointObject, parentHandle))
                                 {
-                                    OmniPvdObjectHandle parentHandle = *(OmniPvdObjectHandle*)attribData;
                                     OmniPvdObject *ancestorObj = findChildObject(&parentHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                     if (ancestorObj)
                                     {
@@ -997,21 +1290,23 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                         {
                             if (cmdType == OmniPvdCommand::eADD_TO_UNIQUE_LIST_ATTRIBUTE)
                             {
-                                uint64_t bufferHandle = *((uint64_t*)data);
+                                uint64_t bufferHandle;
+                                if (!readAttributeValue(data, dataLen, bufferHandle)) return;
                                 OmniPvdObject* childObject = findChildObject(&bufferHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (childObject)
                                 {
-                                    childObject->mLifeSpans[0].mFrameStart = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxActor
+                                    reattachChildSubtree(childObject, getLifespanOpenFrameId(omniPvdObject, domState)); // omniPvdObject : PxActor
                                     omniPvdObject->appendChild(childObject);
                                 }
                             }
                             else if (cmdType == OmniPvdCommand::eREMOVE_FROM_UNIQUE_LIST_ATTRIBUTE)
                             {
-                                uint64_t bufferHandle = *((uint64_t*)data);
+                                uint64_t bufferHandle;
+                                if (!readAttributeValue(data, dataLen, bufferHandle)) return;
                                 OmniPvdObject* childObject = findChildObject(&bufferHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (childObject)
                                 {
-                                    childObject->mLifeSpans[0].mFrameStop = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxActor
+                                    detachChildSubtree(childObject, getLifespanCloseFrameId(omniPvdObject, domState)); // omniPvdObject : PxActor
                                 }
                             }
                         }
@@ -1021,10 +1316,11 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                     {
                         if (isSameString(omniPvdAttributeDef->mAttributeName.c_str(),"isExclusive"))
                         {
-                            if (!(*data)) // isExclusive == false -> shared Shape
+                            uint8_t isExclusive;
+                            if (!readAttributeValue(data, dataLen, isExclusive)) return;
+                            if (!isExclusive) // isExclusive == false -> shared Shape
                             {
                                 omniPvdObject->mIsShared = 1;
-                                omniPvdObject->mAncestor = nullptr;
                                 if (domState->mSharedShapesBranch)
                                 {
                                     domState->mSharedShapesBranch->insertChildFirst(omniPvdObject); // Switch the shape from exclusive to shared and put it into the shared layer
@@ -1039,10 +1335,17 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                         {
                             if (cmdType == OmniPvdCommand::eSET_ATTRIBUTE)
                             {
-                                OmniPvdObject *childObject = findChildObject((uint64_t*)data, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
+                                uint64_t childHandle;
+                                if (!readAttributeValue(data, dataLen, childHandle)) return;
+                                OmniPvdObject *childObject = findChildObject(&childHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                 if (childObject)
                                 {
-                                    childObject->mLifeSpans[0].mFrameStart = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : PxShape
+                                    // Restamp only a newly created geometry object.
+                                    if (!childObject->mLifeSpans.empty() &&
+                                        (childObject->mLifeSpans[0].mFrameStart == 0) && (childObject->mLifeSpans[0].mFrameStop == 0))
+                                    {
+                                        childObject->mLifeSpans[0].mFrameStart = getLifespanOpenFrameId(omniPvdObject, domState); // omniPvdObject : PxShape
+                                    }
                                     omniPvdObject->insertChildFirst(childObject);
                                     // The convexmesh/heighfield/trianglemesh are always shared but if the geom is sphere/capsule/box/
                                     if (omniPvdObject->mIsShared)
@@ -1061,31 +1364,31 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                     case OmniPvdPhysXClassEnum::ePxGeomConvexMesh:
                     {
                         static const std::string str("convexmesh");
-                        attachChildObject(str, cmdType, omniPvdAttributeDef, (uint64_t*)data, omniPvdObject, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
+                        if (!attachChildObjectFromPayload(str, cmdType, omniPvdAttributeDef, data, dataLen, omniPvdObject, domState)) return;
                     }
                     break;
                     case OmniPvdPhysXClassEnum::ePxGeomHeightfield:
                     {
                         static const std::string str("heightfield");
-                        attachChildObject(str, cmdType, omniPvdAttributeDef, (uint64_t*)data, omniPvdObject, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
+                        if (!attachChildObjectFromPayload(str, cmdType, omniPvdAttributeDef, data, dataLen, omniPvdObject, domState)) return;
                     }
                     break;
                     case OmniPvdPhysXClassEnum::ePxGeomTriangleMesh:
                     {
                         static const std::string str("trianglemesh");
-                        attachChildObject(str, cmdType, omniPvdAttributeDef, (uint64_t*)data, omniPvdObject, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
+                        if (!attachChildObjectFromPayload(str, cmdType, omniPvdAttributeDef, data, dataLen, omniPvdObject, domState)) return;
                     }
                     break;
                     case OmniPvdPhysXClassEnum::ePxGeomTetMesh:
                     {
                         static const std::string str("tetrahedronMesh");
-                        attachChildObject(str, cmdType, omniPvdAttributeDef, (uint64_t*)data, omniPvdObject, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
+                        if (!attachChildObjectFromPayload(str, cmdType, omniPvdAttributeDef, data, dataLen, omniPvdObject, domState)) return;
                     }
                     break;
                     case OmniPvdPhysXClassEnum::ePxConvexCoreGeometry:
                     {
                         static const std::string str("core");
-                        attachChildObject(str, cmdType, omniPvdAttributeDef, (uint64_t*)data, omniPvdObject, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
+                        if (!attachChildObjectFromPayload(str, cmdType, omniPvdAttributeDef, data, dataLen, omniPvdObject, domState)) return;
                     }
                     break;
                     default:
@@ -1097,7 +1400,6 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                         {
                             if (dataEnumVal == OmniPvdDataType::eOBJECT_HANDLE)
                             {
-                                uint64_t* refObjectHandles = (uint64_t*)data; // use objecthandle types
                                 int nbrRefObjectHandles = dataLen / sizeof(uint64_t); // use objecthandle types
                                 if (nbrRefObjectHandles > 0)
                                 {
@@ -1118,8 +1420,10 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                                             // NOTE : These keys could potentially just be a single large key of n bytes,
                                             //        which is how the CRC or key value is computed in any case
                                             ////////////////////////////////////////////////////////////////////////////////
+                                            uint64_t refObjectHandle;
+                                            memcpy(&refObjectHandle, data + i * sizeof(uint64_t), sizeof(refObjectHandle));
                                             OmniPvdObject *attribNameObject = 0;
-                                            OmniPvdObject *referencedObject = findChildObject(&refObjectHandles[i], domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
+                                            OmniPvdObject *referencedObject = findChildObject(&refObjectHandle, domState->mExternalToInternalHandleMap, domState->mObjectHandleToObjectMap);
                                             ////////////////////////////////////////////////////////////////////////////////
                                             // Does this object exist in the OmniPVD DOM, that is did a user create it before
                                             // it was referenced?
@@ -1142,7 +1446,11 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                                                     ////////////////////////////////////////////////////////////////////////////////
                                                     if (!attribNameObject)
                                                     {
-                                                        attribNameObject = createNamedObject(domState->mAttributeNameClass, omniPvdAttributeDef->mAttributeName);
+                                                        std::unique_ptr<OmniPvdObject> newName(createNamedObject(domState->mAttributeNameClass,
+                                                                                                                   omniPvdAttributeDef->mAttributeName,
+                                                                                                                   omniPvdObject->mRecordingSegmentId));
+                                                        attribNameObject = newName.get();
+                                                        attribNameObject->mSkipMembershipTraversal = true;
                                                         ////////////////////////////////////////////////////////////////////////////////
                                                         // Make sure that the attribNameObject becomes shared if the parent object is shared
                                                         ////////////////////////////////////////////////////////////////////////////////
@@ -1150,10 +1458,11 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                                                         {
                                                             attribNameObject->mIsShared = 1;
                                                         }
-                                                        attribNameObject->mLifeSpans[0].mFrameStart = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : -
+                                                        attribNameObject->mLifeSpans[0].mFrameStart = getLifespanOpenFrameId(omniPvdObject, domState); // omniPvdObject : -
 
-                                                        omniPvdObject->appendChild(attribNameObject);
                                                         domState->mObjectCreations.push_back(attribNameObject);
+                                                        omniPvdObject->appendChild(attribNameObject);
+                                                        newName.release();
                                                         ////////////////////////////////////////////////////////////////////////////////
                                                         // Insert the attribute name object into the object|attribute map
                                                         ////////////////////////////////////////////////////////////////////////////////
@@ -1168,35 +1477,36 @@ void handleAttributeSetting(OmniPvdReader* reader, const OmniPvdCommand::Enum cm
                                                 uint64_t keyObjectAttribHigh = omniPvdObject->mOmniObjectHandle; // So not more than 4 billion objects? Hmmmm...
                                                 keyObjectAttribHigh = keyObjectAttribHigh << 32;
                                                 uint64_t keyObjectAttribCombined = keyObjectAttribHigh | keyObjectAttribLow;
-                                                OmniPvdObject *refNameObject = findOmniPvdRefObject(keyObjectAttribCombined, refObjectHandles[i], domState->mObjectAttributeRefMap);
+                                                OmniPvdObject *refNameObject = findOmniPvdRefObject(keyObjectAttribCombined, refObjectHandle, domState->mObjectAttributeRefMap);
                                                 if (!refNameObject)
                                                 {
-                                                    refNameObject = createInternalObject(domState->mAttributeRefClass, refObjectHandles[i]); //createNamedObject(domState->mAttributeRefClass, referencedObject->mOmniPvdClass->mClassName);
+                                                    std::unique_ptr<OmniPvdObject> newRef(createInternalObject(domState->mAttributeRefClass, refObjectHandle,
+                                                                                                                 omniPvdObject->mRecordingSegmentId));
+                                                    refNameObject = newRef.get();
                                                     refNameObject->mOmniObjectHandle = referencedObject->mOmniAPIHandle;
                                                     if (omniPvdObject->mIsShared)
                                                     {
                                                         refNameObject->mIsShared = 1;
                                                     }
                                                     referencedObject->mIsShared = 1;
-                                                    refNameObject->mLifeSpans[0].mFrameStart = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : -
+                                                    refNameObject->mLifeSpans[0].mFrameStart = getLifespanOpenFrameId(omniPvdObject, domState); // omniPvdObject : -
 
-                                                    attribNameObject->appendChild(refNameObject);
                                                     domState->mObjectCreations.push_back(refNameObject);
+                                                    attribNameObject->appendChild(refNameObject);
+                                                    newRef.release();
 
                                                     refNameObject->mReferenceObject = referencedObject;
                                                     ////////////////////////////////////////////////////////////////////////////////
                                                     // Insert the attribute name object into the object+attribute|refObject map
                                                     ////////////////////////////////////////////////////////////////////////////////
-                                                    std::pair<uint64_t, uint64_t> key = { keyObjectAttribCombined , refObjectHandles[i] };
+                                                    std::pair<uint64_t, uint64_t> key = { keyObjectAttribCombined , refObjectHandle };
                                                     domState->mObjectAttributeRefMap[key] = referencedObject;
                                                 }
                                                 else
                                                 {
                                                     referencedObject->mIsShared = 1;
                                                     // Create yet another life time key in the refObject
-                                                    const int nbrLifeSpans = (int)refNameObject->mLifeSpans.size();
-                                                    refNameObject->mLifeSpans.resize(nbrLifeSpans + 1);
-                                                    refNameObject->mLifeSpans[nbrLifeSpans].mFrameStart = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : -
+                                                    openLifespan(refNameObject, getLifespanOpenFrameId(omniPvdObject, domState)); // omniPvdObject : -
                                                 }
                                             }
                                         }
@@ -1234,10 +1544,10 @@ void attachFloatingRootLinksToArticulation(OmniPvdDOMState& domState, OmniPvdObj
                 if (link->mAncestor == nullptr)
                 {
                     // Does the link reference the articulation?
-                    uint8_t* attribData = getAttribData(attribIndex, classIndex, "articulation", link);
-                    if (attribData)
+                    OmniPvdObjectHandle articulationtHandle;
+                    if (readFirstAttributeValue(attribIndex, classIndex, "articulation", link,
+                                                articulationtHandle))
                     {
-                        OmniPvdObjectHandle articulationtHandle = *(OmniPvdObjectHandle*)attribData;
                         if (articulationtHandle == articulation.mOmniAPIHandle)
                         {
                             articulation.appendChild(link);
@@ -1251,27 +1561,18 @@ void attachFloatingRootLinksToArticulation(OmniPvdDOMState& domState, OmniPvdObj
 
 void handleObjectCreation(OmniPvdReader* reader, const OmniPvdCommand::Enum cmdType, OmniPvdDOMState* domState)
 {
-    ////////////////////////////////////////////////////////////////////////////////
-    // Here do the version check for the OVD meta data object
-    // mOvdIntegVersionWasChecked is true if the first object if of class type PxOmniPvdMetaData
-    //   and its attribute ovdIntegrationVersionMajor was tested against domState.mOvdIntegrationVersionMajor
-    // mOvdIntegVersionWasChecked is also true if the first object does not contain the attribute ovdIntegrationVersionMajor -> older OVD stream
-    ////////////////////////////////////////////////////////////////////////////////
+    // Validate metadata after the first stream object is complete.
     if (!domState->mOvdIntegVersionWasChecked)
     {
-        if (domState->mObjectCreations.size()==1)
+        if (domState->mNbStreamObjectCreations == 1)
         {
-            ////////////////////////////////////////////////////////////////////////////////
-            // This is the second object of the stream, which means that the attributes
-            // of the ovdIntegration meta data have been set
-            ////////////////////////////////////////////////////////////////////////////////
-            OmniPvdObject* obj = domState->mObjectCreations.front();
+            OmniPvdObject* obj = domState->mFirstStreamObject;
             int32_t attribIndexMajor = -1;
             int32_t classIndex = -1;
-            uint32_t* attribData = (uint32_t*)getAttribData(attribIndexMajor, classIndex, "ovdIntegrationVersionMajor", obj);
-            if (attribData)
+            uint32_t versionMajorStream;
+            if (readFirstAttributeValue(attribIndexMajor, classIndex, "ovdIntegrationVersionMajor", obj,
+                                        versionMajorStream))
             {
-                uint32_t versionMajorStream = *attribData;
                 domState->mStreamOvdIntegVersionMajor = versionMajorStream;
 
                 if (versionMajorStream <=  domState->mOvdIntegrationVersionMajor)
@@ -1281,6 +1582,7 @@ void handleObjectCreation(OmniPvdReader* reader, const OmniPvdCommand::Enum cmdT
                 else
                 {
                     domState->mOvdIntegVersionPassed = false;
+                    domState->mOvdIntegVersionWasChecked = true;
                     PVDDOM_LOG_WARN("   [b2s] Error : PhysX OVD integration version major is too high, not able to parse the OVD object stream confidently");
                     return;
                 }
@@ -1292,10 +1594,11 @@ void handleObjectCreation(OmniPvdReader* reader, const OmniPvdCommand::Enum cmdT
             domState->mOvdIntegVersionWasChecked = true;
 
             int32_t attribIndexMinor = -1;
-            attribData = (uint32_t*)getAttribData(attribIndexMinor, classIndex, "ovdIntegrationVersionMinor", obj);
-            if (attribData)
+            uint32_t versionMinorStream;
+            if (readFirstAttributeValue(attribIndexMinor, classIndex, "ovdIntegrationVersionMinor", obj,
+                                        versionMinorStream))
             {
-                domState->mStreamOvdIntegVersionMinor = *attribData;
+                domState->mStreamOvdIntegVersionMinor = versionMinorStream;
             }
         }
     }
@@ -1307,19 +1610,30 @@ void handleObjectCreation(OmniPvdReader* reader, const OmniPvdCommand::Enum cmdT
         PVDDOM_LOG_WARN("   [b2s] Error : object handle is zero");
         return;
     }
+    OmniPvdClassHandle classHandle = reader->getClassHandle();
+    OmniPvdClass* omniPvdClass = findOmniPvdClass(classHandle, domState->mClassHandleToClassMap);
+    if (omniPvdClass && omniPvdClass->mClassName == "PxOmniPvdMetaData")
+    {
+        beginRecordingSegment(domState);
+    }
+
+    bool objectHandleWasSuperseded = false;
     {
         OmniPvdObjectHandle internalHandle = getInternalHandle(externalObjectHandle, domState->mExternalToInternalHandleMap);
         OmniPvdObject *oldOmniPvdObject = findOmniPvdObject(internalHandle, domState->mObjectHandleToObjectMap);
-        if (oldOmniPvdObject && (oldOmniPvdObject->mLifeSpans[0].mFrameStop == 0))
+        if (oldOmniPvdObject)
         {
-            oldOmniPvdObject->mLifeSpans[0].mFrameStop = getFrameIdFromScene(oldOmniPvdObject, domState); // oldOmniPvdObject : -
+            const uint64_t supersedeClose = getSupersedeCloseFrameId(oldOmniPvdObject, domState); // oldOmniPvdObject : -
+            closeLifespan(oldOmniPvdObject, supersedeClose);
+            closeOpenDescendants(oldOmniPvdObject, supersedeClose, domState);
+            oldOmniPvdObject->mReopenable = false; // superseded object is gone; never reopen it
+            oldOmniPvdObject->mWasDestroyed = true;
+            objectHandleWasSuperseded = true; // the object created below re-uses a live handle (segment re-attach)
         }
     }
     domState->mExternalToInternalHandleMap[externalObjectHandle] = domState->mNextInternalHandle;
     OmniPvdObjectHandle internalHandle = domState->mNextInternalHandle;
     domState->mNextInternalHandle++;
-    OmniPvdClassHandle classHandle = reader->getClassHandle();
-    OmniPvdClass *omniPvdClass = findOmniPvdClass(classHandle, domState->mClassHandleToClassMap);
     if (omniPvdClass) // Does the class exist?
     {
         const int nbrInheritedClasses = static_cast<int>(omniPvdClass->mInheritanceChain.size());
@@ -1329,32 +1643,56 @@ void handleObjectCreation(OmniPvdReader* reader, const OmniPvdCommand::Enum cmdT
             return;
         }
 
-        OmniPvdObject *omniPvdObject = new OmniPvdObject();
+        std::unique_ptr<OmniPvdObject> newObject(new OmniPvdObject());
+        OmniPvdObject *omniPvdObject = newObject.get();
+        domState->mObjectCreations.push_back(omniPvdObject);
+        newObject.release();
         omniPvdObject->mOmniPvdClass = omniPvdClass;
         omniPvdObject->mOmniAPIHandle = externalObjectHandle; // Holds the value of the PhysX pointer
         omniPvdObject->mOmniObjectHandle = omniPvdClass->reserveObjectId(); // Internal handle, less important actually
-        omniPvdObject->mLifeSpans[0].mFrameStart = 0; // Same as getFrameIdFromScene(omniPvdObject, domState);
+        omniPvdObject->mLifeSpans[0].mFrameStart = 0; // start of the timeline; list-add handlers restamp it
+        omniPvdObject->mIsSupersedeRecreate = objectHandleWasSuperseded; // re-attach snapshot samples belong at frame 0
+        omniPvdObject->mRecordingSegmentId = domState->mCurrentRecordingSegmentId;
+        if (objectHandleWasSuperseded)
+        {
+            domState->mSupersedeSnapshotObjects.push_back(omniPvdObject);
+        }
 
         omniPvdObject->mOmniObjectName = reader->getObjectName();
+
+        if (domState->mNbStreamObjectCreations == 0)
+        {
+            domState->mFirstStreamObject = omniPvdObject;
+        }
+        domState->mNbStreamObjectCreations++;
 
         //printf("object creation omniPvdClass(%s)\n", omniPvdClass->mClassName.c_str());
 
         ////////////////////////////////////////////////////////////////////////////////
         // The object is a PxScene, add it to a special list for startFrame event processing
         ////////////////////////////////////////////////////////////////////////////////
-        if (omniPvdClass == domState->mPxSceneClass)
+        if (omniPvdClass->mIsSceneClass)
         {
             domState->mSceneCreations.push_back(omniPvdObject);
         }
 
         // Should be possible to have several ref objects
-        OmniPvdObject *refObject = 0;
+        std::unique_ptr<OmniPvdObject> refObject;
 
         switch (omniPvdClass->mPhysXBaseProcessingClassId)
         {
         case OmniPvdPhysXClassEnum::ePxScene:
         {
-            if (domState->mSceneRoot) domState->mSceneRoot->appendChild(omniPvdObject);
+            // Parent the scene under the latest PxPhysics object.
+            if (domState->mLastPhysics)
+                domState->mLastPhysics->appendChild(omniPvdObject);
+            else if (domState->mSceneRoot)
+                domState->mSceneRoot->appendChild(omniPvdObject);
+        }
+        break;
+        case OmniPvdPhysXClassEnum::ePxPhysics:
+        {
+            domState->mLastPhysics = omniPvdObject;
         }
         break;
         case OmniPvdPhysXClassEnum::ePxActor:
@@ -1363,22 +1701,26 @@ void handleObjectCreation(OmniPvdReader* reader, const OmniPvdCommand::Enum cmdT
         break;
         case OmniPvdPhysXClassEnum::ePxGeomConvexMesh:
         {
-            refObject = createInternalObject(domState->mConvexMeshRefClass, 0);
+            refObject.reset(createInternalObject(domState->mConvexMeshRefClass, 0,
+                                                 omniPvdObject->mRecordingSegmentId));
         }
         break;
         case OmniPvdPhysXClassEnum::ePxGeomHeightfield:
         {
-            refObject = createInternalObject(domState->mHeightfieldRefClass, 0);
+            refObject.reset(createInternalObject(domState->mHeightfieldRefClass, 0,
+                                                 omniPvdObject->mRecordingSegmentId));
         }
         break;
         case OmniPvdPhysXClassEnum::ePxGeomTriangleMesh:
         {
-            refObject = createInternalObject(domState->mTriangleMeshRefClass, 0);
+            refObject.reset(createInternalObject(domState->mTriangleMeshRefClass, 0,
+                                                 omniPvdObject->mRecordingSegmentId));
         }
         break;
         case OmniPvdPhysXClassEnum::ePxGeomTetMesh:
         {
-            refObject = createInternalObject(domState->mTetrahedronMeshRefClass, 0);
+            refObject.reset(createInternalObject(domState->mTetrahedronMeshRefClass, 0,
+                                                 omniPvdObject->mRecordingSegmentId));
         }
         break;
         case OmniPvdPhysXClassEnum::ePxConvexMesh:
@@ -1444,14 +1786,12 @@ void handleObjectCreation(OmniPvdReader* reader, const OmniPvdCommand::Enum cmdT
         // Schedule the object for creation and also potentially its child reference
         // object.
         ////////////////////////////////////////////////////////////////////////////////
-        domState->mObjectCreations.push_back(omniPvdObject);
         if (refObject)
         {
-            refObject->mLifeSpans[0].mFrameStart = getFrameIdFromScene(omniPvdObject, domState); // omniPvdObject : -
-            omniPvdObject->appendChild(refObject);
-
-            domState->mObjectCreations.push_back(refObject);
-            omniPvdObject->mReferenceObject = refObject;
+            refObject->mLifeSpans[0].mFrameStart = getLifespanOpenFrameId(omniPvdObject, domState); // omniPvdObject : -
+            domState->mObjectCreations.push_back(refObject.get());
+            omniPvdObject->appendChild(refObject.get());
+            omniPvdObject->mReferenceObject = refObject.release();
         }
 
         if (omniPvdObject->mOmniPvdClass == domState->mPxArticulationReducedCoordinateClass)
@@ -1468,14 +1808,6 @@ void handleObjectCreation(OmniPvdReader* reader, const OmniPvdCommand::Enum cmdT
 void OMNI_PVD_CALL logFunc(char *logLine)
 {
     printf("my log : %s", logLine);
-}
-
-// pvdruntime factory functions (compiled into pvddom, no DLL loading)
-extern "C" {
-    OmniPvdReader* OMNI_PVD_CALL createOmniPvdReader();
-    void OMNI_PVD_CALL destroyOmniPvdReader(OmniPvdReader& reader);
-    OmniPvdFileReadStream* OMNI_PVD_CALL createOmniPvdFileReadStream();
-    void OMNI_PVD_CALL destroyOmniPvdFileReadStream(OmniPvdFileReadStream& stream);
 }
 
 void applyPvdDomCommand(OmniPvdReader& readerRef, OmniPvdDOMState& domState, OmniPvdCommand::Enum cmdType)
@@ -1528,9 +1860,13 @@ void applyPvdDomCommand(OmniPvdReader& readerRef, OmniPvdDOMState& domState, Omn
             {
                 uint64_t internalHandle = getInternalHandle(externalObjectHandle, domState.mExternalToInternalHandleMap);
                 OmniPvdObject *oldOmniPvdObject = findOmniPvdObject(internalHandle, domState.mObjectHandleToObjectMap);
-                if (oldOmniPvdObject && (oldOmniPvdObject->mLifeSpans[0].mFrameStop == 0))
+                if (oldOmniPvdObject)
                 {
-                    oldOmniPvdObject->mLifeSpans[0].mFrameStop = getFrameIdFromScene(oldOmniPvdObject, &domState); // oldOmniPvdObject : -
+                    const uint64_t destroyClose = getLifespanCloseFrameId(oldOmniPvdObject, &domState); // oldOmniPvdObject : -
+                    closeLifespan(oldOmniPvdObject, destroyClose);
+                    closeOpenDescendants(oldOmniPvdObject, destroyClose);
+                    oldOmniPvdObject->mReopenable = false; // destroyed object is gone; never reopen it
+                    oldOmniPvdObject->mWasDestroyed = true;
                 }
             }
         }
@@ -1545,6 +1881,7 @@ void applyPvdDomCommand(OmniPvdReader& readerRef, OmniPvdDOMState& domState, Omn
             ////////////////////////////////////////////////////////////////////////////////
             uint64_t contextId = reader->getContextHandle();
             uint64_t frameId = reader->getFrameTimeStart();
+            finishSupersedeSnapshots(&domState);
 
             bool contextAwareStartFrameStream = largerOrEqualOVDIntegversion(1, 4, domState.mStreamOvdIntegVersionMajor, domState.mStreamOvdIntegVersionMinor);
            if (contextAwareStartFrameStream)
@@ -1573,7 +1910,6 @@ void applyPvdDomCommand(OmniPvdReader& readerRef, OmniPvdDOMState& domState, Omn
                     sceneObject->mFrameId = frameId;
                 }
             }
-            // update the min/max
             if (domState.mMinFrame > frameId)
             {
                 domState.mMinFrame = frameId;
@@ -1582,6 +1918,12 @@ void applyPvdDomCommand(OmniPvdReader& readerRef, OmniPvdDOMState& domState, Omn
             {
                 domState.mMaxFrame = frameId;
             }
+            uint64_t& segmentMax = domState.mRecordingSegmentMaxFrames[domState.mCurrentRecordingSegmentId];
+            if (segmentMax < frameId)
+            {
+                segmentMax = frameId;
+            }
+            domState.mLatestStartedFrame = frameId;
             //printf("   [b2s] start frame (contextHandle: %d, timeStampe: %" PRIu64 ")\n", (int)reader->getCommandContextHandle(), reader->getCommandFrameTimeStart());
         }
         break;
@@ -1643,10 +1985,21 @@ bool buildPvdDomState(OmniPvdReader* reader, OmniPvdDOMState& domState)
     {
         applyPvdDomCommand(*reader, domState, cmdType);
     }
+    if (domState.mOvdIntegVersionWasChecked && !domState.mOvdIntegVersionPassed)
+    {
+        // Reject unsupported integration versions.
+        return false;
+    }
     return (domState.mExternalToInternalHandleMap.size() >= 1);
 }
 
 bool buildPvdDomStateFromFile(const char* ovdFilePath, OmniPvdDOMState& domState)
+{
+    return buildPvdDomStateFromFile(ovdFilePath, domState, OmniPvdReaderDiagnostics());
+}
+
+bool buildPvdDomStateFromFile(const char* ovdFilePath, OmniPvdDOMState& domState,
+                              const OmniPvdReaderDiagnostics& diagnostics)
 {
     // Clear any messages left over from a previous load so callers don't see
     // stale diagnostics accumulated across invocations.
@@ -1654,6 +2007,7 @@ bool buildPvdDomStateFromFile(const char* ovdFilePath, OmniPvdDOMState& domState
 
     OmniPvdReader* reader = createOmniPvdReader();
     if (!reader) return false;
+    setOmniPvdReaderDiagnostics(*reader, diagnostics);
 
     OmniPvdFileReadStream* readStream = createOmniPvdFileReadStream();
     if (!readStream) {
@@ -1662,27 +2016,28 @@ bool buildPvdDomStateFromFile(const char* ovdFilePath, OmniPvdDOMState& domState
     }
 
     readStream->setFileName(ovdFilePath);
-    if (!readStream->openFile()) {
-        destroyOmniPvdFileReadStream(*readStream);
+    if (!readStream->openStream())
+    {
+        PVDDOM_LOG_ERROR("buildPvdDomStateFromFile: failed to open OVD file: %s", ovdFilePath);
         destroyOmniPvdReader(*reader);
+        destroyOmniPvdFileReadStream(*readStream);
         return false;
     }
-
     reader->setReadStream(*readStream);
     OmniPvdVersionType majorVersion, minorVersion, patch;
     if (!reader->startReading(majorVersion, minorVersion, patch))
     {
         PVDDOM_LOG_ERROR("buildPvdDomStateFromFile: reader->startReading failed (malformed or incompatible OVD header): %s", ovdFilePath);
-        readStream->closeFile();
-        destroyOmniPvdFileReadStream(*readStream);
         destroyOmniPvdReader(*reader);
+        readStream->closeStream();
+        destroyOmniPvdFileReadStream(*readStream);
         return false;
     }
 
     bool result = buildPvdDomState(reader, domState);
 
-    readStream->closeFile();
-    destroyOmniPvdFileReadStream(*readStream);
     destroyOmniPvdReader(*reader);
+    readStream->closeStream();
+    destroyOmniPvdFileReadStream(*readStream);
     return result;
 }

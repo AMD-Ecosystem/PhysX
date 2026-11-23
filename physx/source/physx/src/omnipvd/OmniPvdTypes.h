@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 // Declare OMNI_PVD Types and Attributes here!
 // The last two attribute parameters could now be derived from the other data, so could be removed in a refactor, 
@@ -86,7 +63,6 @@ OMNI_PVD_ENUM_END		(PxRigidBodyFlag)
 
 OMNI_PVD_ENUM_BEGIN		(PxArticulationFlag)
 OMNI_PVD_ENUM_VALUE		(PxArticulationFlag, eFIX_BASE)
-OMNI_PVD_ENUM_VALUE		(PxArticulationFlag, eDRIVE_LIMITS_ARE_FORCES)
 OMNI_PVD_ENUM_VALUE		(PxArticulationFlag, eDISABLE_SELF_COLLISION)
 OMNI_PVD_ENUM_END		(PxArticulationFlag)
 
@@ -128,10 +104,6 @@ OMNI_PVD_ENUM_END		(PxParticleLockFlag)
 ////////////////////////////////////////////////////////////////////////////////
 // Single value enums
 ////////////////////////////////////////////////////////////////////////////////
-
-OMNI_PVD_ENUM_BEGIN		(PxFrictionType)
-OMNI_PVD_ENUM_VALUE		(PxFrictionType, ePATCH)
-OMNI_PVD_ENUM_END		(PxFrictionType)
 
 OMNI_PVD_ENUM_BEGIN		(PxBroadPhaseType)
 OMNI_PVD_ENUM_VALUE		(PxBroadPhaseType, eSAP)
@@ -231,7 +203,25 @@ OMNI_PVD_ATTRIBUTE	 (PxOmniPvdMetaData, physxVersionMinor, PxU32, OmniPvdDataTyp
 OMNI_PVD_ATTRIBUTE	 (PxOmniPvdMetaData, physxVersionBugfix, PxU32, OmniPvdDataType::eUINT32)
 OMNI_PVD_ATTRIBUTE	 (PxOmniPvdMetaData, ovdIntegrationVersionMajor, PxU32, OmniPvdDataType::eUINT32)
 OMNI_PVD_ATTRIBUTE	 (PxOmniPvdMetaData, ovdIntegrationVersionMinor, PxU32, OmniPvdDataType::eUINT32)
+OMNI_PVD_ATTRIBUTE	 (PxOmniPvdMetaData, recordSecondaryData, bool, OmniPvdDataType::eUINT8)
+OMNI_PVD_ATTRIBUTE	 (PxOmniPvdMetaData, captureAllObjects, bool, OmniPvdDataType::eUINT8)
+OMNI_PVD_ATTRIBUTE	 (PxOmniPvdMetaData, captureRequestId, PxU64, OmniPvdDataType::eUINT64)
+OMNI_PVD_ATTRIBUTE	 (PxOmniPvdMetaData, captureRequestStatus, PxU32, OmniPvdDataType::eUINT32)
+OMNI_PVD_ATTRIBUTE	 (PxOmniPvdMetaData, captureEpoch, PxU64, OmniPvdDataType::eUINT64)
+OMNI_PVD_ATTRIBUTE	 (PxOmniPvdMetaData, captureCatalogGeneration, PxU64, OmniPvdDataType::eUINT64)
 OMNI_PVD_CLASS_END   (PxOmniPvdMetaData)
+
+////////////////////////////////////////////////////////////////////////////////
+// Identity-only discovery rows. Numeric IDs refer to capture targets, not OVD objects.
+////////////////////////////////////////////////////////////////////////////////
+OMNI_PVD_CLASS_UNTYPED_BEGIN (PxOmniPvdCaptureEntry)
+OMNI_PVD_ATTRIBUTE (PxOmniPvdCaptureEntry, targetHandle, PxU64, OmniPvdDataType::eUINT64)
+OMNI_PVD_ATTRIBUTE_STRING (PxOmniPvdCaptureEntry, typeName)
+OMNI_PVD_ATTRIBUTE_STRING (PxOmniPvdCaptureEntry, name)
+OMNI_PVD_ATTRIBUTE (PxOmniPvdCaptureEntry, ownerHandle, PxU64, OmniPvdDataType::eUINT64)
+OMNI_PVD_ATTRIBUTE (PxOmniPvdCaptureEntry, sceneHandle, PxU64, OmniPvdDataType::eUINT64)
+OMNI_PVD_ATTRIBUTE (PxOmniPvdCaptureEntry, canSelect, bool, OmniPvdDataType::eUINT8)
+OMNI_PVD_CLASS_END (PxOmniPvdCaptureEntry)
 
 ////////////////////////////////////////////////////////////////////////////////
 // PxPhysics
@@ -287,7 +277,6 @@ OMNI_PVD_ATTRIBUTE_UNIQUE_LIST			(PxScene,		articulations,			PxArticulationReduc
 OMNI_PVD_ATTRIBUTE_UNIQUE_LIST			(PxScene,		aggregates,				PxAggregate)
 OMNI_PVD_ATTRIBUTE_UNIQUE_LIST			(PxScene,		constraints,			PxConstraint)
 OMNI_PVD_ATTRIBUTE_FLAG					(PxScene,		flags,					PxSceneFlags,			PxSceneFlag)
-OMNI_PVD_ATTRIBUTE_FLAG					(PxScene,		frictionType,			PxFrictionType::Enum,	PxFrictionType)
 OMNI_PVD_ATTRIBUTE_FLAG					(PxScene,		broadPhaseType,			PxBroadPhaseType::Enum,	PxBroadPhaseType)
 OMNI_PVD_ATTRIBUTE_FLAG					(PxScene,		kineKineFilteringMode,	PxPairFilteringMode::Enum,	PxPairFilteringMode)
 OMNI_PVD_ATTRIBUTE_FLAG					(PxScene,		staticKineFilteringMode,PxPairFilteringMode::Enum,	PxPairFilteringMode)
@@ -480,6 +469,8 @@ OMNI_PVD_ATTRIBUTE					(PxRigidBody, linearDamping, PxReal, OmniPvdDataType::eFL
 OMNI_PVD_ATTRIBUTE					(PxRigidBody, angularDamping, PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE_ARRAY_FIXED_SIZE	(PxRigidBody, linearVelocity, PxVec3, OmniPvdDataType::eFLOAT32, 3)
 OMNI_PVD_ATTRIBUTE_ARRAY_FIXED_SIZE	(PxRigidBody, angularVelocity, PxVec3, OmniPvdDataType::eFLOAT32, 3)
+OMNI_PVD_ATTRIBUTE_ARRAY_FIXED_SIZE	(PxRigidBody, linearAcceleration, PxVec3, OmniPvdDataType::eFLOAT32, 3)
+OMNI_PVD_ATTRIBUTE_ARRAY_FIXED_SIZE	(PxRigidBody, angularAcceleration, PxVec3, OmniPvdDataType::eFLOAT32, 3)
 OMNI_PVD_ATTRIBUTE					(PxRigidBody, maxLinearVelocity, PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE					(PxRigidBody, maxAngularVelocity, PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE_FLAG				(PxRigidBody, rigidBodyFlags, PxRigidBodyFlags, PxRigidBodyFlag)
@@ -493,8 +484,6 @@ OMNI_PVD_CLASS_END					(PxRigidBody)
 
 ////////////////////////////////////////////////////////////////////////////////
 // PxRigidDynamic
-// Missing
-//	 kinematicTarget?
 ////////////////////////////////////////////////////////////////////////////////
 OMNI_PVD_CLASS_DERIVED_BEGIN	(PxRigidDynamic, PxRigidBody)
 OMNI_PVD_ATTRIBUTE				(PxRigidDynamic, isSleeping, bool, OmniPvdDataType::eUINT8)
@@ -505,6 +494,8 @@ OMNI_PVD_ATTRIBUTE				(PxRigidDynamic, wakeCounter, PxReal, OmniPvdDataType::eFL
 OMNI_PVD_ATTRIBUTE				(PxRigidDynamic, positionIterations, PxU32, OmniPvdDataType::eUINT32)
 OMNI_PVD_ATTRIBUTE				(PxRigidDynamic, velocityIterations, PxU32, OmniPvdDataType::eUINT32)
 OMNI_PVD_ATTRIBUTE				(PxRigidDynamic, contactReportThreshold, PxReal, OmniPvdDataType::eFLOAT32)
+// Retains the most recently captured actor-space input after the pending target is consumed.
+OMNI_PVD_ATTRIBUTE_ARRAY_FIXED_SIZE	(PxRigidDynamic, kinematicTarget, PxTransform, OmniPvdDataType::eFLOAT32, 7)
 OMNI_PVD_CLASS_END				(PxRigidDynamic)
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -575,15 +566,21 @@ OMNI_PVD_ATTRIBUTE								(PxDeformableVolume, selfCollisionStressTolerance,	PxR
 OMNI_PVD_ATTRIBUTE								(PxDeformableVolume, nbCollisionMeshVertices,	PxU32,		OmniPvdDataType::eUINT32)
 OMNI_PVD_ATTRIBUTE								(PxDeformableVolume, nbSimulationMeshVertices,	PxU32,		OmniPvdDataType::eUINT32)
 OMNI_PVD_ATTRIBUTE_UNIQUE_LIST					(PxDeformableVolume, simulationMeshShapes,		PxTetrahedronMesh)
+OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE		(PxDeformableVolume, collisionPositions, PxReal, OmniPvdDataType::eFLOAT32)
+OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE		(PxDeformableVolume, simulationPositions, PxReal, OmniPvdDataType::eFLOAT32)
+OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE		(PxDeformableVolume, velocities, PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_CLASS_END								(PxDeformableVolume)
 
 ////////////////////////////////////////////////////////////////////////////////
 // PxDeformableSurface
 ////////////////////////////////////////////////////////////////////////////////
 OMNI_PVD_CLASS_DERIVED_BEGIN					(PxDeformableSurface, PxDeformableBody)
+OMNI_PVD_ATTRIBUTE								(PxDeformableSurface, collisionMesh, PxTriangleMesh* const, OmniPvdDataType::eOBJECT_HANDLE)
 OMNI_PVD_ATTRIBUTE								(PxDeformableSurface, nbCollisionPairUpdatesPerTimestep,	PxU32,		OmniPvdDataType::eUINT32)
 OMNI_PVD_ATTRIBUTE								(PxDeformableSurface, nbCollisionSubsteps,					PxU32,		OmniPvdDataType::eUINT32)
 OMNI_PVD_ATTRIBUTE								(PxDeformableSurface, nbVertices,							PxU32,		OmniPvdDataType::eUINT32)
+OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE		(PxDeformableSurface, positions, PxReal, OmniPvdDataType::eFLOAT32)
+OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE		(PxDeformableSurface, velocities, PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_CLASS_END								(PxDeformableSurface)
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -617,17 +614,16 @@ OMNI_PVD_ATTRIBUTE_FLAG					(PxArticulationJointReducedCoordinate, type,					PxA
 OMNI_PVD_ATTRIBUTE_STRING				(PxArticulationJointReducedCoordinate, name)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, motion,					PxArticulationMotion::Enum, OmniPvdDataType::eUINT32)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, armature,				PxReal, OmniPvdDataType::eFLOAT32)
-OMNI_PVD_ATTRIBUTE						(PxArticulationJointReducedCoordinate, frictionCoefficient,		PxReal, OmniPvdDataType::eFLOAT32)
-OMNI_PVD_ATTRIBUTE						(PxArticulationJointReducedCoordinate, maxJointVelocity,		PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, jointPosition,			PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, jointVelocity,			PxReal, OmniPvdDataType::eFLOAT32)
+OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, jointAcceleration,		PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, jointForce,				PxReal, OmniPvdDataType::eFLOAT32)
+OMNI_PVD_ATTRIBUTE_ARRAY_FIXED_SIZE	(PxArticulationJointReducedCoordinate, incomingJointForce,	OmniPvdJointReaction, OmniPvdDataType::eFLOAT32, 6)
 OMNI_PVD_ATTRIBUTE_STRING				(PxArticulationJointReducedCoordinate, concreteTypeName)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, limitLow,				PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, limitHigh,				PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, driveStiffness,			PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, driveDamping,			PxReal, OmniPvdDataType::eFLOAT32)
-OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, driveMaxForce,			PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, driveMaxEffort,			PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, driveMaxActuatorVelocity,PxReal, OmniPvdDataType::eFLOAT32)
 OMNI_PVD_ATTRIBUTE_ARRAY_VARIABLE_SIZE	(PxArticulationJointReducedCoordinate, driveVelocityDependentResistance,PxReal, OmniPvdDataType::eFLOAT32)

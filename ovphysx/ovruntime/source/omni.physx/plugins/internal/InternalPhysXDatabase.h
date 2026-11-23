@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * @implements REQ-ATTACH-RESOLVE-001
+ * @covers AC-7, AC-11
+ */
 
 #pragma once
 
 #include "Internal.h"
 #include "InternalVehicle.h"
-#include "InternalVoxelMap.h"
 #include "InternalActor.h"
 #include "InternalScene.h"
 #include "InternalDebugDraw.h"
@@ -31,13 +35,19 @@ using PxJointMap = std::unordered_multimap<omni::physics::parse::ObjectKey, std:
 using SplinesCurveMap =
     std::unordered_map<omni::physics::parse::ObjectKey, SplinesCurve*, omni::physics::parse::ObjectKey::Hash>;
 
+// Source-agnostic mirror of a point instancer's initial-transform arrays, written by
+// InternalActor's constructor (raw USD capture, still fenced there) and consumed by
+// resetStartProperties()'s write-back through IPhysicsDataWrite::writeArray (unconditional,
+// same tok.positions/orientations/scales/velocities/angularVelocities tokens
+// flushInstancerArrays in InternalScene.cpp already uses). orientations are xyzw
+// (real-last, PxQuat/IPhysicsDataWrite convention), not GfQuath's wxyz storage order.
 struct InitialInstancerData
 {
-    PXR_NS::VtArray<PXR_NS::GfVec3f> positions;
-    PXR_NS::VtArray<PXR_NS::GfQuath> orientations;
-    PXR_NS::VtArray<PXR_NS::GfVec3f> scales;
-    PXR_NS::VtArray<PXR_NS::GfVec3f> velocities;
-    PXR_NS::VtArray<PXR_NS::GfVec3f> angularVelocities;
+    std::vector<carb::Float3> positions;
+    std::vector<carb::Float4> orientations;
+    std::vector<carb::Float3> scales;
+    std::vector<carb::Float3> velocities;
+    std::vector<carb::Float3> angularVelocities;
 };
 
 using TransformsInstanceMap =
@@ -46,7 +56,7 @@ using TransformsInstanceMap =
 class InternalPhysXDatabase : public InternalDatabase
 {
 public:
-    InternalPhysXDatabase();
+    explicit InternalPhysXDatabase(const usdparser::AttachedStage* attachedStage = nullptr);
     ~InternalPhysXDatabase();
 
     void release();
@@ -54,7 +64,8 @@ public:
     void resetStartProperties(bool useUsdUpdate, bool useVelocitiesUSDUpdate, bool outputVelocitiesLocalSpace);
 
     omni::physx::usdparser::ObjectId createTireFrictionTable(
-        const omni::physx::usdparser::TireFrictionTableDesc& tireFrictionTableDesc, const PXR_NS::UsdPrim& usdPrim);
+        const usdparser::AttachedStage& attachedStage,
+        const omni::physx::usdparser::TireFrictionTableDesc& tireFrictionTableDesc);
 
     void addDirtyMassActor(size_t actorIndex);
     void addDirtyMassActor(InternalActor* actor);
@@ -126,12 +137,16 @@ public:
 
 public:
     bool mInitialTransformsStored;
+    // ActorInitialDataMap (internal/InternalActor.h): Kit-only USD xform-op-restore-on-stop
+    // state; see its own comment.
     ActorInitialDataMap mInitialActorDataMap;
     TransformsInstanceMap mInitialPointInstancerTransforms;
 
     PxJointMap mPxJointMap;
 
 private:
+    const usdparser::AttachedStage* mAttachedStage;
+
     std::vector<InternalActor*> mDirtyMassActorList;
     std::vector<InternalParticle*> mDirtyMassParticleList;
 

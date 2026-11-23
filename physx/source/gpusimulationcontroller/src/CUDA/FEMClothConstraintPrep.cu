@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PxgFEMCloth.h"
 #include "vector_types.h"
@@ -58,12 +35,12 @@ extern "C" __global__ void cloth_rigidContactPrepareLaunch(
 	float4*							contacts_restW,
 	float4*							normalPens,
 	float4*							barycentrics,
-	const PxgFemOtherContactInfo*	contactInfos,
+	const PxgDeformablePairInfo*	contactInfos,
 	PxU32*							numContacts,
-	PxgDbRigidContactBlock*			contactBlocks,
+	PxgRigidDbContactBlock*			contactBlocks,
 	PxgPrePrepDesc*					preDesc,
 	PxgConstraintPrepareDesc*		prepareDesc,
-	PxReal* 						rigidLambdaNs, 
+	float2*							rigidLambdaNs,
 	const PxReal					invDt,
 	PxgSolverSharedDescBase*		sharedDesc,
 	bool							isTGS
@@ -83,25 +60,21 @@ extern "C" __global__ void cloth_rigidContactPrepareLaunch(
 		if(workIndex >= tNumContacts)
 			return;
 
-		rigidLambdaNs[workIndex] = 0.0f;
+		rigidLambdaNs[workIndex] = make_float2(0.f, 0.f);
 
-		PxgFemOtherContactInfo contactInfo = contactInfos[workIndex];
-		PxgDbRigidContactBlock& block = contactBlocks[workIndex / 32];
-
-		PxU64 pairInd0 = contactInfo.pairInd0;
+		PxgDeformablePairInfo contactInfo = contactInfos[workIndex];
+		PxgRigidDbContactBlock& block = contactBlocks[workIndex / 32];
 
 		// First one is rigid body
-		const PxU64 tRigidId = pairInd0;
-		const PxNodeIndex& rigidId = reinterpret_cast<const PxNodeIndex&>(tRigidId);
+		const PxNodeIndex rigidId = PxgGetRigidNode(contactInfo.ref0);
 
-		// Second one is cloth
-		PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-
-		PxgFEMCloth& cloth = femClothes[PxGetClothId(pairInd1)];
-		const PxU32 elementId = PxGetClothElementIndex(pairInd1);
-
-		if(elementId == 0xfffff)
+		if(!PxgIsValidPairInfo(contactInfo))
 			continue;
+
+		// Second one is cloth.
+		PxgFEMCloth& cloth = femClothes[PxgGetDeformableId(contactInfo.ref1)];
+		const PxU32 elementId = PxgGetDeformableFeatureId(contactInfo.ref1);
+		const bool clothIsVertex = PxgGetDeformableFeatureType(contactInfo.ref1) == PxgDeformableRef::eVERTEX;
 
 		const float4* PX_RESTRICT accumDelta_invMass = cloth.mAccumulatedDeltaPos;
 
@@ -110,12 +83,11 @@ extern "C" __global__ void cloth_rigidContactPrepareLaunch(
 
 		const PxVec3 p(contact_restW.x, contact_restW.y, contact_restW.z);
 
-		float4 barycentric = barycentrics[workIndex];
-
 		float4 deltaP;
-		if(barycentric.w == 0.f)
+		if(!clothIsVertex)
 		{
-			const uint4 vertexIndices = cloth.mTriangleVertexIndices[elementId];
+			const float4 barycentric = barycentrics[workIndex];
+			const uint4 vertexIndices = cloth.mTriangleVertexIndices_ownedEdges[elementId];
 			deltaP = barycentricProjectTri(vertexIndices, accumDelta_invMass, barycentric);
 		}
 		else
@@ -128,7 +100,8 @@ extern "C" __global__ void cloth_rigidContactPrepareLaunch(
 
 		const PxVec3 delta(deltaP.x, deltaP.y, deltaP.z);
 
-		prepareDbRigidContact(block, normal, sharedDesc, p, pen, delta, rigidId, barycentric, prepareDesc, solverBodyIndices, cloth.mPenBiasClamp, invDt, isTGS);
+		prepareRigidDbContact(block, normal, sharedDesc, p, pen, delta, rigidId,
+							  prepareDesc, solverBodyIndices, cloth.mPenBiasClamp, invDt, isTGS);
 	}
 }
 
@@ -140,7 +113,7 @@ extern "C" __global__ void cloth_rigidContactPrepareLaunch(
 extern "C" __global__ 
 void cloth_clothContactPrepareLaunch(
 	PxgFEMCloth*						clothes,
-	PxgFemFemContactInfo*				contactInfos,
+	PxgDeformablePairInfo*				contactInfos,
 	PxU32*								numContacts,
 	PxU32								maxContacts,
 	PxsDeformableSurfaceMaterialData*	clothMaterials,
@@ -171,36 +144,39 @@ void cloth_clothContactPrepareLaunch(
 			return;
 		}
 
-		PxgFemFemContactInfo contactInfo = contactInfos[workIndex];
-		if(contactInfo.isValidPair()) // For different cloths, contactInfo is already set to valid.
+		PxgDeformablePairInfo contactInfo = contactInfos[workIndex];
+
+		const PxU32 clothId0 = PxgGetDeformableId(contactInfo.ref0);
+		const PxU32 clothId1 = PxgGetDeformableId(contactInfo.ref1);
+
+		// Only self-collision needs the exact test. A contact between two cloths stands as generated,
+		// the midphase having applied the filter distance that self-collision only approximates.
+		if(clothId0 != clothId1)
 		{
 			continue;
 		}
 
-		const PxU32 pairInd0 = PxU32(contactInfo.pairInd0);
-		PxgFEMCloth& cloth0 = clothes[PxGetClothId(pairInd0)];
-		const PxU32 elementId0 = PxGetClothElementIndex(pairInd0);
+		PxgFEMCloth& cloth0 = clothes[clothId0];
+		PxgFEMCloth& cloth1 = clothes[clothId1];
 
-		PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-		PxgFEMCloth& cloth1 = clothes[PxGetClothId(pairInd1)];
-		const PxU32 elementId1 = PxGetClothElementIndex(pairInd1);
-
-		if(contactInfo.isEdgeEdgePair()) // Edge-edge collision
+		// prepClothContactBlocks runs this kernel once for the vertex-triangle stream and once for the
+		// edge-edge stream. The ref0 feature type is sufficient to identify which of the two it is.
+		if(PxgGetDeformableFeatureType(contactInfo.ref0) == PxgDeformableRef::eTRIANGLE_EDGE)
 		{
 			// Edge0
-			PxU32 e0_localIndex0 = contactInfo.getAuxInd0();
+			PxU32 e0_localIndex0 = PxgGetDeformableEdgeLocalIndex(contactInfo.ref0);
 			PxU32 e0_localIndex1 = (e0_localIndex0 + 1) % 3;
 
-			const uint4 triVertInd0 = cloth0.mTriangleVertexIndices[elementId0];
+			const uint4 triVertInd0 = cloth0.mTriangleVertexIndices_ownedEdges[PxgGetDeformableEdgeTriangle(contactInfo.ref0)];
 			const PxU32* vertexIndices0 = reinterpret_cast<const PxU32*>(&triVertInd0);
 			const PxU32 e0_v0 = vertexIndices0[e0_localIndex0];
 			const PxU32 e0_v1 = vertexIndices0[e0_localIndex1];
 
 			// Edge1
-			PxU32 e1_localIndex0 = contactInfo.getAuxInd1();
+			PxU32 e1_localIndex0 = PxgGetDeformableEdgeLocalIndex(contactInfo.ref1);
 			PxU32 e1_localIndex1 = (e1_localIndex0 + 1) % 3;
 
-			const uint4 triVertInd1 = cloth1.mTriangleVertexIndices[elementId1];
+			const uint4 triVertInd1 = cloth1.mTriangleVertexIndices_ownedEdges[PxgGetDeformableEdgeTriangle(contactInfo.ref1)];
 			const PxU32* vertexIndices1 = reinterpret_cast<const PxU32*>(&triVertInd1);
 			const PxU32 e1_v0 = vertexIndices1[e1_localIndex0];
 			const PxU32 e1_v1 = vertexIndices1[e1_localIndex1];
@@ -220,16 +196,15 @@ void cloth_clothContactPrepareLaunch(
 			closestPtEdgeEdge(r0, r1, r2, r3, s, t, restDistSq);
 
 			// Apply exact (non-approximated) rest distance filtering.
-			if(restDistSq > cloth0.mSelfCollisionFilterDistance * cloth0.mSelfCollisionFilterDistance)
+			if(restDistSq <= cloth0.mSelfCollisionFilterDistance * cloth0.mSelfCollisionFilterDistance)
 			{
-				contactInfo.markValid();
-				contactInfos[workIndex] = contactInfo;
+				PxgInvalidatePairInfo(contactInfos[workIndex]);
 			}
 		}
 		else // Vertex-triangle collision
 		{
-			const uint4 triVertId1 = cloth1.mTriangleVertexIndices[elementId1];
-			PxVec4T<PxU32> vertIndices(elementId0, triVertId1.x, triVertId1.y, triVertId1.z);
+			const uint4 triVertId1 = cloth1.mTriangleVertexIndices_ownedEdges[PxgGetDeformableFeatureId(contactInfo.ref1)];
+			PxVec4T<PxU32> vertIndices(PxgGetDeformableFeatureId(contactInfo.ref0), triVertId1.x, triVertId1.y, triVertId1.z);
 
 			// Compute the exact rest distance for filtering.
 			// Mark pairs as valid if their rest distance exceeds the filter threshold.
@@ -245,26 +220,25 @@ void cloth_clothContactPrepareLaunch(
 			const PxVec3 closest = Gu::closestPtPointTriangle2(r0, r1, r2, r3, r12, r13);
 
 			const PxReal restDistSq = (r0 - closest).magnitudeSquared();
-			if(restDistSq > cloth0.mSelfCollisionFilterDistance * cloth0.mSelfCollisionFilterDistance)
+			if(restDistSq <= cloth0.mSelfCollisionFilterDistance * cloth0.mSelfCollisionFilterDistance)
 			{
-				contactInfo.markValid();
-				contactInfos[workIndex] = contactInfo;
+				PxgInvalidatePairInfo(contactInfos[workIndex]);
 			}
 		}
 	}
 }
 
 extern "C" __global__ void cloth_particleContactPrepareLaunch(
-	PxgFEMCloth*					clothes,
-	PxgParticleSystem*				particlesystems,
-	float4*							contacts,
-	float4*							normalPens,
-	float4*							barycentrics,
-	PxgFemOtherContactInfo*			contactInfos,
-	PxU32*							numContacts,
-	PxgDbParticleContactBlock*		contactBlocks,
-	float2*							clothAppliedForces,
-	float2*							particleAppliedForces
+	PxgFEMCloth*				clothes,
+	PxgParticleSystem*			particlesystems,
+	float4*						contacts,
+	float4*						normalPens,
+	float4*						barycentrics,
+	PxgDeformablePairInfo*		contactInfos,
+	PxU32*						numContacts,
+	PxgParticleDbContactBlock*	contactBlocks,
+	float2*						clothAppliedForces,
+	float2*						particleAppliedForces
 )
 {
 	const PxU32 tNumContacts = *numContacts;
@@ -287,24 +261,22 @@ extern "C" __global__ void cloth_particleContactPrepareLaunch(
 		clothAppliedForces[workIndex] = make_float2(0.f, 0.f);
 		particleAppliedForces[workIndex] = make_float2(0.f, 0.f);
 
-		PxgFemOtherContactInfo contactInfo = contactInfos[workIndex];
-		PxgDbParticleContactBlock& block = contactBlocks[workIndex / 32];
+		PxgDeformablePairInfo contactInfo = contactInfos[workIndex];
+		PxgParticleDbContactBlock& block = contactBlocks[workIndex / 32];
 
-		PxU64 pairInd0 = contactInfo.pairInd0;
+		if(!PxgIsValidPairInfo(contactInfo))
+			continue;
 
-		//pairInd0 is a particle system
-		const PxU32 tParticleSystemId = PxGetParticleSystemId(pairInd0);
-		const PxU32 tParticleIndex = PxGetParticleIndex(pairInd0);
+		PxU64 particleRef = contactInfo.ref0;
+
+		const PxU32 tParticleSystemId = PxgGetParticleSystemId(particleRef);
+		const PxU32 tParticleIndex = PxgGetParticleIndex(particleRef);
 
 		//second one will be cloth
-		PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-		PxgFEMCloth& cloth = clothes[PxGetClothId(pairInd1)];
-		const PxU32 triangleInd = PxGetClothElementIndex(pairInd1);
+		PxgFEMCloth& cloth = clothes[PxgGetDeformableId(contactInfo.ref1)];
+		const PxU32 triangleInd = PxgGetDeformableFeatureId(contactInfo.ref1);
 
-		/*printf("workIndex %i particleSystemId %i particleIndex %i\n", workIndex, tParticleSystemId, tParticleIndex);
-		printf("workIndex %i softbodyId %i tetInd %i\n", workIndex, pairInd1.getSoftBodyId(), tetInd);*/
-
-		const uint4 triVertInd = cloth.mTriangleVertexIndices[triangleInd];
+		const uint4 triVertInd = cloth.mTriangleVertexIndices_ownedEdges[triangleInd];
 
 		/*	printf("workIndex %i tetrahedronId(%i, %i, %i, %i)\n", workIndex, tetrahedronIdx.x, tetrahedronIdx.y,
 		tetrahedronIdx.z, tetrahedronIdx.w);*/
@@ -326,7 +298,9 @@ extern "C" __global__ void cloth_particleContactPrepareLaunch(
 
 		PxVec3 delta(delta1.x - deltaP_invMass.x, delta1.y - deltaP_invMass.y, delta1.z - deltaP_invMass.z);
 
-		const PxReal pen = normal_pen.w + normal.dot(delta) - cloth.mRestDistance;
+		// Computation of rest distance as the SS/SC contact prep functions do. The narrowphase writes a raw distance.
+		const PxReal restDistance = particleSystem.mData.mRestOffset + cloth.mRestOffset;
+		const PxReal pen = normal_pen.w + normal.dot(delta) - restDistance;
 
 		block.normal_pen[threadIndexInWarp] = make_float4(normal.x, normal.y, normal.z, pen);
 		block.barycentric[threadIndexInWarp] = barycentric;
@@ -336,16 +310,17 @@ extern "C" __global__ void cloth_particleContactPrepareLaunch(
 
 
 extern "C" __global__ void cloth_rigidAttachmentPrepareLaunch(
-	PxgFEMCloth*								clothes,
-	PxgFEMRigidAttachment*						rigidAttachments,
-	PxU32*										activeRigidAttachments,
-	PxNodeIndex*								rigidAttachmentIds,
-	PxU32										numRigidAttachments,
-	PxgDbRigidAttachmentBlock*					attachmentBlocks,
-	const PxgPrePrepDesc*						preDesc,
-	const PxgConstraintPrepareDesc*				prepareDesc,
-	const PxgSolverSharedDescBase*				sharedDesc,
-	float4*										rigidDeltaVel
+	PxgFEMCloth*						clothes,
+	PxgDeformableAttachment*			rigidAttachments,
+	PxU32*								activeRigidAttachments,
+	const PxU32*						rigidAttachmentRigidRefCounts,
+	PxNodeIndex*						rigidAttachmentIds,
+	PxU32								numRigidAttachments,
+	PxgRigidDbAttachmentBlock*			attachmentBlocks,
+	const PxgPrePrepDesc*				preDesc,
+	const PxgConstraintPrepareDesc*		prepareDesc,
+	const PxgSolverSharedDescBase*		sharedDesc,
+	float4*								rigidDeltaVel
 )
 {
 
@@ -368,13 +343,13 @@ extern "C" __global__ void cloth_rigidAttachmentPrepareLaunch(
 
 		const PxU32 attachmentId = activeRigidAttachments[workIndex];
 
-		const PxgFEMRigidAttachment& attachment = rigidAttachments[attachmentId];
-		PxgDbRigidAttachmentBlock& block = attachmentBlocks[index];
+		const PxgDeformableAttachment& attachment = rigidAttachments[attachmentId];
+		PxgRigidDbAttachmentBlock& block = attachmentBlocks[index];
 
-		const PxU32 elemId = attachment.index1;
-		const PxU32 clothId = PxGetClothId(elemId);
-		const PxU32 elemIdx = PxGetClothElementIndex(elemId);
-		const bool elemIsVertex = PxGetIsVertexType(attachment.baryOrType1);
+		const PxU64 clothRef = attachment.pair.ref1;
+		const PxU32 clothId = PxgGetDeformableId(clothRef);
+		const PxU32 elemIdx = PxgGetDeformableFeatureId(clothRef);
+		const bool elemIsVertex = PxgGetDeformableFeatureType(clothRef) == PxgDeformableRef::eVERTEX;
 
 		PxgFEMCloth& cloth = clothes[clothId];
 
@@ -389,8 +364,8 @@ extern "C" __global__ void cloth_rigidAttachmentPrepareLaunch(
 		}
 		else
 		{
-			const float4 barycentric = attachment.baryOrType1;
-			const uint4 triVertInd = cloth.mTriangleVertexIndices[elemIdx];
+			const float4 barycentric = attachment.barycentric1;
+			const uint4 triVertInd = cloth.mTriangleVertexIndices_ownedEdges[elemIdx];
 			const float4 pos_iMass0 = pos_invMass[triVertInd.x];
 			const float4 pos_iMass1 = pos_invMass[triVertInd.y];
 			const float4 pos_iMass2 = pos_invMass[triVertInd.z];
@@ -402,11 +377,11 @@ extern "C" __global__ void cloth_rigidAttachmentPrepareLaunch(
 		}
 		const PxVec3 point(attachmentPose.x, attachmentPose.y, attachmentPose.z);
 
-		PxNodeIndex rigidId = reinterpret_cast<const PxNodeIndex&>(attachment.index0);
+		PxNodeIndex rigidId = PxgGetRigidNode(attachment.pair.ref0);
 		rigidAttachmentIds[workIndex] = rigidId;
 
-		prepareDbRigidAttachment(block, point, invMass1, attachment.localPose0, rigidId,
-		                         elemId, attachment.baryOrType1, attachment.rigidBodyRefCount,
+		prepareRigidDbAttachment(block, point, invMass1, PxLoad3(attachment.barycentricOrPosition0), rigidId,
+		                         clothRef, attachment.barycentric1, rigidAttachmentRigidRefCounts[workIndex],
 		                         prepareDesc, preDesc->solverBodyIndices, sharedDesc,
 		                         rigidDeltaVel, workIndex, numRigidAttachments);
 	}

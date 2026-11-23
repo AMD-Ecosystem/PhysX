@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 cmake_minimum_required(VERSION 3.16)
 
 function(_assert_runtime_deps_config build_type use_release_deps expected_config)
@@ -44,8 +47,11 @@ endif()
 # install.cmake imports this setting from the configured build after including
 # build_common.cmake. Exercise that later path so a cached Debug/OFF selection
 # cannot bypass the Release-runtime-only policy.
-set(_install_cache_build_dir "_build_runtime_deps_config_test")
+set(_install_cache_build_dir "_build/runtime_deps_config_test")
 set(_install_cache_build_path "${CMAKE_CURRENT_LIST_DIR}/../${_install_cache_build_dir}")
+get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+include("${CMAKE_CURRENT_LIST_DIR}/build_directory.cmake")
+ovphysx_require_build_path("${_install_cache_build_path}")
 file(REMOVE_RECURSE "${_install_cache_build_path}")
 file(MAKE_DIRECTORY "${_install_cache_build_path}")
 file(WRITE "${_install_cache_build_path}/CMakeCache.txt"

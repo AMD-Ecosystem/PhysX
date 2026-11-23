@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-// clang-format off
-#include <UsdPCH.h>
-// clang-format on
+// @implements REQ-ATTACH-EXECUTION-001
+// @covers AC-1 AC-3 AC-4
 
 #include "tensors/cpu/CpuSimulationData.h"
 #include "tensors/GlobalsAreBad.h"
 #include "tensors/SimulationBackend.h"
+#include "AttachmentContactLookup.h"
+#include "usdLoad/LoadUsd.h"
 
 #include <omni/physx/IPhysxSimulation.h>
 
@@ -22,9 +23,9 @@ namespace physx
 namespace tensors
 {
 
-CpuSimulationData::CpuSimulationData(SimulationBackend& backend, long stageId)
+CpuSimulationData::CpuSimulationData(SimulationBackend& backend, omni::physics::tensors::AttachHandle attachHandle)
     : mBackend(backend)
-    , mStageId(stageId)
+    , mAttachHandle(attachHandle)
 {
 }
 
@@ -103,13 +104,14 @@ void CpuSimulationData::removeRigidContactBucket(uint64_t referentId, RigidConta
 
 void CpuSimulationData::updateContactReports()
 {
-    if (!g_physxSimulation)
+    const usdparser::AttachedStage* owner = usdparser::UsdLoad::getUsdLoad()->getAttachedStageByHandle(mAttachHandle);
+    if (!owner)
     {
         return;
     }
 
     // avoid processing contacts multiple times during a step
-    int64_t timestamp = mBackend.getTimestamp();
+    int64_t timestamp = mBackend.getTimestamp(mAttachHandle);
     if (mRigidContactTimestamp >= timestamp)
     {
         return;
@@ -131,7 +133,7 @@ void CpuSimulationData::updateContactReports()
     const ::omni::physx::FrictionAnchor* frictionAnchorData = nullptr;
     PxU32 numContacts = 0;
     PxU32 numFrictionAnchorData = 0;
-    PxU32 numHeaders = g_physxSimulation->getFullContactReport(&contactHeaders, &contactData, numContacts, &frictionAnchorData, numFrictionAnchorData);
+    PxU32 numHeaders = attachmentContact::full(*owner, &contactHeaders, &contactData, numContacts, &frictionAnchorData, numFrictionAnchorData);
 
     if (!numHeaders || !numContacts || !contactHeaders || !contactData)
     {

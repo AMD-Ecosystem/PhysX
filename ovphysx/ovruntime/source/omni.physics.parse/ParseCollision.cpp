@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 /**
+ * @implements REQ-PARSE-PARALLEL-001
+ * @covers AC-1 AC-2
+ *
  * @implements REQ-PARSE-COL-001
  * @covers AC-1 AC-2 AC-3 AC-4
  *
@@ -13,6 +16,9 @@
  *
  * @implements REQ-PARSE-SHAPE-002
  * @covers AC-1
+ *
+ * @implements REQ-PARSE-CORE-003
+ * @covers AC-2
  */
 
 // Collision extension parser — covers the PhysxCollisionAPI fields that
@@ -22,6 +28,7 @@
 // side walker.
 
 #include <omni/physics/parse/ParseApi.h>
+#include <omni/physics/parse/PreparedCollision.h>
 #include <omni/physics/parse/KnownTokens.h>
 
 #include <cfloat>
@@ -33,98 +40,148 @@ namespace omni::physics::parse
 namespace
 {
 
-float readClampedFloat(const IPhysicsSource& src, ObjectKey key, TokenId attr,
-                      float defaultVal, float minVal, float maxVal)
+float readPreparedClampedFloat(const PreparedAttribute<float>& input, float defaultVal,
+                               float minVal, float maxVal) noexcept
 {
-    float result;
-    if (!src.getAttribute(key, attr, result))
-        return defaultVal;
+    float result = input.valueOr(defaultVal);
     if (result < minVal) result = minVal;
     if (result > maxVal) result = maxVal;
     return result;
+}
+
+bool readPreparedUint32(const PreparedAttribute<int64_t>& input, uint32_t& out) noexcept
+{
+    if (!input.valid || input.value < 0 || uint64_t(input.value) > UINT32_MAX) return false;
+    out = static_cast<uint32_t>(input.value);
+    return true;
+}
+
+void readPreparedWeld(const PreparedAttribute<float>& input, float& out) noexcept
+{
+    input.read(out);
+    if (std::isnan(out)) out = -FLT_MAX;
 }
 
 } // namespace
 
 void parseCollisionExt(ParseContext& ctx, ObjectKey key, CollisionExtFields& fields)
 {
-    IPhysicsSource& src = ctx.source();
-    KnownTokens tok;
-    tok.intern(src);
+    fillCollisionExt(prepareCollisionExt(ctx, key), fields);
+}
+
+PreparedCollisionExt prepareCollisionExt(ParseContext& ctx, ObjectKey key)
+{
+    const IPhysicsSource& src = ctx.source();
+    const KnownTokens& tok = ctx.knownTokens();
+    PreparedCollisionExt input;
+    input.physxCollisionAPI = src.hasSchema(key, tok.physxCollisionAPI);
+    input.physxTriggerAPI = src.hasSchema(key, tok.physxTriggerAPI);
+    input.physxTriggerStateAPI = src.hasSchema(key, tok.physxTriggerStateAPI);
+    readCollisionExtAttributes(src, key, tok, input);
+    return input;
+}
+
+bool fillCollisionExt(const PreparedCollisionExt& input, CollisionExtFields& fields) noexcept
+{
+    if (!input.prepared)
+        return false;
+
 
     // PhysxCollisionAPI extension fields. Skip the per-attribute reads when
     // the API isn't applied, but DON'T early-return — trigger flags below are
     // independent of PhysxCollisionAPI.
-    if (src.hasSchema(key, tok.physxCollisionAPI))
+    if (input.physxCollisionAPI)
     {
-        fields.torsionalPatchRadius = readClampedFloat(
-            src, key, tok.physxCollisionTorsionalPatchRadius,
+        fields.torsionalPatchRadius = readPreparedClampedFloat(input.physxCollisionTorsionalPatchRadius,
             fields.torsionalPatchRadius, 0.0f, FLT_MAX);
-        fields.minTorsionalPatchRadius = readClampedFloat(
-            src, key, tok.physxCollisionMinTorsionalPatchRadius,
+        fields.minTorsionalPatchRadius = readPreparedClampedFloat(input.physxCollisionMinTorsionalPatchRadius,
             fields.minTorsionalPatchRadius, 0.0f, FLT_MAX);
     }
 
     // PhysxTriggerAPI flips isTrigger; PhysxTriggerStateAPI additionally
     // flips isTriggerUsdOutput. Both flags are only ever set to true
     // (never to false) — the caller passes the current outDesc value in.
-    if (src.hasSchema(key, tok.physxTriggerAPI))
+    if (input.physxTriggerAPI)
     {
         fields.isTrigger = true;
-        if (src.hasSchema(key, tok.physxTriggerStateAPI))
+        if (input.physxTriggerStateAPI)
             fields.isTriggerUsdOutput = true;
     }
 
-    // contactOffset / restOffset (PhysxCollisionAPI). Schema default for
-    // both is `-inf` (an "unset" sentinel), so reads MUST gate on
-    // `hasAuthoredAttribute`, not on `getAttribute(...).valid()` (which
-    // resolves schema fallbacks).
+    // contactOffset / restOffset (PhysxCollisionAPI). The schema default for
+    // both is NEGATIVE inf, an "unset" sentinel, and that sentinel is what
+    // separates an authored value from the schema fallback.
     //
-    // Per-axis sentinel and range:
-    //   contactOffset: inf -> -1.0f; otherwise clamp to [0, FLT_MAX].
-    //   restOffset:    inf ->  0.0f; otherwise clamp to [-FLT_MAX, FLT_MAX].
+    // This used to ask `hasAuthoredAttribute`. A resolved-value backend answers
+    // that `true` for everything it publishes (ADR-0020), so on ovstage BOTH
+    // authored bits were always set and the Newton contactMargin/contactGap
+    // fallbacks below — which gate on them — silently never fired, at load and
+    // at runtime alike. Reading the sentinel out of the resolved value instead
+    // is answerable identically on every backend: ovstage publishes the raw
+    // -inf here (measured), and USD resolves the same schema fallback.
     //
-    // Cross-validation: only writes the local back to outDesc when
-    // `contactOffset >= restOffset` (and the inverse for restOffset), so
-    // a one-sided author can't violate the constraint.
-    if (src.hasSchema(key, tok.physxCollisionAPI))
+    // Sign matters, and is the reason this does not lose the sentinel mapping:
+    //   v < -0.5e38f (-inf or -FLT_MAX) -> UNSET. Leave the caller's value
+    //            alone, authored bit stays false.
+    //   +inf  -> an explicitly authored sentinel; keep the historical mapping
+    //            (contactOffset -> -1.0f, restOffset -> 0.0f) and set authored.
+    //   finite -> authored; clamp to range.
+    // Mirrors readSceneGravity's `< -0.5e38f` test for physics:gravityMagnitude.
+    // The one behaviour this cannot preserve is an explicitly authored value
+    // at or below -0.5e38f, which is by construction indistinguishable from
+    // the schema fallback.
+    //
+    // Per-axis range:
+    //   contactOffset: clamp to [0, FLT_MAX].
+    //   restOffset:    clamp to [-FLT_MAX, FLT_MAX].
+    //
+    // Cross-validate concrete contact offsets. A negative contact offset
+    // means automatic; the runtime resolves it from geometry and restOffset.
+    if (input.physxCollisionAPI)
     {
         float contactOffset = fields.contactOffset;
         float restOffset = fields.restOffset;
 
-        if (src.hasAuthoredAttribute(key, tok.physxCollisionContactOffset))
+        // The schema's "unset" fallback. Threshold, not exact -inf: the
+        // resolved-value sentinel this guards against (like the joint-limit
+        // sentinels -- kJointSentinelLimit, ParseMimicJoint's
+        // kFiniteLimitSentinel, PhysXScenePropertiesUpdate's gravityMagnitude
+        // check) shows up in the wild as both -inf and -FLT_MAX; ovstage's
+        // population already publishes the FLT_MAX spelling for the positive
+        // maxJointVelocity sentinel (see hasAxisVelocityLimitOpinion). An
+        // exact isinf() test would miss the -FLT_MAX spelling and mark the
+        // attribute authored, silently disabling the Newton
+        // contactMargin/contactGap fallbacks the authored bit gates.
+        // static: MSVC 14.29 (VS2019, the OSS-build floor) rejects a non-static
+        // constexpr local read inside a captureless lambda with C3493.
+        static constexpr float kFiniteLimitSentinel = 0.5e38f;
+        const auto isUnset = [](float v) { return v < -kFiniteLimitSentinel; };
+
+        float attrVal;
+        if (input.physxCollisionContactOffset.read(attrVal) && !isUnset(attrVal))
         {
             fields.contactOffsetAuthored = true;
-            float attrVal;
-            if (src.getAttribute(key, tok.physxCollisionContactOffset, attrVal))
-            {
-                if (std::isinf(attrVal))
-                    contactOffset = -1.0f;
-                else if (attrVal >= 0.0f && attrVal <= FLT_MAX)
-                    contactOffset = attrVal;
-            }
+            if (std::isinf(attrVal))
+                contactOffset = -1.0f;
+            else if (attrVal >= 0.0f && attrVal <= FLT_MAX)
+                contactOffset = attrVal;
         }
 
-        if (src.hasAuthoredAttribute(key, tok.physxCollisionRestOffset))
+        if (input.physxCollisionRestOffset.read(attrVal) && !isUnset(attrVal))
         {
             fields.restOffsetAuthored = true;
-            float attrVal;
-            if (src.getAttribute(key, tok.physxCollisionRestOffset, attrVal))
-            {
-                if (std::isinf(attrVal))
-                    restOffset = 0.0f;
-                else if (attrVal >= -FLT_MAX && attrVal <= FLT_MAX)
-                    restOffset = attrVal;
-            }
+            if (std::isinf(attrVal))
+                restOffset = 0.0f;
+            else if (attrVal >= -FLT_MAX && attrVal <= FLT_MAX)
+                restOffset = attrVal;
         }
 
-        // Cross-validation gates the writeback: each field is only
-        // committed if it leaves contactOffset >= restOffset. When
-        // neither is authored, both locals equal the input fields and
-        // the writes are no-ops, so this is safe.
-        if (contactOffset >= restOffset)
+        // Preserve the automatic contact sentinel and authored rest offset
+        // together. Comparing restOffset to the unresolved -1 sentinel would
+        // discard valid values before the runtime can compute contactOffset.
+        if (contactOffset < 0.0f || contactOffset >= restOffset)
             fields.contactOffset = contactOffset;
-        if (restOffset < contactOffset)
+        if (contactOffset < 0.0f || restOffset < contactOffset)
             fields.restOffset = restOffset;
     }
 
@@ -141,7 +198,7 @@ void parseCollisionExt(ParseContext& ctx, ObjectKey key, CollisionExtFields& fie
         if (!fields.restOffsetAuthored)
         {
             float m;
-            if (src.getAttribute(key, tok.newtonContactMargin, m) && m >= 0.0f)
+            if (input.newtonContactMargin.read(m) && m >= 0.0f)
             {
                 fields.restOffset = m;
                 newtonMargin = m;
@@ -153,7 +210,7 @@ void parseCollisionExt(ParseContext& ctx, ObjectKey key, CollisionExtFields& fie
         {
             float gap;
             // Newton uses -inf as "use default" sentinel; skip it.
-            if (src.getAttribute(key, tok.newtonContactGap, gap) && !std::isinf(gap) && gap >= 0.0f)
+            if (input.newtonContactGap.read(gap) && !std::isinf(gap) && gap >= 0.0f)
             {
                 // Newton gap is on top of margin; PhysX contactOffset is
                 // measured from the surface, so add margin.
@@ -171,31 +228,11 @@ void parseCollisionExt(ParseContext& ctx, ObjectKey key, CollisionExtFields& fie
             fields.contactOffset = fields.restOffset + epsilon;
         }
     }
-}
-
-namespace
-{
-// Tiny helpers — `attr.Get(&v)` with no clamp, no override on missing.
-
-bool readFloatIfAuthored(IPhysicsSource& src, ObjectKey key, TokenId attr, float& out)
-{
-    return src.getAttribute(key, attr, out);
-}
-
-bool readIntAsUint32IfAuthored(IPhysicsSource& src, ObjectKey key, TokenId attr, uint32_t& out)
-{
-    int64_t tmp;
-    if (!src.getAttribute(key, attr, tmp)) return false;
-    out = static_cast<uint32_t>(tmp);
     return true;
 }
 
-bool readBoolIfAuthored(IPhysicsSource& src, ObjectKey key, TokenId attr, bool& out)
-{
-    return src.getAttribute(key, attr, out);
-}
 
-} // namespace
+
 
 // Reads `PhysxSchemaPhysxConvexHullCollisionAPI` (minThickness +
 // hullVertexLimit) plus the `newton:maxHullVertices` fallback. No
@@ -203,16 +240,30 @@ bool readBoolIfAuthored(IPhysicsSource& src, ObjectKey key, TokenId attr, bool& 
 // authored, the existing `params` field is preserved.
 void parseConvexHullCookingExt(ParseContext& ctx, ObjectKey key, ConvexMeshCookingParams& params)
 {
-    IPhysicsSource& src = ctx.source();
-    KnownTokens tok;
-    tok.intern(src);
+    fillConvexHullCookingExt(prepareConvexHullCookingExt(ctx, key), params);
+}
+
+PreparedConvexHullCookingExt prepareConvexHullCookingExt(ParseContext& ctx, ObjectKey key)
+{
+    const IPhysicsSource& src = ctx.source();
+    const KnownTokens& tok = ctx.knownTokens();
+    PreparedConvexHullCookingExt input;
+    input.physxConvexHullCollisionAPI = src.hasSchema(key, tok.physxConvexHullCollisionAPI);
+    readConvexHullCookingExtAttributes(src, key, tok, input);
+    return input;
+}
+
+bool fillConvexHullCookingExt(const PreparedConvexHullCookingExt& input, ConvexMeshCookingParams& params) noexcept
+{
+    if (!input.prepared)
+        return false;
+
 
     bool hullVertexLimitAuthored = false;
-    if (src.hasSchema(key, tok.physxConvexHullCollisionAPI))
+    if (input.physxConvexHullCollisionAPI)
     {
-        readFloatIfAuthored(src, key, tok.physxConvexHullCollisionMinThickness, params.minThickness);
-        hullVertexLimitAuthored = readIntAsUint32IfAuthored(
-            src, key, tok.physxConvexHullCollisionHullVertexLimit, params.maxHullVertices);
+        input.physxConvexHullCollisionMinThickness.read(params.minThickness);
+        hullVertexLimitAuthored = readPreparedUint32(input.physxConvexHullCollisionHullVertexLimit, params.maxHullVertices);
     }
 
     // Newton fallback: newton:maxHullVertices (int) → maxHullVertices when
@@ -220,10 +271,12 @@ void parseConvexHullCookingExt(ParseContext& ctx, ObjectKey key, ConvexMeshCooki
     if (!hullVertexLimitAuthored)
     {
         int64_t nv;
-        if (src.getAttribute(key, tok.newtonMaxHullVertices, nv) && nv > 0)
+        if (input.newtonMaxHullVertices.read(nv) && nv > 0)
             params.maxHullVertices = static_cast<uint32_t>(nv);
     }
+    return true;
 }
+
 
 // Reads PhysxSchemaPhysxConvexDecompositionCollisionAPI. Six fields
 // plus the same Newton `maxHullVertices` fallback as ConvexHull.
@@ -235,87 +288,141 @@ void parseConvexHullCookingExt(ParseContext& ctx, ObjectKey key, ConvexMeshCooki
 // authored without applying the API.
 void parseConvexDecompositionCookingExt(ParseContext& ctx, ObjectKey key, ConvexDecompositionCookingParams& params)
 {
-    IPhysicsSource& src = ctx.source();
-    KnownTokens tok;
-    tok.intern(src);
+    fillConvexDecompositionCookingExt(prepareConvexDecompositionCookingExt(ctx, key), params);
+}
 
-    readFloatIfAuthored(src, key, tok.physxConvexDecompositionCollisionMinThickness, params.minThickness);
-    readIntAsUint32IfAuthored(src, key, tok.physxConvexDecompositionCollisionMaxConvexHulls, params.maxConvexHulls);
-    const bool hullVertexLimitAuthored = readIntAsUint32IfAuthored(
-        src, key, tok.physxConvexDecompositionCollisionHullVertexLimit, params.maxHullVertices);
-    readIntAsUint32IfAuthored(src, key, tok.physxConvexDecompositionCollisionVoxelResolution, params.voxelResolution);
-    readFloatIfAuthored(src, key, tok.physxConvexDecompositionCollisionErrorPercentage, params.errorPercentage);
-    readBoolIfAuthored(src, key, tok.physxConvexDecompositionCollisionShrinkWrap, params.shrinkWrap);
+PreparedConvexDecompositionCookingExt prepareConvexDecompositionCookingExt(ParseContext& ctx, ObjectKey key)
+{
+    const IPhysicsSource& src = ctx.source();
+    const KnownTokens& tok = ctx.knownTokens();
+    PreparedConvexDecompositionCookingExt input;
+    readConvexDecompositionCookingExtAttributes(src, key, tok, input);
+    return input;
+}
+
+bool fillConvexDecompositionCookingExt(const PreparedConvexDecompositionCookingExt& input, ConvexDecompositionCookingParams& params) noexcept
+{
+    if (!input.prepared)
+        return false;
+
+
+    input.physxConvexDecompositionCollisionMinThickness.read(params.minThickness);
+    readPreparedUint32(input.physxConvexDecompositionCollisionMaxConvexHulls, params.maxConvexHulls);
+    const bool hullVertexLimitAuthored = readPreparedUint32(input.physxConvexDecompositionCollisionHullVertexLimit, params.maxHullVertices);
+    readPreparedUint32(input.physxConvexDecompositionCollisionVoxelResolution, params.voxelResolution);
+    input.physxConvexDecompositionCollisionErrorPercentage.read(params.errorPercentage);
+    input.physxConvexDecompositionCollisionShrinkWrap.read(params.shrinkWrap);
 
     // Newton fallback for hullVertexLimit — same gating as ConvexHull.
     if (!hullVertexLimitAuthored)
     {
         int64_t nv;
-        if (src.getAttribute(key, tok.newtonMaxHullVertices, nv) && nv > 0)
+        if (input.newtonMaxHullVertices.read(nv) && nv > 0)
             params.maxHullVertices = static_cast<uint32_t>(nv);
     }
+    return true;
 }
+
 
 // Reads PhysxSchemaPhysxSphereFillCollisionAPI. Four fields including
 // a token enum for the fill mode. Like ConvexDecomp, no
 // `if (physxColMeshAPI)` schema-presence gate.
 void parseSphereFillCookingExt(ParseContext& ctx, ObjectKey key, SphereFillCookingParams& params)
 {
-    IPhysicsSource& src = ctx.source();
-    KnownTokens tok;
-    tok.intern(src);
+    fillSphereFillCookingExt(prepareSphereFillCookingExt(ctx, key), params);
+}
 
-    readIntAsUint32IfAuthored(src, key, tok.physxSphereFillCollisionMaxSpheres, params.maxSpheres);
-    readIntAsUint32IfAuthored(src, key, tok.physxSphereFillCollisionSeedCount, params.seedCount);
-    readIntAsUint32IfAuthored(src, key, tok.physxSphereFillCollisionVoxelResolution, params.voxelResolution);
+PreparedSphereFillCookingExt prepareSphereFillCookingExt(ParseContext& ctx, ObjectKey key)
+{
+    const IPhysicsSource& src = ctx.source();
+    const KnownTokens& tok = ctx.knownTokens();
+    PreparedSphereFillCookingExt input;
+    input.fillModeFlood = tok.fillModeFlood;
+    input.fillModeRaycast = tok.fillModeRaycast;
+    input.fillModeSurface = tok.fillModeSurface;
+    readSphereFillCookingExtAttributes(src, key, tok, input);
+    return input;
+}
+
+bool fillSphereFillCookingExt(const PreparedSphereFillCookingExt& input, SphereFillCookingParams& params) noexcept
+{
+    if (!input.prepared)
+        return false;
+
+
+    readPreparedUint32(input.physxSphereFillCollisionMaxSpheres, params.maxSpheres);
+    readPreparedUint32(input.physxSphereFillCollisionSeedCount, params.seedCount);
+    readPreparedUint32(input.physxSphereFillCollisionVoxelResolution, params.voxelResolution);
 
     // fillMode is a token enum: "flood" / "raycast" / "surface". Any
     // other value (or missing attribute) keeps the existing default.
     TokenId fm;
-    if (src.getAttribute(key, tok.physxSphereFillCollisionFillMode, fm))
+    if (input.physxSphereFillCollisionFillMode.read(fm))
     {
-        if      (fm == tok.fillModeFlood)   params.fillMode = ::omni::physx::SphereFillMode::eFLOOD;
-        else if (fm == tok.fillModeRaycast) params.fillMode = ::omni::physx::SphereFillMode::eRAYCAST;
-        else if (fm == tok.fillModeSurface) params.fillMode = ::omni::physx::SphereFillMode::eSURFACE;
+        if      (fm == input.fillModeFlood)   params.fillMode = ::omni::physx::SphereFillMode::eFLOOD;
+        else if (fm == input.fillModeRaycast) params.fillMode = ::omni::physx::SphereFillMode::eRAYCAST;
+        else if (fm == input.fillModeSurface) params.fillMode = ::omni::physx::SphereFillMode::eSURFACE;
     }
+    return true;
 }
 
-namespace
-{
-// Read attribute (if authored / schema-fallback present), then
-// unconditionally NaN-guard down to -FLT_MAX. The NaN check applies
-// even when the attribute is missing — defensive against an existing
-// NaN in the params struct.
-void readWeldToleranceWithNanGuard(IPhysicsSource& src, ObjectKey key, TokenId attr, float& out)
-{
-    readFloatIfAuthored(src, key, attr, out);
-    if (std::isnan(out))
-        out = -FLT_MAX;
-}
-} // namespace
+
+
 
 // Reads `PhysxTriangleMeshCollisionAPI:weldTolerance`. No
 // schema-applied gate (the API may be applied or not; the attribute
 // is read regardless).
 void parseTriangleMeshCookingExt(ParseContext& ctx, ObjectKey key, TriangleMeshCookingParams& params)
 {
-    IPhysicsSource& src = ctx.source();
-    KnownTokens tok;
-    tok.intern(src);
-    readWeldToleranceWithNanGuard(src, key, tok.physxTriangleMeshCollisionWeldTolerance, params.meshWeldTolerance);
+    fillTriangleMeshCookingExt(prepareTriangleMeshCookingExt(ctx, key), params);
 }
+
+PreparedTriangleMeshCookingExt prepareTriangleMeshCookingExt(ParseContext& ctx, ObjectKey key)
+{
+    const IPhysicsSource& src = ctx.source();
+    const KnownTokens& tok = ctx.knownTokens();
+    PreparedTriangleMeshCookingExt input;
+    readTriangleMeshCookingExtAttributes(src, key, tok, input);
+    return input;
+}
+
+bool fillTriangleMeshCookingExt(const PreparedTriangleMeshCookingExt& input, TriangleMeshCookingParams& params) noexcept
+{
+    if (!input.prepared)
+        return false;
+
+    readPreparedWeld(input.physxTriangleMeshCollisionWeldTolerance, params.meshWeldTolerance);
+    return true;
+}
+
 
 // Reads `simplificationMetric` and `weldTolerance` from the
 // PhysxTriangleMeshSimplificationCollisionAPI schema. No
 // schema-applied gate.
 void parseTriangleMeshSimplificationCookingExt(ParseContext& ctx, ObjectKey key, TriangleMeshCookingParams& params)
 {
-    IPhysicsSource& src = ctx.source();
-    KnownTokens tok;
-    tok.intern(src);
-    readFloatIfAuthored(src, key, tok.physxTriangleMeshSimplificationCollisionMetric, params.simplificationMetric);
-    readWeldToleranceWithNanGuard(src, key, tok.physxTriangleMeshSimplificationCollisionWeldTolerance, params.meshWeldTolerance);
+    fillTriangleMeshSimplificationCookingExt(prepareTriangleMeshSimplificationCookingExt(ctx, key), params);
 }
+
+PreparedTriangleMeshSimplificationCookingExt prepareTriangleMeshSimplificationCookingExt(ParseContext& ctx, ObjectKey key)
+{
+    const IPhysicsSource& src = ctx.source();
+    const KnownTokens& tok = ctx.knownTokens();
+    PreparedTriangleMeshSimplificationCookingExt input;
+    readTriangleMeshSimplificationCookingExtAttributes(src, key, tok, input);
+    return input;
+}
+
+bool fillTriangleMeshSimplificationCookingExt(const PreparedTriangleMeshSimplificationCookingExt& input, TriangleMeshCookingParams& params) noexcept
+{
+    if (!input.prepared)
+        return false;
+
+    input.physxTriangleMeshSimplificationCollisionMetric.read(params.simplificationMetric);
+    readPreparedWeld(input.physxTriangleMeshSimplificationCollisionWeldTolerance, params.meshWeldTolerance);
+    return true;
+}
+
 
 // SDF cooking-knob reader. Two-stage gate: (1) PhysxSDFMeshCollisionAPI
 // must be applied; (2) sdfResolution must be > 0. Only when both hold
@@ -324,32 +431,50 @@ void parseTriangleMeshSimplificationCookingExt(ParseContext& ctx, ObjectKey key,
 // cooking.
 bool parseSdfMeshCookingExt(ParseContext& ctx, ObjectKey key, SdfMeshCookingParams& params)
 {
-    IPhysicsSource& src = ctx.source();
-    KnownTokens tok;
-    tok.intern(src);
+    return fillSdfMeshCookingExt(prepareSdfMeshCookingExt(ctx, key), params);
+}
 
-    if (!src.hasSchema(key, tok.physxSDFMeshCollisionAPI))
+PreparedSdfMeshCookingExt prepareSdfMeshCookingExt(ParseContext& ctx, ObjectKey key)
+{
+    const IPhysicsSource& src = ctx.source();
+    const KnownTokens& tok = ctx.knownTokens();
+    PreparedSdfMeshCookingExt input;
+    input.physxSDFMeshCollisionAPI = src.hasSchema(key, tok.physxSDFMeshCollisionAPI);
+    input.bitsPerPixel8 = tok.bitsPerPixel8;
+    input.bitsPerPixel16 = tok.bitsPerPixel16;
+    input.bitsPerPixel32 = tok.bitsPerPixel32;
+    readSdfMeshCookingExtAttributes(src, key, tok, input);
+    return input;
+}
+
+bool fillSdfMeshCookingExt(const PreparedSdfMeshCookingExt& input, SdfMeshCookingParams& params) noexcept
+{
+    if (!input.prepared)
+        return false;
+
+
+    if (!input.physxSDFMeshCollisionAPI)
         return false;
 
     // sdfResolution is the validity gate.
     uint32_t resolution = 0;
-    readIntAsUint32IfAuthored(src, key, tok.physxSDFMeshCollisionSdfResolution, resolution);
+    readPreparedUint32(input.physxSDFMeshCollisionSdfResolution, resolution);
     if (resolution == 0)
         return false;
 
     params.sdfResolution = resolution;
-    readIntAsUint32IfAuthored(src, key, tok.physxSDFMeshCollisionSdfSubgridResolution, params.sdfSubgridResolution);
+    readPreparedUint32(input.physxSDFMeshCollisionSdfSubgridResolution, params.sdfSubgridResolution);
 
     // sdfBitsPerSubgridPixel is a token enum. Default is 16; only
     // recognised tokens override. On any other (or missing) value, the
     // param keeps the seeded 16.
     uint32_t sdfBitsPerSubgridPixel = 16;
     TokenId bp;
-    if (src.getAttribute(key, tok.physxSDFMeshCollisionSdfBitsPerSubgridPixel, bp))
+    if (input.physxSDFMeshCollisionSdfBitsPerSubgridPixel.read(bp))
     {
-        if      (bp == tok.bitsPerPixel8)  sdfBitsPerSubgridPixel = 8;
-        else if (bp == tok.bitsPerPixel16) sdfBitsPerSubgridPixel = 16;
-        else if (bp == tok.bitsPerPixel32) sdfBitsPerSubgridPixel = 32;
+        if      (bp == input.bitsPerPixel8)  sdfBitsPerSubgridPixel = 8;
+        else if (bp == input.bitsPerPixel16) sdfBitsPerSubgridPixel = 16;
+        else if (bp == input.bitsPerPixel32) sdfBitsPerSubgridPixel = 32;
     }
     params.sdfBitsPerSubgridPixel = sdfBitsPerSubgridPixel;
 
@@ -357,22 +482,23 @@ bool parseSdfMeshCookingExt(ParseContext& ctx, ObjectKey key, SdfMeshCookingPara
     // unconditionally assign back to params so an unauthored attribute
     // doesn't leave the field with whatever the caller seeded.
     float narrowBandThickness = 0.0f;
-    readFloatIfAuthored(src, key, tok.physxSDFMeshCollisionSdfNarrowBandThickness, narrowBandThickness);
+    input.physxSDFMeshCollisionSdfNarrowBandThickness.read(narrowBandThickness);
     params.sdfNarrowBandThickness = narrowBandThickness;
 
     float sdfMargin = 0.0f;  // seeded to avoid UB on unauthored attribute
-    readFloatIfAuthored(src, key, tok.physxSDFMeshCollisionSdfMargin, sdfMargin);
+    input.physxSDFMeshCollisionSdfMargin.read(sdfMargin);
     params.sdfMargin = sdfMargin;
 
     bool sdfEnableRemeshing = false;  // seeded to avoid UB on unauthored attribute
-    readBoolIfAuthored(src, key, tok.physxSDFMeshCollisionSdfEnableRemeshing, sdfEnableRemeshing);
+    input.physxSDFMeshCollisionSdfEnableRemeshing.read(sdfEnableRemeshing);
     params.sdfEnableRemeshing = sdfEnableRemeshing;
 
     float sdfTriangleCountReductionFactor = 0.0f;  // same.
-    readFloatIfAuthored(src, key, tok.physxSDFMeshCollisionSdfTriangleCountReductionFactor, sdfTriangleCountReductionFactor);
+    input.physxSDFMeshCollisionSdfTriangleCountReductionFactor.read(sdfTriangleCountReductionFactor);
     params.sdfTriangleCountReductionFactor = sdfTriangleCountReductionFactor;
 
     return true;
 }
+
 
 } // namespace omni::physics::parse

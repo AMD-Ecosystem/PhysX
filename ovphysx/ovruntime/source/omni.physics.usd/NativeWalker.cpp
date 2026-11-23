@@ -1,5 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+// @implements REQ-SIM-LOCALVELOCITY-001
+// @covers AC-8
+
+/**
+ * @implements REQ-PARSE-INSTANCER-DISPATCH-001
+ * @covers AC-1 AC-2
+ */
 
 /**
  * Native USD prim walker.
@@ -10,6 +18,9 @@
  *
  * @implements REQ-PARSE-SCAN-001
  * @covers AC-1 AC-2 AC-3
+ *
+ * @implements REQ-PARSE-SHAPE-004
+ * @covers AC-1
  */
 
 #include "NativeWalker.h"
@@ -22,6 +33,17 @@
 #include <private/omni/physics/CollisionShapeTransform.h>
 #include <private/omni/physics/JointFrameTransform.h>
 
+// The two private headers above are Gf-free (they are shared with the USD-free
+// ovstage walker), so this backend converts at the call boundary with
+// omni.physics.usd/TypeCast.h. TypeCast.h declares only the bridge functions
+// and relies on the includer for the PhysX and Gf types it names; these are the
+// ones NativeWalker.cpp did not already pull in.
+#include <foundation/PxMat33.h>
+#include <foundation/PxVec2.h>
+
+#include <pxr/base/work/loops.h>
+#include <pxr/base/gf/matrix4f.h>
+#include <pxr/base/gf/quath.h>
 #include <pxr/base/gf/quaternion.h>
 #include <pxr/base/gf/transform.h>
 #include <pxr/base/gf/vec3f.h>
@@ -46,11 +68,13 @@
 #include <pxr/usd/usdGeom/tetMesh.h>
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/usd/usdGeom/xformable.h>
+#include <pxr/usd/usdGeom/xform.h>
 #include <pxr/usd/usdGeom/xformCache.h>
 
 #include <physxSchema/physxCharacterControllerAPI.h>
 #include <physxSchema/physxVehicleTireFrictionTable.h>
 #include <physxSchema/physxParticleSystem.h>
+#include <physxSchema/physxPhysicsJointInstancer.h>
 #include <physxSchema/physxVehicleWheelAPI.h>
 #include <physxSchema/physxVehicleTireAPI.h>
 #include <physxSchema/physxVehicleSuspensionAPI.h>
@@ -86,6 +110,8 @@
 #include <pxr/usd/usdPhysics/scene.h>
 #include <pxr/usd/usdPhysics/sphericalJoint.h>
 #include <pxr/usd/usdPhysics/tokens.h>
+
+#include <TypeCast.h>
 
 #include <pxr/usd/usdShade/material.h>
 #include <pxr/usd/usdShade/materialBindingAPI.h>
@@ -631,14 +657,37 @@ void emitDeformableMaterial(ScannedStage& out, parse::ParseContext& ctx,
     out.deformableMaterials.push_back(std::move(desc));
 }
 
-void emitCollisionGroup(ScannedStage& out, parse::ParseContext& ctx, parse::ObjectKey key)
+// @implements REQ-PARSE-COLGROUP-002
+// @covers AC-3
+void emitCollisionGroups(ScannedStage& out, parse::ParseContext& ctx,
+                         const std::vector<parse::ObjectKey>& keys)
 {
-    parse::CollisionGroupInfo info = parse::parseCollisionGroup(ctx, key);
-    parse::DescPtr<parse::CollisionGroupDesc> desc = parse::allocateDesc<parse::CollisionGroupDesc>(ctx.descriptorAllocator());
-    desc->primKey = key;
-    desc->sourceFilteredGroups = std::move(info.filteredGroups);
-    desc->sourceMembers        = std::move(info.members);
-    out.collisionGroups.push_back(std::move(desc));
+    if (keys.empty())
+        return;
+
+    // Initialize token interning before the read-only collection queries run in
+    // parallel. Descriptor allocation and emission stay serial and retain walk order.
+    ctx.knownTokens();
+    std::vector<parse::CollisionGroupInfo> infos(keys.size());
+    const auto resolveGroups = [&ctx, &keys, &infos](size_t begin, size_t end)
+    {
+        for (size_t i = begin; i < end; ++i)
+            infos[i] = parse::parseCollisionGroup(ctx, keys[i]);
+    };
+    if (keys.size() >= 20)
+        PXR_NS::WorkParallelForN(keys.size(), resolveGroups);
+    else
+        resolveGroups(0, keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        parse::DescPtr<parse::CollisionGroupDesc> desc =
+            parse::allocateDesc<parse::CollisionGroupDesc>(ctx.descriptorAllocator());
+        desc->primKey = keys[i];
+        desc->sourceFilteredGroups = std::move(infos[i].filteredGroups);
+        desc->sourceMembers = std::move(infos[i].members);
+        out.collisionGroups.push_back(std::move(desc));
+    }
 }
 
 // Attachment emit. parse::parseAttachment does the
@@ -2200,11 +2249,13 @@ parse::DescPtr<parse::PhysxShapeDesc> readMeshShapeDesc(
     {
         // Read the gprim's points into a mergedMesh buffer; the consumer
         // computes the bounding-sphere radius / bounding-box halfExtents
-        // from those points.
+        // from those points. The points must carry the gprim's world scale:
+        // unlike the cooked-mesh descs there is no meshScale field for the
+        // consumer to apply later, so an unscaled buffer yields a bounding
+        // shape in mesh-local units.
         parse::DescPtr<parse::MergeMeshDesc> mm = parse::allocateDesc<parse::MergeMeshDesc>(ctx.descriptorAllocator());
         const parse::MeshGeometry geom = parse::parseMeshGeometry(ctx, meshDataKey);
-        const parse::BufferSpan<carb::Float3> pointsView = ctx.getBuffer<carb::Float3>(geom.points);
-        mm->points.assign(pointsView.data, pointsView.data + pointsView.count);
+        parse::scaleMeshPoints(ctx, geom.points, meshScale, mm->points);
 
         parse::DescPtr<parse::MergeMeshPhysxShapeDesc> typed;
         if (approx == parse::MeshApproximation::eBoundingSphere)
@@ -2281,145 +2332,6 @@ bool isCustomShapeApplied(const PXR_NS::TfTokenVector& apis,
     return false;
 }
 
-// Walk children of a `PhysxMeshMergeCollisionAPI` parent and assemble
-// a MergeMeshDesc from each child's points / indices / face counts /
-// holes — concatenated into one merged buffer. Mixed-handedness
-// children are normalised by flipping triangle winding on the minority.
-void populateMergedMeshFromChildrenNative(
-    parse::ParseContext& ctx, UsdWalkCtx& impl,
-    parse::MergeMeshPhysxShapeDesc* desc, parse::ObjectKey parentKey)
-{
-    const parse::TokenId collectionTok = impl.source.internToken("collisionmeshes");
-    const parse::TokenId orientationTok = impl.source.internToken("orientation");
-    const parse::TokenId leftHandedTok = impl.source.internToken("leftHanded");
-
-    std::vector<parse::ObjectKey> children;
-    impl.source.resolveCollection(parentKey, collectionTok, children);
-
-    struct ChildEntry
-    {
-        parse::ObjectKey                 key;
-        parse::BufferSpan<carb::Float3>  points;
-        parse::BufferSpan<int32_t>       indices;
-        parse::BufferSpan<int32_t>       faceCounts;
-        parse::BufferSpan<int32_t>       holes;
-        size_t                           pointsOffset = 0;
-        size_t                           indicesOffset = 0;
-        size_t                           facesOffset = 0;
-        size_t                           holesOffset = 0;
-        bool                             changeIndicesOrder = false;
-    };
-    std::vector<ChildEntry> entries;
-    entries.reserve(children.size());
-
-    bool leftHanded = false, rightHanded = false;
-    for (parse::ObjectKey child : children)
-    {
-        ChildEntry e;
-        e.key = child;
-        const parse::MeshGeometry geom = parse::parseMeshGeometry(ctx, child);
-        e.points     = ctx.getBuffer<carb::Float3>(geom.points);
-        e.indices    = ctx.getBuffer<int32_t>(geom.indices);
-        e.faceCounts = ctx.getBuffer<int32_t>(geom.faceCounts);
-        e.holes      = ctx.getBuffer<int32_t>(geom.holes);
-        if (e.points.empty() || e.indices.empty() || e.faceCounts.empty())
-            continue;
-
-        parse::TokenId orient;
-        const bool childLeftHanded = impl.source.getAttribute(child, orientationTok, orient) &&
-                                     orient == leftHandedTok;
-
-        if (!leftHanded && !rightHanded)
-        {
-            if (childLeftHanded) leftHanded = true; else rightHanded = true;
-        }
-        else
-        {
-            if (childLeftHanded && rightHanded)      e.changeIndicesOrder = true;
-            else if (!childLeftHanded && leftHanded) e.changeIndicesOrder = true;
-        }
-        entries.push_back(std::move(e));
-    }
-
-    size_t totalPoints = 0, totalIndices = 0, totalFaces = 0, totalHoles = 0;
-    for (auto& e : entries)
-    {
-        e.pointsOffset  = totalPoints;  totalPoints  += e.points.count;
-        e.indicesOffset = totalIndices; totalIndices += e.indices.count;
-        e.facesOffset   = totalFaces;   totalFaces   += e.faceCounts.count;
-        e.holesOffset   = totalHoles;   totalHoles   += e.holes.count;
-    }
-
-    parse::DescPtr<parse::MergeMeshDesc> mm = parse::allocateDesc<parse::MergeMeshDesc>(ctx.descriptorAllocator());
-    mm->points.resize(totalPoints);
-    mm->indices.resize(totalIndices);
-    mm->faces.resize(totalFaces);
-    mm->holes.resize(totalHoles);
-
-    parse::Matrix4d parentWorldM4d;
-    impl.source.getLocalToWorldTransform(parentKey, parentWorldM4d);
-    const PXR_NS::GfMatrix4d parentWorld(
-        parentWorldM4d.data[0],  parentWorldM4d.data[1],  parentWorldM4d.data[2],  parentWorldM4d.data[3],
-        parentWorldM4d.data[4],  parentWorldM4d.data[5],  parentWorldM4d.data[6],  parentWorldM4d.data[7],
-        parentWorldM4d.data[8],  parentWorldM4d.data[9],  parentWorldM4d.data[10], parentWorldM4d.data[11],
-        parentWorldM4d.data[12], parentWorldM4d.data[13], parentWorldM4d.data[14], parentWorldM4d.data[15]);
-    const PXR_NS::GfMatrix4d parentWorldInv = parentWorld.GetInverse();
-
-    for (const auto& e : entries)
-    {
-        parse::Matrix4d childWorldM4d;
-        impl.source.getLocalToWorldTransform(e.key, childWorldM4d);
-        const PXR_NS::GfMatrix4d childWorld(
-            childWorldM4d.data[0],  childWorldM4d.data[1],  childWorldM4d.data[2],  childWorldM4d.data[3],
-            childWorldM4d.data[4],  childWorldM4d.data[5],  childWorldM4d.data[6],  childWorldM4d.data[7],
-            childWorldM4d.data[8],  childWorldM4d.data[9],  childWorldM4d.data[10], childWorldM4d.data[11],
-            childWorldM4d.data[12], childWorldM4d.data[13], childWorldM4d.data[14], childWorldM4d.data[15]);
-        const PXR_NS::GfMatrix4d relMatrix = childWorld * parentWorldInv;
-
-        for (size_t i = 0; i < e.points.count; ++i)
-        {
-            const carb::Float3& p = e.points[i];
-            const PXR_NS::GfVec3f xformed(relMatrix.Transform(PXR_NS::GfVec3f(p.x, p.y, p.z)));
-            mm->points[e.pointsOffset + i] = { xformed[0], xformed[1], xformed[2] };
-        }
-
-        std::memcpy(mm->faces.data() + e.facesOffset, e.faceCounts.data,
-                    sizeof(int32_t) * e.faceCounts.count);
-
-        if (!e.changeIndicesOrder)
-        {
-            for (size_t i = 0; i < e.indices.count; ++i)
-                mm->indices[e.indicesOffset + i] = e.indices[i] + int32_t(e.pointsOffset);
-        }
-        else
-        {
-            size_t faceOffset = 0;
-            for (size_t f = 0; f < e.faceCounts.count; ++f)
-            {
-                const int32_t faceIndices = e.faceCounts[f];
-                if (faceIndices > 0)
-                {
-                    size_t newIndex = 0;
-                    for (size_t i = faceOffset + size_t(faceIndices) - 1; i >= faceOffset; --i)
-                    {
-                        mm->indices[e.indicesOffset + faceOffset + newIndex] =
-                            e.indices[faceOffset + i] + int32_t(e.pointsOffset);
-                        ++newIndex;
-                        if (i == faceOffset) break;
-                    }
-                    faceOffset += size_t(faceIndices);
-                }
-            }
-        }
-
-        for (size_t i = 0; i < e.holes.count; ++i)
-            mm->holes[e.holesOffset + i] = e.holes[i] + int32_t(e.facesOffset);
-    }
-
-    desc->mergedMesh = mm.get();
-    impl.scan.retainOwnedMesh(std::move(mm));
-}
-
 // Build a custom-mesh-merge shape: discriminate the parent's mesh
 // approximation + assemble mergedMesh from the `collisionMeshes`
 // collection.
@@ -2494,7 +2406,7 @@ parse::DescPtr<parse::PhysxShapeDesc> buildMeshMergeCustomShape(
     {
         // Bounding-sphere: emit the BoundingSpherePhysxShapeDesc subclass;
         // the consumer fills positionOffset / radius from mergedMesh
-        // (populated by populateMergedMeshFromChildrenNative below).
+        // (filled from the merged members below).
         parse::DescPtr<parse::BoundingSpherePhysxShapeDesc> bs = parse::allocateDesc<parse::BoundingSpherePhysxShapeDesc>(ctx.descriptorAllocator());
         typed = parse::descPtrCast<parse::MergeMeshPhysxShapeDesc>(std::move(bs));
         break;
@@ -2517,7 +2429,20 @@ parse::DescPtr<parse::PhysxShapeDesc> buildMeshMergeCustomShape(
         break;
     }
     }
-    populateMergedMeshFromChildrenNative(ctx, impl, typed.get(), shapeKey);
+    // The shared parse::buildMergedMesh (path order, right-handed, inconsistent members
+    // skipped) fills a MergeMeshDesc the scan owns; a merge without member geometry emits
+    // no shape. The merged points sit in the collider's frame without its scale: the
+    // cooked types carry that in meshScale, but the bounding fits read the points
+    // directly, so they get the collider's world scale baked in, as the standalone
+    // bounding path does for a gprim's points.
+    parse::DescPtr<parse::MergeMeshDesc> mergedMesh = parse::allocateDesc<parse::MergeMeshDesc>(ctx.descriptorAllocator());
+    if (parse::buildMergedMesh(ctx, shapeKey, *mergedMesh) == 0)
+        return parse::DescPtr<parse::PhysxShapeDesc>{};
+    if (approx == parse::MeshApproximation::eBoundingSphere || approx == parse::MeshApproximation::eBoundingCube)
+        for (carb::Float3& point : mergedMesh->points)
+            point = { point.x * meshScale.x, point.y * meshScale.y, point.z * meshScale.z };
+    typed->mergedMesh = mergedMesh.get();
+    impl.scan.retainOwnedMesh(std::move(mergedMesh));
     return parse::descPtrCast<parse::PhysxShapeDesc>(std::move(typed));
 }
 
@@ -3339,7 +3264,14 @@ PXR_NS::SdfPath computeJointLocalPose(PXR_NS::UsdStageWeakPtr stage,
     else
         bodyToWorld.SetIdentity();
 
-    omni::physics::transformJointFrameToBody(relationshipToWorld, bodyToWorld, relPrim == body, t, q);
+    carb::Float3 localPosition{ t[0], t[1], t[2] };
+    carb::Float4 localOrientation{ q.GetImaginary()[0], q.GetImaginary()[1], q.GetImaginary()[2], q.GetReal() };
+    omni::physics::transformJointFrameToBody(omni::physx::toPhysX(relationshipToWorld),
+                                             omni::physx::toPhysX(bodyToWorld), relPrim == body, localPosition,
+                                             localOrientation);
+    t.Set(localPosition.x, localPosition.y, localPosition.z);
+    q = PXR_NS::GfQuatf(localOrientation.w,
+                        PXR_NS::GfVec3f(localOrientation.x, localOrientation.y, localOrientation.z));
 
     return body ? body.GetPrimPath() : PXR_NS::SdfPath();
 }
@@ -3889,9 +3821,9 @@ void finalizeBodiesAndShapes(WalkState& walk, UsdWalkCtx& impl)
                 transformSrcPrim = gprimPrim;
         }
 
-        PXR_NS::GfVec3f localPos(0.0f);
-        PXR_NS::GfQuatf localRot(1.0f);
-        PXR_NS::GfVec3f localScale(1.0f);
+        carb::Float3 localPos{ 0.0f, 0.0f, 0.0f };
+        carb::Float4 localRot{ 0.0f, 0.0f, 0.0f, 1.0f };
+        carb::Float3 localScale{ 1.0f, 1.0f, 1.0f };
         PXR_NS::GfMatrix4d shapeToBody(1.0);
         if (transformSrcPrim != bodyPrim)
         {
@@ -3901,11 +3833,12 @@ void finalizeBodiesAndShapes(WalkState& walk, UsdWalkCtx& impl)
         }
         // Matrix sourcing remains specific to the native walker.
         omni::physics::decomposeCollisionShapeLocalTransform(
-            shapeToBody, walk.xfCache.GetLocalToWorldTransform(bodyPrim), localPos, localRot, localScale);
+            omni::physx::toPhysX(shapeToBody),
+            omni::physx::toPhysX(walk.xfCache.GetLocalToWorldTransform(bodyPrim)), localPos, localRot, localScale);
 
-        desc->localPos   = toFloat3(localPos);
-        desc->localRot   = toFloat4(localRot);
-        desc->localScale = toFloat3(localScale);
+        desc->localPos   = localPos;
+        desc->localRot   = localRot;
+        desc->localScale = localScale;
     }
 }
 
@@ -3936,23 +3869,31 @@ PXR_NS::SdfPath getMaterialBindingPath(const PXR_NS::UsdPrim& usdPrim)
     return materialKey;
 }
 
+// @implements REQ-PARSE-SCAN-001
+// @covers AC-3 AC-19
 ScannedStage scanStageNative(PXR_NS::UsdStageWeakPtr stage,
                              omni::physics::schema::PrimIteratorBase& primIterator,
-                             parse::IDescriptorAllocator& allocator)
+                             parse::IDescriptorAllocator& allocator,
+                             UsdSource* attachedSource,
+                             bool outputVelocitiesLocalSpaceDefault)
 {
     if (!stage)
         return {};
 
-    // The walk drives a concrete UsdSource (it needs UsdSource-specific
-    // resolvers like keyFor(SdfPath)); the scan owns it type-erased as the
-    // backend `IPhysicsSource`. Moving the unique_ptr does not move the
-    // pointee, so `usdSource` stays valid for the walk.
-    std::unique_ptr<UsdSource> usdPtr = std::make_unique<UsdSource>(stage);
-    UsdSource& usdSource = *usdPtr;
-    ScannedStage out{ parse::makeScannedStageFromSource(std::move(usdPtr)) };
+    // Share only attachment identity state. Each snapshot owns fresh transform,
+    // token and buffer state, so nested/rescanned snapshots do not retain stale
+    // matrices or accumulate source-side array buffers (ADR-0043).
+    if (attachedSource && !attachedSource->isForStage(stage))
+        return {};
+    std::unique_ptr<UsdSource> owned = attachedSource ? attachedSource->makeScanSource() :
+                                                    std::make_unique<UsdSource>(stage);
+    UsdSource& usdSource = *owned;
+    ScannedStage out{parse::makeScannedStageFromSource(std::move(owned))};
     UsdWalkCtx impl{ usdSource, stage, out };
     parse::ParseContext ctx(usdSource, allocator);
+    ctx.setOutputVelocitiesLocalSpaceDefault(outputVelocitiesLocalSpaceDefault);
     WalkState walk;
+    std::vector<parse::ObjectKey> collisionGroupKeys;
 
     // Mass scale (1 / kilogramsPerUnit) used by parse-lib vehicle
     // component parsers (Tire's deprecated longitudinalStiffnessPerUnit-
@@ -3963,6 +3904,57 @@ ScannedStage scanStageNative(PXR_NS::UsdStageWeakPtr stage,
     const float massScale   = 1.0f / static_cast<float>(kilogramsPerUnit);
     const float lengthScale = 1.0f / static_cast<float>(metersPerUnit);
     const float kgmsScale   = (lengthScale * lengthScale) * massScale;
+
+    // Retain dispatch candidates even below an instancer, before the ordinary
+    // descriptor walk prunes its prototypes. Direct USD type/API classification
+    // keeps this discovery independent of source instancing resolution.
+    std::unordered_set<parse::ObjectKey, parse::ObjectKey::Hash> seenParticleCandidates;
+    primIterator.reset();
+    while (!primIterator.atEnd())
+    {
+        const PXR_NS::UsdPrim& prim = *primIterator.getCurrent();
+        if (!prim)
+        {
+            primIterator.pruneChildren();
+            primIterator.next();
+            continue;
+        }
+        const PXR_NS::TfTokenVector apis = prim.GetPrimTypeInfo().GetAppliedAPISchemas();
+        const uint64_t apiFlags = classifyApiSchemas(apis);
+        using Kind = parse::ParticleObjectCandidate::Kind;
+        Kind kind = Kind::eCustomInstancer;
+        bool candidate = true;
+        if (prim.IsA<PXR_NS::PhysxSchemaPhysxParticleSystem>())
+            kind = Kind::eParticleSystem;
+        else if (prim.IsA<PXR_NS::UsdGeomXform>())
+        {
+            candidate = std::find(apis.begin(), apis.end(), PXR_NS::TfToken("InfiniteVoxelMapAPI")) != apis.end();
+            kind = Kind::eVoxelMap;
+        }
+        else if (prim.IsA<PXR_NS::UsdGeomMesh>() && (apiFlags & ApiFlag::eParticleSamplingAPI))
+            kind = Kind::eParticleSampler;
+        else if ((prim.IsA<PXR_NS::UsdGeomPointBased>() || prim.IsA<PXR_NS::UsdGeomPointInstancer>()) &&
+                 (apiFlags & ApiFlag::eParticleSetAPI))
+            kind = Kind::eParticleSet;
+        else if (prim.IsA<PXR_NS::UsdGeomPointInstancer>())
+            kind = Kind::ePointInstancer;
+        else if (prim.IsA<PXR_NS::PhysxSchemaPhysxPhysicsJointInstancer>())
+            kind = Kind::eJointInstancer;
+        else
+            candidate = false;
+        if (!candidate && isCustomPhysicsInstancerToken(prim.GetTypeName()))
+        {
+            candidate = true;
+            kind = Kind::eCustomInstancer;
+        }
+        if (candidate)
+        {
+            const parse::ObjectKey key = impl.source.keyFor(prim.GetPrimPath());
+            if (seenParticleCandidates.insert(key).second)
+                out.particleObjectCandidates.push_back({ key, kind });
+        }
+        primIterator.next();
+    }
 
     primIterator.reset();
     while (!primIterator.atEnd())
@@ -4008,7 +4000,7 @@ ScannedStage scanStageNative(PXR_NS::UsdStageWeakPtr stage,
         }
         else if (typeBits & PrimTypeBits::eUsdPhysicsCollisionGroup)
         {
-            emitCollisionGroup(out, ctx, key);
+            collisionGroupKeys.push_back(key);
         }
         else if (typeBits & PrimTypeBits::ePhysxVehicleTireFrictionTable)
         {
@@ -4220,6 +4212,8 @@ ScannedStage scanStageNative(PXR_NS::UsdStageWeakPtr stage,
 
         primIterator.next();
     }
+
+    emitCollisionGroups(out, ctx, collisionGroupKeys);
 
     // Pass-2: shape ancestor walk + finalizeCollision.
     finalizeBodiesAndShapes(walk, impl);

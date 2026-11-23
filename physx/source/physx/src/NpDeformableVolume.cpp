@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "DyDeformableVolumeCore.h"
 #include "PxsHeapMemoryAllocator.h"
@@ -260,7 +237,6 @@ void NpDeformableVolume::setSolverIterationCounts(PxU32 minPositionIters, PxU32 
 	PX_CHECK_AND_RETURN(minPositionIters > 0, "PxDeformableBody::setSolverIterationCounts: minPositionIters must be more than zero!");
 	PX_CHECK_AND_RETURN(minPositionIters <= 255, "PxDeformableBody::setSolverIterationCounts: minPositionIters must be no greater than 255!");
 	PX_CHECK_AND_RETURN(minVelocityIters <= 255, "PxDeformableBody::setSolverIterationCounts: minVelocityIters must be no greater than 255!");
-	PX_WARN_ONCE_IF(minVelocityIters > 1, "PxDeformableBody::setSolverIterationCounts: minVelocityIters are ignored!");
 
 	PX_CHECK_SCENE_API_WRITE_FORBIDDEN(npScene, "PxDeformableBody::setSolverIterationCounts() not allowed while simulation is running. Call will be ignored.");
 
@@ -368,6 +344,10 @@ PxShape* NpDeformableVolume::getShape()
 
 bool NpDeformableVolume::attachShape(PxShape& shape)
 {
+	NP_WRITE_CHECK(getNpScene());
+	PX_CHECK_AND_RETURN_NULL(getNpScene() == NULL,
+		"PxDeformableVolume::attachShape: only allowed while the deformable volume is not part of a scene.");
+
 	NpShape* npShape = static_cast<NpShape*>(&shape);
 
 	PX_CHECK_AND_RETURN_NULL(npShape->getGeometryTypeFast() == PxGeometryType::eTETRAHEDRONMESH,
@@ -381,9 +361,14 @@ bool NpDeformableVolume::attachShape(PxShape& shape)
 	PX_CHECK_AND_RETURN_NULL(tetGeom.tetrahedronMesh != NULL,
 		"PxDeformableVolume::attachShape: PxTetrahedronMeshGeometry::tetrahedronMesh is NULL");
 
-	Gu::BVTetrahedronMesh* tetMesh = static_cast<Gu::BVTetrahedronMesh*>(tetGeom.tetrahedronMesh);
+	const Gu::TetrahedronMesh* tetMesh = Gu::_getTetraMeshData(tetGeom);
+	PX_CHECK_AND_RETURN_NULL(tetMesh->getBVTetrahedronMesh() != NULL,
+		"PxDeformableVolume::attachShape: the shape's tetrahedron mesh must be the collision mesh of a PxDeformableVolumeMesh, see PxDeformableVolumeMesh::getCollisionMesh()");
 	PX_CHECK_AND_RETURN_NULL(tetMesh->getNbTetrahedronsFast() <= PX_MAX_NB_DEFORMABLE_VOLUME_TET,
 		"PxDeformableVolume::attachShape: collision mesh consists of too many tetrahedrons, see PX_MAX_NB_DEFORMABLE_VOLUME_TET");
+	// Element filters encode a collision tetrahedron's vertex indices, so they are capped like the tetrahedra.
+	PX_CHECK_AND_RETURN_NULL(tetMesh->getNbVerticesFast() <= PX_MAX_NB_DEFORMABLE_VOLUME_VTX,
+		"PxDeformableVolume::attachShape: collision mesh consists of too many vertices, see PX_MAX_NB_DEFORMABLE_VOLUME_VTX");
 
 	PX_CHECK_AND_RETURN_NULL(npShape->getCore().mShapeCoreFlags & PxShapeCoreFlag::eDEFORMABLE_VOLUME_SHAPE,
 		"PxDeformableVolume::attachShape: shape must be a deformable volume shape!");
@@ -412,9 +397,9 @@ bool NpDeformableVolume::attachShape(PxShape& shape)
 
 void NpDeformableVolume::detachShape()
 {
-	PX_CHECK_MSG(getNpSceneFromActor(*this) == NULL,
-		"Detaching a shape from a PxDeformableVolume is currenly only allowed as long as it is not part of a scene. "
-		"Please remove the deformable volume from its scene first.");
+	NP_WRITE_CHECK(getNpScene());
+	PX_CHECK_AND_RETURN(getNpScene() == NULL,
+		"PxDeformableVolume::detachShape: only allowed while the deformable volume is not part of a scene.");
 
 	if (!mShape)
 		return;
@@ -536,15 +521,23 @@ void NpDeformableVolume::setKinematicTargetBufferD(const PxVec4* positions)
 
 bool NpDeformableVolume::attachSimulationMesh(PxTetrahedronMesh& simulationMesh, PxDeformableVolumeAuxData& deformableVolumeAuxData)
 {
+	NP_WRITE_CHECK(getNpScene());
+	PX_CHECK_AND_RETURN_NULL(getNpScene() == NULL,
+		"PxDeformableVolume::attachSimulationMesh: only allowed while the deformable volume is not part of a scene.");
+
 	Dy::DeformableVolumeCore& core = mCore.getCore();
 
 	PX_CHECK_AND_RETURN_NULL(core.simPositionInvMass == NULL, "PxDeformableVolume::attachSimulationMesh: simPositionInvMass already exists, overwrite not allowed, call detachSimulationMesh first");
 	PX_CHECK_AND_RETURN_NULL(core.simVelocity == NULL, "PxDeformableVolume::attachSimulationMesh: simVelocity already exists, overwrite not allowed, call detachSimulationMesh first");
 	Gu::TetrahedronMesh& tetMesh = static_cast<Gu::TetrahedronMesh&>(simulationMesh);
 	PX_CHECK_AND_RETURN_NULL(tetMesh.getNbTetrahedronsFast() <= PX_MAX_NB_DEFORMABLE_VOLUME_TET, "PxDeformableVolume::attachSimulationMesh: simulation mesh contains too many tetrahedrons, see PX_MAX_NB_DEFORMABLE_VOLUME_TET");
+	PX_CHECK_AND_RETURN_NULL(tetMesh.getNbVerticesFast() <= PX_MAX_NB_DEFORMABLE_VOLUME_VTX, "PxDeformableVolume::attachSimulationMesh: simulation mesh contains too many vertices, see PX_MAX_NB_DEFORMABLE_VOLUME_VTX");
 
 	mSimulationMesh = &tetMesh;
 	mAuxData = static_cast<Gu::DeformableVolumeAuxData*>(&deformableVolumeAuxData);
+	// Both are read for as long as they stay attached.
+	Cm::RefCountable_incRefCount(*mSimulationMesh);
+	Cm::RefCountable_incRefCount(*mAuxData);
 	const PxU32 numVertsGM = tetMesh.getNbVerticesFast();
 
 	createAllocator();
@@ -557,6 +550,10 @@ bool NpDeformableVolume::attachSimulationMesh(PxTetrahedronMesh& simulationMesh,
 
 void NpDeformableVolume::detachSimulationMesh()
 {
+	NP_WRITE_CHECK(getNpScene());
+	PX_CHECK_AND_RETURN(getNpScene() == NULL,
+		"PxDeformableVolume::detachSimulationMesh: only allowed while the deformable volume is not part of a scene.");
+
 	if (!mSimulationMesh)
 		return;
 
@@ -575,6 +572,8 @@ void NpDeformableVolume::detachSimulationMesh()
 		core.simVelocity = NULL;
 	}
 
+	Cm::RefCountable_decRefCount(*mSimulationMesh);
+	Cm::RefCountable_decRefCount(*mAuxData);
 	mSimulationMesh = NULL;
 	mAuxData = NULL;
 }
@@ -623,6 +622,9 @@ void NpDeformableVolume::createAllocator()
 
 		mMemoryManager = physXGpu->createGpuMemoryManager(mCudaContextManager);
 		mDeviceMemoryAllocator = mMemoryManager->getDeviceMemoryAllocator();
+
+		// OMPE-93952: keep the context manager alive for the memory manager. Released in releaseAllocator().
+		mCudaContextManager->acquireReference();
 	}
 	PX_ASSERT(mMemoryManager != NULL);
 	PX_ASSERT(mDeviceMemoryAllocator != NULL);
@@ -657,6 +659,9 @@ void NpDeformableVolume::releaseAllocator()
 	{
 		mDeviceMemoryAllocator = NULL; // released by memory manager
 		PX_DELETE(mMemoryManager);
+
+		// release the reference taken in createAllocator().
+		mCudaContextManager->release();
 	}
 }
 

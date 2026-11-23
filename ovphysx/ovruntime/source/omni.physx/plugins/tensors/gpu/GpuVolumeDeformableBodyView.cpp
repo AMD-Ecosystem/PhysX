@@ -1,10 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
+/**
+ * @implements REQ-TENSOR-INDEX-001
+ * @covers AC-3
+ *
+ * @implements REQ-TENSOR-VIEW-001
+ * @covers AC-15
+ */
 #include <string>
 
 // clang-format off
-#include <UsdPCH.h>
 // clang-format on
 
 #include <PxPhysicsAPI.h>
@@ -92,36 +98,24 @@ GpuVolumeDeformableBodyView::GpuVolumeDeformableBodyView(GpuSimulationView* sim,
             deformableBodyRecord.collNodalPositions = deformableBody->getPositionInvMassBufferD();
 
             // tensor lib managed data
-            if (!CHECK_CUDA(cudaMalloc(&(deformableBodyRecord.simElementIndices), simElementIndicesBufferSize)))
-                return;
-
-            if (!CHECK_CUDA(cudaMemcpy(deformableBodyRecord.simElementIndices, entries[i].simIndices.data(),
-                                       simElementIndicesBufferSize, cudaMemcpyHostToDevice)))
+            const bool allocated =
+                CHECK_CUDA(cudaMalloc(&(deformableBodyRecord.simElementIndices), simElementIndicesBufferSize)) &&
+                CHECK_CUDA(cudaMemcpy(deformableBodyRecord.simElementIndices, entries[i].simIndices.data(),
+                                      simElementIndicesBufferSize, cudaMemcpyHostToDevice)) &&
+                CHECK_CUDA(cudaMalloc(&(deformableBodyRecord.simNodalKinematicTargets), simNodalVec4BufferSize)) &&
+                CHECK_CUDA(cudaMalloc(&(deformableBodyRecord.restNodalPositions), restNodalVec3BufferSize)) &&
+                CHECK_CUDA(cudaMemcpy(deformableBodyRecord.restNodalPositions, entries[i].restPositions.data(),
+                                      restNodalVec3BufferSize, cudaMemcpyHostToDevice)) &&
+                CHECK_CUDA(cudaMalloc(&(deformableBodyRecord.collElementIndices), collElementIndicesBufferSize)) &&
+                CHECK_CUDA(cudaMemcpy(deformableBodyRecord.collElementIndices, entries[i].collIndices.data(),
+                                      collElementIndicesBufferSize, cudaMemcpyHostToDevice));
+            if (!allocated)
             {
-                CARB_LOG_ERROR("Unable to copy data from host to device for simElementIndicesBuffer\n");
-                return;
-            }
-
-            if (!CHECK_CUDA(cudaMalloc(&(deformableBodyRecord.simNodalKinematicTargets), simNodalVec4BufferSize)))
-                return;
-
-            if (!CHECK_CUDA(cudaMalloc(&(deformableBodyRecord.restNodalPositions), restNodalVec3BufferSize)))
-                return;
-
-            if (!CHECK_CUDA(cudaMemcpy(deformableBodyRecord.restNodalPositions, entries[i].restPositions.data(),
-                                       restNodalVec3BufferSize, cudaMemcpyHostToDevice)))
-            {
-                CARB_LOG_ERROR("Unable to copy data from host to device for restNodalPositionsBuffer\n");
-                return;
-            }
-
-            if (!CHECK_CUDA(cudaMalloc(&(deformableBodyRecord.collElementIndices), collElementIndicesBufferSize)))
-                return;
-
-            if (!CHECK_CUDA(cudaMemcpy(deformableBodyRecord.collElementIndices, entries[i].collIndices.data(),
-                                       collElementIndicesBufferSize, cudaMemcpyHostToDevice)))
-            {
-                CARB_LOG_ERROR("Unable to copy data from host to device for collElementIndicesBuffer\n");
+                // The record is not kept, so what it allocated is freed here, and the view stays unusable. The failure
+                // is reported here rather than left as CUDA's last error for a later launch check to report.
+                CARB_LOG_ERROR("Unable to allocate or upload the device buffers of a volume deformable body");
+                cudaGetLastError();
+                DeformableBodyBufferManager::freeRecordBuffers(deformableBodyRecord);
                 return;
             }
 
@@ -162,15 +156,20 @@ GpuVolumeDeformableBodyView::GpuVolumeDeformableBodyView(GpuSimulationView* sim,
     mSimNodalKinematicTargets.setMaxBufferSize();
     mRestNodalPositions.setMaxBufferSize();
 
-    mSimElementIndices.uploadDeviceData("mSimElementIndices");
-    mCollElementIndices.uploadDeviceData("mCollElementIndices");
-    mSimNodalKinematicTargets.uploadDeviceData("mSimNodalKinematicTargets");
-    mRestNodalPositions.uploadDeviceData("mRestNodalPositions");
+    mUsable = mSimElementIndices.uploadDeviceData("mSimElementIndices") &&
+              mCollElementIndices.uploadDeviceData("mCollElementIndices") &&
+              mSimNodalKinematicTargets.uploadDeviceData("mSimNodalKinematicTargets") &&
+              mRestNodalPositions.uploadDeviceData("mRestNodalPositions");
+    if (!mUsable)
+        return;
 
     PhysxCudaContextGuard ctxGuard(mGpuSimData->mCudaContextManager);
 
-    DeformableBodyBufferManager::allocDevMemAndCopyH2D((void**)&mViewIndicesD, mViewIndices.data(), sizeof(PxU32) * numBodies, "ViewIndices");
-    DeformableBodyBufferManager::allocDevMemAndCopyH2D((void**)&mDeformableBodyRecordsD, mDeformableBodyRecords.data(), sizeof(GpuDeformableBodyRecord) * numBodies, "GpuDeformableBodyRecord");
+    mUsable = DeformableBodyBufferManager::allocDevMemAndCopyH2D(
+                  (void**)&mViewIndicesD, mViewIndices.data(), sizeof(PxU32) * numBodies, "ViewIndices") &&
+              DeformableBodyBufferManager::allocDevMemAndCopyH2D(
+                  (void**)&mDeformableBodyRecordsD, mDeformableBodyRecords.data(),
+                  sizeof(GpuDeformableBodyRecord) * numBodies, "GpuDeformableBodyRecord");
 }
 
 GpuVolumeDeformableBodyView::~GpuVolumeDeformableBodyView()
@@ -189,6 +188,7 @@ GpuVolumeDeformableBodyView::~GpuVolumeDeformableBodyView()
         mSimNodalKinematicTargets.releaseDeviceMem();
         mSimElementIndices.releaseDeviceMem();
         mCollElementIndices.releaseDeviceMem();
+        mRestNodalPositions.releaseDeviceMem();
         // NOTE: should we remove the device buffer allocated for a specific deformable body as soon as they are not managed
         // by any views or should we keep them around maybe some new view are going to manage them?
         // former is more memory efficient, but later is more performant if the users keep creating view objects
@@ -228,7 +228,8 @@ bool GpuVolumeDeformableBodyView::submitData(const TensorDesc* srcTensor,
     if (indexTensor && indexTensor->data)
     {
         if (!checkTensorDevice(*indexTensor, mDevice, "index", __FUNCTION__) ||
-            !checkTensorInt32(*indexTensor, "index", __FUNCTION__))
+            !checkTensorInt32(*indexTensor, "index", __FUNCTION__) ||
+            !checkIndexTensorSize(*indexTensor, getCount(), __FUNCTION__))
         {
             return false;
         }

@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 /**
  * @implements REQ-PARSE-CORE-001
  * @covers AC-1
+ *
+ * @implements REQ-PARSE-BODY-001
+ * @covers AC-6
  *
  * @implements REQ-PARSE-CORE-004
  * @covers AC-1 AC-2 AC-3 AC-4
@@ -16,6 +19,9 @@
  *
  * @implements REQ-PARSE-SCAN-001
  * @covers AC-7 AC-12
+ *
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-27 AC-28
  */
 
 #pragma once
@@ -235,6 +241,8 @@ struct ObjectInstance
     uint32_t index = 0;
     ObjectKey protoKey;
     bool isExclusive = false;
+    Matrix4d protoTransformInverse;
+    bool hasProtoTransformInverse = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -405,7 +413,7 @@ struct PhysxSceneDesc : PhysxObjectDesc
     bool enableStabilization = false;
     bool enableGPUDynamics = true;
     bool enableEnhancedDeterminism = false;
-    bool enableExternalForcesEveryIteration = false;
+    bool enableExternalForcesEveryIteration = true;
     bool invertedFiltering = false;
     bool reportKineKine = false;
     bool reportKineStatic = false;
@@ -782,7 +790,15 @@ struct DynamicPhysxRigidBodyDesc : PhysxRigidBodyDesc
 
     bool surfaceVelocityEnabled = false;
     bool surfaceVelocityLocalSpace = false;
+    // The effective (world-frame) surface velocity: the authored value with the prim's
+    // per-axis scale folded in when surfaceVelocityLocalSpace is set.
     carb::Float3 surfaceLinearVelocity = { 0.0f, 0.0f, 0.0f };
+    // The same quantity as authored, before that fold. The runtime caches it so a later
+    // change to surfaceVelocityLocalSpace alone can re-derive the effective velocity
+    // without reading the surfaceVelocity attribute back out of the source: that read
+    // resolves at the source's latest state, which is not necessarily the state the
+    // change being processed belongs to.
+    carb::Float3 surfaceLinearVelocityAuthored = { 0.0f, 0.0f, 0.0f };
     carb::Float3 surfaceAngularVelocity = { 0.0f, 0.0f, 0.0f };
 
     bool splinesSurfaceVelocityEnabled = false;
@@ -877,7 +893,7 @@ struct PhysxJointDesc : PhysxObjectDesc
     PhysxJointDesc()
         : localPose0Position({ 0.0f, 0.0f, 0.0f }), localPose0Orientation({ 1.0f, 0.0f, 0.0f, 0.0f }),
           localPose1Position({ 0.0f, 0.0f, 0.0f }), localPose1Orientation({ 1.0f, 0.0f, 0.0f, 0.0f }),
-          jointEnabled(true), breakForce(FLT_MAX), breakTorque(FLT_MAX), jointFriction(0.0f)
+          jointEnabled(true), breakForce(FLT_MAX), breakTorque(FLT_MAX)
     {
     }
 
@@ -893,7 +909,6 @@ struct PhysxJointDesc : PhysxObjectDesc
     bool jointEnabled;
     float breakForce;
     float breakTorque;
-    float jointFriction;
     bool enableCollision = false;            // USD `physics:collisionEnabled` default
     bool excludedFromArticulation = false;   // USD `physics:excludeFromArticulation` default
     bool validBodyTransformations = true;    // runtime-side validity flag; parsers default to true

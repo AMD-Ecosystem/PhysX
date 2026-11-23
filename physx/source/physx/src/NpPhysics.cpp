@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "NpPhysics.h"
 
@@ -228,6 +205,8 @@ NpPhysics::~NpPhysics()
 		// The ctor stashed mOmniPvdSampler into the (ref-counted) PxOmniPvd singleton, which
 		// can outlive this PxPhysics. Clear that pointer before deleting the sampler so a
 		// later PxOmniPvd::startSampling()/stopSampling() cannot dereference a freed sampler.
+		// End discovery too: the singleton must not revive its scope for a later PxPhysics.
+		mOmniPvd->stopSampling();
 		static_cast<NpOmniPvd*>(mOmniPvd)->mPhysXSampler = NULL;
 		mFoundation.deregisterErrorCallback(*mOmniPvdSampler);
 		NpOmniPvd::decRefCount();
@@ -541,7 +520,16 @@ PxRigidDynamic* NpPhysics::createRigidDynamic(const PxTransform& globalPose)
 
 PxConstraint* NpPhysics::createConstraint(PxRigidActor* actor0, PxRigidActor* actor1, PxConstraintConnector& connector, const PxConstraintShaderTable& shaders, PxU32 dataSize)
 {
-	return NpFactory::getInstance().createConstraint(actor0, actor1, connector, shaders, dataSize);
+#if PX_SUPPORT_OMNI_PVD
+	if (mOmniPvdSampler)
+		mOmniPvdSampler->beginConstraintCreation(connector);
+#endif
+	PxConstraint* constraint = NpFactory::getInstance().createConstraint(actor0, actor1, connector, shaders, dataSize);
+#if PX_SUPPORT_OMNI_PVD
+	if (mOmniPvdSampler)
+		mOmniPvdSampler->endConstraintCreation(connector);
+#endif
+	return constraint;
 }
 
 PxU32 NpPhysics::getNbConstraints() const
@@ -657,7 +645,16 @@ static NpMaterialT* addMaterial(
 	else
 	{
 		PxGetFoundation().error(PxErrorCode::eINVALID_PARAMETER, PX_FL, error);
+
+		//setMaterial() has already cleared the index of a material it rejected, so destroying it here cannot
+		//unregister a slot it does not own: both NpMaterialManager::removeMaterial and NpScene::removeMaterial
+		//skip MATERIAL_INVALID_HANDLE. Getting that wrong is the material table corruption behind OMPE-109162,
+		//where a deserialized copy took the *source* material's slot down with it.
+		//onRefCountZero() dispatches on eOWNS_MEMORY, so this returns an owned material to the pool and
+		//destroys a deserialized one in place. Its caller must therefore not touch it again - which is why
+		//resolveReferences() reports the outcome instead of leaving it to be read back off the object.
 		m->release();
+
 		return NULL;
 	}
 }
@@ -1163,6 +1160,6 @@ PxPhysics* PxCreatePhysics(PxU32 version, PxFoundation& foundation, const physx:
 void PxAddCollectionToPhysics(const PxCollection& collection)
 {
 	NpFactory& factory = NpFactory::getInstance();
-	const Cm::Collection& c = static_cast<const Cm::Collection&>(collection);	
+	const Cm::Collection& c = static_cast<const Cm::Collection&>(collection);
     factory.addCollection(c);
 }

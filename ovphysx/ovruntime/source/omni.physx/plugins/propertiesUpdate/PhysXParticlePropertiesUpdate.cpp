@@ -1,9 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+/**
+ * @implements REQ-PARSE-BACKEND-001
+ * @covers AC-9
+ *
+ * @implements REQ-SIM-PARTICLESET-001
+ * @covers AC-4
+ */
 
 #include "PhysXPropertiesUpdate.h"
+
+#include <omni/physics/parse/KnownTokens.h>
 
 #include <internal/InternalParticle.h>
 #include <particles/PhysXParticlePost.h>
@@ -19,24 +27,17 @@
 
 #include <PxPhysicsAPI.h>
 
-#include <common/foundation/TypeCast.h>
-
 using namespace ::physx;
 using namespace carb;
-using namespace PXR_NS;
 using namespace omni::physx;
 using namespace omni::physx::usdparser;
 using namespace omni::physx::internal;
 
-// schemaTypeToken lives in PhysXTools.h (single boundary translation).
-using omni::physx::internal::schemaTypeToken;
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 // PARTICLE SYSTEM
-bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -48,7 +49,12 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
         PxPBDParticleSystem* physxPS = reinterpret_cast<PxPBDParticleSystem*>(objectRecord->mPtr);
         if (physxPS)
         {
-            if (property == PhysxSchemaTokens.Get()->particleSystemEnabled)
+            const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+            omni::physics::parse::KnownTokens tok;
+            if (source)
+                tok.intern(*source);
+
+            if (property == tok.particleSystemEnabled)
             {
                 bool enabled;
                 if (!getValue<bool>(attachedStage, objectRecord->mKey, property, timeCode, enabled))
@@ -57,7 +63,7 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
                 InternalPbdParticleSystem* internalPS = reinterpret_cast<InternalPbdParticleSystem*>(objectRecord->mInternalPtr);
                 internalPS->enableParticleSystem(enabled);
             }
-            else if (property == PhysxSchemaTokens.Get()->enableCCD)
+            else if (property == tok.enableCCD)
             {
                 bool enabled;
                 if (!getValue<bool>(attachedStage, objectRecord->mKey, property, timeCode, enabled))
@@ -65,7 +71,7 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
 
                 physxPS->setParticleFlag(PxParticleFlag::eENABLE_SPECULATIVE_CCD, enabled);
             }
-            else if (property == PhysxSchemaTokens.Get()->contactOffset)
+            else if (property == tok.contactOffset)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -75,7 +81,7 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
 
                 physxPS->setContactOffset(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->fluidRestOffset)
+            else if (property == tok.fluidRestOffset)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -85,7 +91,7 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
 
                 physxPS->setFluidRestOffset(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->maxDepenetrationVelocity)
+            else if (property == tok.maxDepenetrationVelocity)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -93,7 +99,7 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
 
                 physxPS->setMaxDepenetrationVelocity(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->maxVelocity)
+            else if (property == tok.maxVelocity)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -101,7 +107,7 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
 
                 physxPS->setMaxLinearVelocity(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->particleContactOffset)
+            else if (property == tok.particleContactOffset)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -111,7 +117,7 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
 
                 physxPS->setParticleContactOffset(data);
             }            
-            else if (property == PhysxSchemaTokens.Get()->restOffset)
+            else if (property == tok.restOffset)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -121,7 +127,7 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
 
                 physxPS->setRestOffset(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->solidRestOffset)
+            else if (property == tok.solidRestOffset)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -131,7 +137,7 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
 
                 physxPS->setSolidRestOffset(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->solverPositionIterationCount)
+            else if (property == tok.solverPositionIterationCount)
             {
                 PxU32 pos, vel;
                 physxPS->getSolverIterationCounts(pos, vel);
@@ -142,23 +148,23 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
 
                 physxPS->setSolverIterationCounts(PxU32(data), vel);
             }
-            else if (property == PhysxSchemaTokens.Get()->wind)
+            else if (source && property == source->internToken("wind"))
             {
-                GfVec3f data;
+                carb::Float3 data;
                 if (!getValue(attachedStage, objectRecord->mKey, property, timeCode, data))
                     return true;
 
                 physxPS->setWind(toPhysX(data));
             }
-            else if (property == PhysxSchemaTokens.Get()->maxNeighborhood)
+            else if (property == tok.maxNeighborhood)
             {
                 const InternalPbdParticleSystem* internalPS = reinterpret_cast<InternalPbdParticleSystem*>(objectRecord->mInternalPtr);
-                CARB_LOG_WARN("Cannot update maxNeighborhood of %s after simulation start.", internalPS->getPath().GetText());
+                CARB_LOG_WARN("Cannot update maxNeighborhood of %s after simulation start.", attachedStage.textFor(internalPS->mKey));
             }
-            else if (property == PhysxSchemaTokens.Get()->neighborhoodScale)
+            else if (property == tok.neighborhoodScale)
             {
                 const InternalPbdParticleSystem* internalPS = reinterpret_cast<InternalPbdParticleSystem*>(objectRecord->mInternalPtr);
-                CARB_LOG_WARN("Cannot update neighborhoodScale of %s after simulation start.", internalPS->getPath().GetText());
+                CARB_LOG_WARN("Cannot update neighborhoodScale of %s after simulation start.", attachedStage.textFor(internalPS->mKey));
             }
         }
     }
@@ -166,10 +172,9 @@ bool omni::physx::updateParticleSystemAttribute(AttachedStage& attachedStage, om
     return true;
 }
 
-bool omni::physx::updateParticleSmoothingEnabledAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleSmoothingEnabledAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -182,7 +187,12 @@ bool omni::physx::updateParticleSmoothingEnabledAttribute(AttachedStage& attache
 
         if (internalPS)
         {
-            if (property == PhysxSchemaTokens.Get()->physxParticleSmoothingParticleSmoothingEnabled)
+            const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+            omni::physics::parse::KnownTokens tok;
+            if (source)
+                tok.intern(*source);
+
+            if (property == tok.physxParticleSmoothingParticleSmoothingEnabled)
             {
                 bool data;
                 if (!getValue<bool>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -196,10 +206,9 @@ bool omni::physx::updateParticleSmoothingEnabledAttribute(AttachedStage& attache
     return true;
 }
 
-bool omni::physx::updateParticleAnisotropyEnabledAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleAnisotropyEnabledAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -212,7 +221,12 @@ bool omni::physx::updateParticleAnisotropyEnabledAttribute(AttachedStage& attach
 
         if (internalPS)
         {
-            if (property == PhysxSchemaTokens.Get()->physxParticleAnisotropyParticleAnisotropyEnabled)
+            const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+            omni::physics::parse::KnownTokens tok;
+            if (source)
+                tok.intern(*source);
+
+            if (property == tok.physxParticleAnisotropyParticleAnisotropyEnabled)
             {
                 bool data;
                 if (!getValue<bool>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -226,10 +240,9 @@ bool omni::physx::updateParticleAnisotropyEnabledAttribute(AttachedStage& attach
     return true;
 }
 
-bool omni::physx::updateParticleIsosurfaceEnabledAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleIsosurfaceEnabledAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -242,7 +255,12 @@ bool omni::physx::updateParticleIsosurfaceEnabledAttribute(AttachedStage& attach
 
         if (internalPS)
         {
-            if (property == PhysxSchemaTokens.Get()->physxParticleIsosurfaceIsosurfaceEnabled)
+            const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+            omni::physics::parse::KnownTokens tok;
+            if (source)
+                tok.intern(*source);
+
+            if (property == tok.physxParticleIsosurfaceIsosurfaceEnabled)
             {
                 bool data;
                 if (!getValue<bool>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -256,10 +274,9 @@ bool omni::physx::updateParticleIsosurfaceEnabledAttribute(AttachedStage& attach
     return true;
 }
 
-bool omni::physx::updateParticleIsosurfaceAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleIsosurfaceAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -270,11 +287,24 @@ bool omni::physx::updateParticleIsosurfaceAttribute(AttachedStage& attachedStage
     {
         InternalPbdParticleSystem* internalPS = reinterpret_cast<InternalPbdParticleSystem*>(objectRecord->mInternalPtr);
 
-        uint32_t postFlags = particles::getPostprocessStages(internalPS->getPath());
+        // particles::getPostprocessStages is ObjectKey-keyed and unconditional (see
+        // PhysXParticlePost.h's top-of-file comment): the postprocess registry it queries is
+        // always empty in OvruntimePhysX, so it returns eNone. Isosurface is therefore never
+        // enabled, so the block below (already almost entirely commented-out
+        // real work, see the getValue<>() calls it guards) stays unreachable there.
+        // Read the key only once internalPS is known good -- the check below used to
+        // come after this dereference.
+        const uint32_t postFlags =
+            internalPS ? particles::getPostprocessStages(attachedStage, internalPS->mKey) : uint32_t(ParticlePostFlag::eNone);
 
         if (internalPS && (postFlags & ParticlePostFlag::eIsosurface))
         {
-            if (property == PhysxSchemaTokens.Get()->physxParticleIsosurfaceSurfaceDistance)
+            const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+            omni::physics::parse::KnownTokens tok;
+            if (source)
+                tok.intern(*source);
+
+            if (property == tok.physxParticleIsosurfaceSurfaceDistance)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -284,7 +314,7 @@ bool omni::physx::updateParticleIsosurfaceAttribute(AttachedStage& attachedStage
                 p.particleCenterToIsosurfaceDistance = data;
                 internalPS->mIsosurface->mIsosurfaceBuffer->setParams(p);*/
             }
-            else if (property == PhysxSchemaTokens.Get()->physxParticleIsosurfaceGridFilteringPasses)
+            else if (property == tok.physxParticleIsosurfaceGridFilteringPasses)
             {
                 std::string data;
                 if (!getValue<std::string>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -296,7 +326,7 @@ bool omni::physx::updateParticleIsosurfaceAttribute(AttachedStage& attachedStage
                 omni::physx::particle::setIsosurfaceGridFilteringPasses(p, passes);
                 internalPS->mIsosurface->mIsosurfaceBuffer->setParams(p);*/
             }
-            else if (property == PhysxSchemaTokens.Get()->physxParticleIsosurfaceGridSmoothingRadius)
+            else if (property == tok.physxParticleIsosurfaceGridSmoothingRadius)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -306,7 +336,7 @@ bool omni::physx::updateParticleIsosurfaceAttribute(AttachedStage& attachedStage
                 p.gridSmoothingRadiusRelativeToCellSize = data;
                 internalPS->mIsosurface->mIsosurfaceBuffer->setParams(p);*/
             }
-            else if (property == PhysxSchemaTokens.Get()->physxParticleIsosurfaceNumMeshSmoothingPasses)
+            else if (property == tok.physxParticleIsosurfaceNumMeshSmoothingPasses)
             {
                 int data;
                 if (!getValue<int>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -316,7 +346,7 @@ bool omni::physx::updateParticleIsosurfaceAttribute(AttachedStage& attachedStage
                 p.numMeshSmoothingPasses = data;
                 internalPS->mIsosurface->mIsosurfaceBuffer->setParams(p);*/
             }
-            else if (property == PhysxSchemaTokens.Get()->physxParticleIsosurfaceNumMeshNormalSmoothingPasses)
+            else if (property == tok.physxParticleIsosurfaceNumMeshNormalSmoothingPasses)
             {
                 int data;
                 if (!getValue<int>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -332,10 +362,9 @@ bool omni::physx::updateParticleIsosurfaceAttribute(AttachedStage& attachedStage
     return true;
 }
 
-bool omni::physx::updateDiffuseParticlesEnabledAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateDiffuseParticlesEnabledAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -348,7 +377,12 @@ bool omni::physx::updateDiffuseParticlesEnabledAttribute(AttachedStage& attached
 
         if (particleSet)
         {
-            if (property == PhysxSchemaTokens.Get()->physxDiffuseParticlesDiffuseParticlesEnabled)
+            const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+            omni::physics::parse::KnownTokens tok;
+            if (source)
+                tok.intern(*source);
+
+            if (property == tok.physxDiffuseParticlesDiffuseParticlesEnabled)
             {
                 bool enabled;
                 if (!getValue<bool>(attachedStage, objectRecord->mKey, property, timeCode, enabled))
@@ -361,10 +395,9 @@ bool omni::physx::updateDiffuseParticlesEnabledAttribute(AttachedStage& attached
     return true;
 }
 
-bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -376,12 +409,17 @@ bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, 
         InternalParticleSet* particleSet = reinterpret_cast<InternalParticleSet*>(objectRecord->mInternalPtr);
         if (particleSet)
         {
-            if (property == PhysxSchemaTokens.Get()->physxDiffuseParticlesMaxDiffuseParticleMultiplier)
+            const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+            omni::physics::parse::KnownTokens tok;
+            if (source)
+                tok.intern(*source);
+
+            if (property == tok.physxDiffuseParticlesMaxDiffuseParticleMultiplier)
             {
                 particleSet->changeDiffuseParticles(false);
                 return true;
             }
-            else if (property == PhysxSchemaTokens.Get()->physxDiffuseParticlesThreshold)
+            else if (property == tok.physxDiffuseParticlesThreshold)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -389,7 +427,7 @@ bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, 
 
                 particleSet->mDiffuseParticleParams.threshold = data;
             }
-            else if (property == PhysxSchemaTokens.Get()->physxDiffuseParticlesLifetime)
+            else if (property == tok.physxDiffuseParticlesLifetime)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -397,7 +435,7 @@ bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, 
 
                 particleSet->mDiffuseParticleParams.lifetime = data;
             }
-            else if (property == PhysxSchemaTokens.Get()->physxDiffuseParticlesAirDrag)
+            else if (property == tok.physxDiffuseParticlesAirDrag)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -405,7 +443,7 @@ bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, 
 
                 particleSet->mDiffuseParticleParams.airDrag = data;
             }
-            else if (property == PhysxSchemaTokens.Get()->physxDiffuseParticlesBubbleDrag)
+            else if (property == tok.physxDiffuseParticlesBubbleDrag)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -413,7 +451,7 @@ bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, 
 
                 particleSet->mDiffuseParticleParams.bubbleDrag = data;
             }
-            else if (property == PhysxSchemaTokens.Get()->physxDiffuseParticlesBuoyancy)
+            else if (property == tok.physxDiffuseParticlesBuoyancy)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -421,7 +459,7 @@ bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, 
 
                 particleSet->mDiffuseParticleParams.buoyancy = data;
             }
-            else if (property == PhysxSchemaTokens.Get()->physxDiffuseParticlesKineticEnergyWeight)
+            else if (property == tok.physxDiffuseParticlesKineticEnergyWeight)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -429,7 +467,7 @@ bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, 
 
                 particleSet->mDiffuseParticleParams.kineticEnergyWeight = data;
             }
-            else if (property == PhysxSchemaTokens.Get()->physxDiffuseParticlesPressureWeight)
+            else if (property == tok.physxDiffuseParticlesPressureWeight)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -437,7 +475,7 @@ bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, 
 
                 particleSet->mDiffuseParticleParams.pressureWeight = data;
             }
-            else if (property == PhysxSchemaTokens.Get()->physxDiffuseParticlesDivergenceWeight)
+            else if (property == tok.physxDiffuseParticlesDivergenceWeight)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -445,7 +483,7 @@ bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, 
 
                 particleSet->mDiffuseParticleParams.divergenceWeight = data;
             }
-            else if (property == PhysxSchemaTokens.Get()->physxDiffuseParticlesCollisionDecay)
+            else if (property == tok.physxDiffuseParticlesCollisionDecay)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -462,10 +500,9 @@ bool omni::physx::updateDiffuseParticlesAttribute(AttachedStage& attachedStage, 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 // PARTICLE SET
-bool omni::physx::updateParticleSetEnabled(AttachedStage& attachedStage, ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleSetEnabled(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTParticleSet;
     InternalParticleSet* internalParticleSet = reinterpret_cast<InternalParticleSet*>(db.getInternalTypedRecord(internalType, objectId));
@@ -482,10 +519,9 @@ bool omni::physx::updateParticleSetEnabled(AttachedStage& attachedStage, ObjectI
     return true;
 }
 
-bool omni::physx::updateParticleSetSelfCollision(AttachedStage& attachedStage, ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleSetSelfCollision(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTParticleSet;
     InternalParticleSet* internalParticleSet = reinterpret_cast<InternalParticleSet*>(db.getInternalTypedRecord(internalType, objectId));
@@ -519,10 +555,9 @@ bool omni::physx::updateParticleSetSelfCollision(AttachedStage& attachedStage, O
     return true;
 }
 
-bool omni::physx::updateParticleSetFluid(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleSetFluid(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -563,10 +598,9 @@ bool omni::physx::updateParticleSetFluid(AttachedStage& attachedStage, omni::phy
     return true;
 }
 
-bool omni::physx::updateParticleSetParticleGroup(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleSetParticleGroup(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTParticleSet;
     InternalParticleSet* internalParticleSet = reinterpret_cast<InternalParticleSet*>(db.getInternalTypedRecord(internalType, objectId));
@@ -595,10 +629,55 @@ bool omni::physx::updateParticleSetParticleGroup(AttachedStage& attachedStage, o
     return true;
 }
 
-static void updateParticlePositions(InternalParticleSet* internalParticleSet, const VtArray<GfVec3f>& positions)
+// After a count-changing resize, re-populate the set's authored columns. A single OVStage write that
+// grows a set may carry both `points` and `velocities`, but each arrives as its own per-attribute batch
+// and resize() reseeds positions from the origin; so a resize driven by one column must re-apply the
+// authored data of BOTH columns, or the other column's authored values are lost -- independent of the
+// drain's column order. A column whose authored array does not match the new count
+// (e.g. a points-less velocities write) is left untouched: it is not part of this growth.
+static void reapplyParticleColumnsAfterResize(AttachedStage& attachedStage, InternalParticleSet* set)
 {
-    AttachedStage* as = UsdLoad::getUsdLoad()->getActiveAttachedStage();
-    GfMatrix4d localToWorld = getWorldTransform(*as, internalParticleSet->mKey, UsdTimeCode::Default());
+    const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
+    if (!src)
+        return;
+    omni::physics::parse::KnownTokens tok;
+    tok.intern(*src);
+    const bool pointBased = src->isA(set->mKey, tok.pointBasedType);
+    const bool instancer = src->isA(set->mKey, tok.pointInstancerType);
+
+    std::vector<carb::Float3> points;
+    if (pointBased)
+        getArrayValue(attachedStage, set->mKey, tok.points, omni::physics::parse::ReadTime::defaultTime(), points);
+    else if (instancer)
+        getArrayValue(attachedStage, set->mKey, tok.positions, omni::physics::parse::ReadTime::defaultTime(), points);
+    if (points.size() == set->mNumParticles && set->mPositions)
+    {
+        const PxMat44d localToWorld = getWorldTransform(attachedStage, set->mKey, omni::physics::parse::ReadTime::defaultTime());
+        for (uint32_t i = 0; i < set->mNumParticles; ++i)
+        {
+            const PxVec3d pos = localToWorld.transform(toPhysXd(points[i]));
+            set->mPositions[i] = PxVec4(float(pos.x), float(pos.y), float(pos.z), set->mParticleInvMass);
+        }
+        set->mUploadDirtyFlags |= ParticleBufferFlags::ePOSITIONS;
+    }
+
+    std::vector<carb::Float3> velocities;
+    if (pointBased || instancer)
+        getArrayValue(attachedStage, set->mKey, tok.velocities, omni::physics::parse::ReadTime::defaultTime(), velocities);
+    if (velocities.size() == set->mNumParticles && set->mVelocities)
+    {
+        for (uint32_t i = 0; i < set->mNumParticles; ++i)
+            set->mVelocities[i] = PxVec4(toPhysX(velocities[i]), 0.0f);
+        set->mUploadDirtyFlags |= ParticleBufferFlags::eVELOCITIES;
+    }
+}
+
+// Takes the stage from the caller: `positions` were just read off `attachedStage`,
+// so the local-to-world transform must come from the same stage. Re-fetching the
+// process-global active stage here was also an unguarded null dereference.
+static void updateParticlePositions(AttachedStage& attachedStage, InternalParticleSet* internalParticleSet, const std::vector<carb::Float3>& positions)
+{
+    const PxMat44d localToWorld = getWorldTransform(attachedStage, internalParticleSet->mKey, omni::physics::parse::ReadTime::defaultTime());
 
     uint32_t newNumParticles = (uint32_t)positions.size();
     if (newNumParticles != internalParticleSet->mNumParticles)
@@ -609,16 +688,16 @@ static void updateParticlePositions(InternalParticleSet* internalParticleSet, co
     // better make sure the resizing worked
     if (internalParticleSet->mNumParticles != newNumParticles)
     {
-        CARB_LOG_ERROR("Changing number of particles in %s failed - skipping update.", UsdLoad::getUsdLoad()->getActiveAttachedStage()->pathFor(internalParticleSet->mKey).GetText());
+        CARB_LOG_ERROR("Changing number of particles in %s failed - skipping update.", attachedStage.textFor(internalParticleSet->mKey));
         return;
     }
     PxVec4* positionsInvMass = internalParticleSet->mPositions;
     for (uint32_t i = 0; i < internalParticleSet->mNumParticles; i++)
     {
-        GfVec3f localPos = positions[i];
-        GfVec3f pos = PXR_NS::GfVec3f(localToWorld.Transform(localPos));
+        const PxVec3d pos = localToWorld.transform(toPhysXd(positions[i]));
 
-        positionsInvMass[i] = PxVec4(pos[0], pos[1], pos[2], internalParticleSet->mParticleInvMass);
+        positionsInvMass[i] =
+            PxVec4(float(pos.x), float(pos.y), float(pos.z), internalParticleSet->mParticleInvMass);
     }
 
     // we don't change velocities/widths here because we assume that the user updates all data before sim runs.
@@ -626,10 +705,9 @@ static void updateParticlePositions(InternalParticleSet* internalParticleSet, co
 }
 
 
-bool omni::physx::updateParticlePositions(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticlePositions(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTParticleSet;
     InternalParticleSet* internalParticleSet = reinterpret_cast<InternalParticleSet*>(db.getInternalTypedRecord(internalType, objectId));
@@ -637,14 +715,17 @@ bool omni::physx::updateParticlePositions(AttachedStage& attachedStage, omni::ph
     if (internalParticleSet)
     {
         const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
-        VtArray<GfVec3f> positions;
-        if (src && src->isA(internalParticleSet->mKey, schemaTypeToken<UsdGeomPointBased>(*src)))
+        omni::physics::parse::KnownTokens tok;
+        if (src)
+            tok.intern(*src);
+        std::vector<carb::Float3> positions;
+        if (src && src->isA(internalParticleSet->mKey, tok.pointBasedType))
         {
-            getArrayValue<VtVec3fArray>(attachedStage, internalParticleSet->mKey, UsdGeomTokens->points, UsdTimeCode::Default(), positions);
+            getArrayValue(attachedStage, internalParticleSet->mKey, tok.points, omni::physics::parse::ReadTime::defaultTime(), positions);
         }
-        else if (src && src->isA(internalParticleSet->mKey, schemaTypeToken<UsdGeomPointInstancer>(*src)))
+        else if (src && src->isA(internalParticleSet->mKey, tok.pointInstancerType))
         {
-            getArrayValue<VtVec3fArray>(attachedStage, internalParticleSet->mKey, UsdGeomTokens->positions, UsdTimeCode::Default(), positions);
+            getArrayValue(attachedStage, internalParticleSet->mKey, tok.positions, omni::physics::parse::ReadTime::defaultTime(), positions);
         }
         else
         {
@@ -652,37 +733,45 @@ bool omni::physx::updateParticlePositions(AttachedStage& attachedStage, omni::ph
             // rather than passing empty positions into updateParticlePositions,
             // which would resize the set to zero and silently clear all particles.
             CARB_LOG_ERROR("Cannot update positions of particle set %s - it is neither a UsdGeomPointBased nor a UsdGeomPointInstancer; skipping update.",
-                           attachedStage.pathFor(internalParticleSet->mKey).GetText());
+                           attachedStage.textFor(internalParticleSet->mKey));
             return true;
         }
-        updateParticlePositions(internalParticleSet, positions);
+        const uint32_t oldNumParticles = internalParticleSet->mNumParticles;
+        updateParticlePositions(attachedStage, internalParticleSet, positions);
+        // A count-changing points write re-seeds the other columns from the origin; re-apply the
+        // set's authored velocities so a combined grow write does not lose them.
+        if (internalParticleSet->mNumParticles != oldNumParticles)
+            reapplyParticleColumnsAfterResize(attachedStage, internalParticleSet);
     }
 
     return true;
 }
 
-bool omni::physx::updateParticleSimPositions(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleSimPositions(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTParticleSet;
     InternalParticleSet* internalParticleSet = reinterpret_cast<InternalParticleSet*>(db.getInternalTypedRecord(internalType, objectId));
 
     if (internalParticleSet)
     {
-        VtArray<GfVec3f> positions;
-        getArrayValue<VtVec3fArray>(attachedStage, internalParticleSet->mKey, PhysxSchemaTokens->physxParticleSimulationPoints, UsdTimeCode::Default(), positions);
-        updateParticlePositions(internalParticleSet, positions);
+        const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+        omni::physics::parse::KnownTokens tok;
+        if (source)
+            tok.intern(*source);
+
+        std::vector<carb::Float3> positions;
+        getArrayValue(attachedStage, internalParticleSet->mKey, tok.physxParticleSimulationPoints, omni::physics::parse::ReadTime::defaultTime(), positions);
+        updateParticlePositions(attachedStage, internalParticleSet, positions);
     }
 
     return true;
 }
 
-bool omni::physx::updateParticleVelocities(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleVelocities(AttachedStage& attachedStage, omni::physx::usdparser::ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTParticleSet;
     InternalParticleSet* internalParticleSet = reinterpret_cast<InternalParticleSet*>(db.getInternalTypedRecord(internalType, objectId));
@@ -690,18 +779,22 @@ bool omni::physx::updateParticleVelocities(AttachedStage& attachedStage, omni::p
     if (internalParticleSet)
     {
         const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
+        omni::physics::parse::KnownTokens tok;
+        if (src)
+            tok.intern(*src);
 
         // Both UsdGeomPointBased and UsdGeomPointInstancer expose a "velocities"
-        // attribute under the same UsdGeomTokens->velocities name; gate on the
-        // prim type so neither case simply skips the read.
-        VtArray<GfVec3f> velocities;
-        if (src && (src->isA(internalParticleSet->mKey, schemaTypeToken<UsdGeomPointBased>(*src)) ||
-                    src->isA(internalParticleSet->mKey, schemaTypeToken<UsdGeomPointInstancer>(*src))))
+        // attribute under the same name; gate on the prim type so neither case
+        // simply skips the read.
+        std::vector<carb::Float3> velocities;
+        if (src && (src->isA(internalParticleSet->mKey, tok.pointBasedType) ||
+                    src->isA(internalParticleSet->mKey, tok.pointInstancerType)))
         {
-            getArrayValue<VtVec3fArray>(attachedStage, internalParticleSet->mKey, UsdGeomTokens->velocities, UsdTimeCode::Default(), velocities);
+            getArrayValue(attachedStage, internalParticleSet->mKey, tok.velocities, omni::physics::parse::ReadTime::defaultTime(), velocities);
         }
         uint32_t newNumParticles = (uint32_t)velocities.size();
 
+        const uint32_t oldNumParticles = internalParticleSet->mNumParticles;
         if (newNumParticles != internalParticleSet->mNumParticles)
         {
             internalParticleSet->resize(newNumParticles);
@@ -710,7 +803,7 @@ bool omni::physx::updateParticleVelocities(AttachedStage& attachedStage, omni::p
         // better make sure the resizing worked
         if (internalParticleSet->mNumParticles != newNumParticles)
         {
-            CARB_LOG_ERROR("Changing number of particles in %s failed - skipping update.", UsdLoad::getUsdLoad()->getActiveAttachedStage()->pathFor(internalParticleSet->mKey).GetText());
+            CARB_LOG_ERROR("Changing number of particles in %s failed - skipping update.", attachedStage.textFor(internalParticleSet->mKey));
             return true;
         }
         PxVec4* velocitiesPhysX = internalParticleSet->mVelocities;
@@ -721,6 +814,11 @@ bool omni::physx::updateParticleVelocities(AttachedStage& attachedStage, omni::p
 
         // we don't change positions/widths here because we assume that the user updates all data before sim runs.
         internalParticleSet->mUploadDirtyFlags |= ParticleBufferFlags::eVELOCITIES;
+
+        // A count-changing velocities write re-seeds the other columns from the origin; re-apply the
+        // set's authored points so a combined grow write does not lose them.
+        if (internalParticleSet->mNumParticles != oldNumParticles)
+            reapplyParticleColumnsAfterResize(attachedStage, internalParticleSet);
     }
 
     return true;
@@ -728,10 +826,9 @@ bool omni::physx::updateParticleVelocities(AttachedStage& attachedStage, omni::p
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 // material
-bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    const internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    const internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     PhysXType internalType = ePTRemoved;
     const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, objectId);
@@ -743,7 +840,12 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
         PxPBDMaterial* material = (PxPBDMaterial*)objectRecord->mPtr;
         if (material)
         {
-            if (property == PhysxSchemaTokens.Get()->physxPBDMaterialCohesion)
+            const omni::physics::parse::IPhysicsSource* source = attachedStage.getSource();
+            omni::physics::parse::KnownTokens tok;
+            if (source)
+                tok.intern(*source);
+
+            if (property == tok.physxPBDMaterialCohesion)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -751,7 +853,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setCohesion(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialAdhesion)
+            else if (property == tok.physxPBDMaterialAdhesion)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -759,7 +861,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setAdhesion(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialParticleAdhesionScale)
+            else if (property == tok.physxPBDMaterialParticleAdhesionScale)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -767,7 +869,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setParticleAdhesionScale(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialAdhesionOffsetScale)
+            else if (property == tok.physxPBDMaterialAdhesionOffsetScale)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -775,7 +877,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setAdhesionRadiusScale(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialFriction)
+            else if (property == tok.physxPBDMaterialFriction)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -783,7 +885,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setFriction(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialParticleFrictionScale)
+            else if (property == tok.physxPBDMaterialParticleFrictionScale)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -791,7 +893,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setParticleFrictionScale(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialDamping)
+            else if (property == tok.physxPBDMaterialDamping)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -799,7 +901,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setDamping(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialSurfaceTension)
+            else if (property == tok.physxPBDMaterialSurfaceTension)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -807,7 +909,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setSurfaceTension(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialViscosity)
+            else if (property == tok.physxPBDMaterialViscosity)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -815,7 +917,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setViscosity(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialVorticityConfinement)
+            else if (property == tok.physxPBDMaterialVorticityConfinement)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -823,7 +925,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setVorticityConfinement(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialGravityScale)
+            else if (property == tok.physxPBDMaterialGravityScale)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -831,7 +933,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setGravityScale(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialCflCoefficient)
+            else if (property == tok.physxPBDMaterialCflCoefficient)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -839,7 +941,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 material->setCFLCoefficient(data);
             }
-            else if (property == PhysxSchemaTokens.Get()->physxPBDMaterialDensity)
+            else if (property == tok.physxPBDMaterialDensity)
             {
                 float data;
                 if (!getValue<float>(attachedStage, objectRecord->mKey, property, timeCode, data))
@@ -850,7 +952,7 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
 
                 for (size_t i = 0; i < intMat->mParticleIds.size(); i++)
                 {
-                    OmniPhysX::getInstance().getInternalPhysXDatabase().addDirtyMassParticle(intMat->mParticleIds[i]);
+                    attachedStage.getInternalPhysXDatabase().addDirtyMassParticle(intMat->mParticleIds[i]);
                 }
             }
         }
@@ -858,10 +960,9 @@ bool omni::physx::updatePBDMaterialAttribute(AttachedStage& attachedStage, Objec
     return true;
 }
 
-bool omni::physx::updateParticleDensity(AttachedStage& attachedStage, ObjectId objectId, const TfToken& property, const UsdTimeCode& timeCode)
+bool omni::physx::updateParticleDensity(AttachedStage& attachedStage, ObjectId objectId, omni::physics::parse::TokenId property, omni::physics::parse::ReadTime timeCode)
 {
-    OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-    internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+    internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
 
     db.addDirtyMassParticle(size_t(objectId));
     return true;

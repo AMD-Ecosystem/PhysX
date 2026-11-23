@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
@@ -26,6 +26,13 @@ public:
     GpuSurfaceDeformableBodyView(GpuSimulationView* sim, const std::vector<DeformableBodyEntry>& entries, int device);
     ~GpuSurfaceDeformableBodyView() override;
 
+    // True only once construction has completed. A body whose shape or device buffers could not be set up leaves the
+    // view unusable, and the factory drops it rather than hand out one whose device buffers are missing.
+    bool isUsable() const
+    {
+        return mUsable;
+    }
+
     // simulation mesh
     virtual bool getSimulationElementIndices(const TensorDesc* dstTensor) const override;
     virtual bool getSimulationNodalPositions(const TensorDesc* dstTensor) const override;
@@ -49,6 +56,7 @@ public:
 private:
     int mDevice = -1;
     GpuSimulationDataPtr mGpuSimData;
+    bool mUsable = false;
     using checkTensorType = std::function<bool(const TensorDesc& tensor, const char* tensorName, const char* funcName)>;
 
     void resizeDeviceBuffer(::physx::PxU32 previousSize,

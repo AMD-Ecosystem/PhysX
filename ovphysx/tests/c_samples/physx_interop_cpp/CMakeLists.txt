@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 cmake_minimum_required(VERSION 3.16)
 project(PhysxInteropCpp CXX)
 
@@ -11,7 +14,7 @@ add_executable(physx_interop_cpp main.cpp)
 target_link_libraries(physx_interop_cpp PRIVATE ovphysx::ovphysx ovphysx::ovstage)
 target_include_directories(physx_interop_cpp PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../common")
 
-# PhysX SDK headers shipped with the ovphysx SDK (headers only, no library linking needed)
+# This sample calls virtual methods on returned objects, so only PhysX headers are needed.
 target_include_directories(physx_interop_cpp PRIVATE ${ovphysx_PHYSX_INCLUDE_DIR})
 
 get_filename_component(OVPHYSX_TEST_DATA_DIR "${CMAKE_CURRENT_LIST_DIR}/../../data" ABSOLUTE)
@@ -20,4 +23,7 @@ target_compile_definitions(physx_interop_cpp PRIVATE
 )
 if(WIN32)
     ovphysx_copy_runtime_dlls(physx_interop_cpp)
+    # OVStage is not copied (it loads its plugins relative to itself), so its
+    # directories have to reach the process through PATH.
+    ovphysx_set_ovstage_runtime_env(physx_interop_cpp)
 endif()

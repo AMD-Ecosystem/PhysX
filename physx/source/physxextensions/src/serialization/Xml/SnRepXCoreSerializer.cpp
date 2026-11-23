@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PxPhysicsAPI.h"
 #include "PxMetaDataObjects.h"
@@ -192,7 +169,7 @@ namespace physx {
 		readStridedBufferProperty<Triangle<PxU32> >( inReader, "triangles", theDesc.triangles, inAllocator);
 		PxU64 triCount;
 		readStridedBufferProperty<PxMaterialTableIndex>( inReader, "materialIndices", theDesc.materialIndices, triCount, inAllocator);
-		PxStridedData cookedData;
+		PxBoundedData cookedData;
 		cookedData.stride = sizeof(PxU8);
 		PxU64 dataSize;
 		readStridedBufferProperty<PxU8>( inReader, "CookedData", cookedData, dataSize, inAllocator);
@@ -212,15 +189,20 @@ namespace physx {
 
 		if(theMesh == NULL)
 		{
+			// ### DEFENSIVE against NvBugs 6408886 / OMPE-100163
+			if(!theDesc.isValid())
+			{
+				PxGetFoundation().error(PxErrorCode::eINVALID_PARAMETER, PX_FL, "RepX: invalid triangle mesh descriptor. The mesh is not created.");
+				return PxCreateRepXObject(theMesh);
+			}
 			PX_ASSERT(inArgs.cooker);
 			theTempBuf.clear();
 
 			PxCookingParams params = *inArgs.cooker;
 			params.midphaseDesc = PxMeshMidPhase::eBVH33;
 
-			PxCookTriangleMesh( params, theDesc, theTempBuf );
-//			theMesh = inArgs.physics.createTriangleMesh( theTempBuf );
-			theMesh = static_cast<PxBVH33TriangleMesh*>(inArgs.physics.createTriangleMesh( theTempBuf ));
+			if(PxCookTriangleMesh( params, theDesc, theTempBuf ))
+				theMesh = static_cast<PxBVH33TriangleMesh*>(inArgs.physics.createTriangleMesh( theTempBuf ));
 		}
 
 		return PxCreateRepXObject( theMesh );
@@ -293,7 +275,7 @@ namespace physx {
 		readStridedBufferProperty<Triangle<PxU32> >( inReader, "triangles", theDesc.triangles, inAllocator);
 		PxU64 triCount;
 		readStridedBufferProperty<PxMaterialTableIndex>( inReader, "materialIndices", theDesc.materialIndices, triCount, inAllocator);
-		PxStridedData cookedData;
+		PxBoundedData cookedData;
 		cookedData.stride = sizeof(PxU8);
 		PxU64 dataSize;
 		readStridedBufferProperty<PxU8>( inReader, "CookedData", cookedData, dataSize, inAllocator);
@@ -313,15 +295,20 @@ namespace physx {
 
 		if(theMesh == NULL)
 		{
+			// ### DEFENSIVE against NvBugs 6408886 / OMPE-100163
+			if(!theDesc.isValid())
+			{
+				PxGetFoundation().error(PxErrorCode::eINVALID_PARAMETER, PX_FL, "RepX: invalid triangle mesh descriptor. The mesh is not created.");
+				return PxCreateRepXObject(theMesh);
+			}
 			PX_ASSERT(inArgs.cooker);
 			theTempBuf.clear();
 
 			PxCookingParams params = *inArgs.cooker;
 			params.midphaseDesc = PxMeshMidPhase::eBVH34;
 
-			PxCookTriangleMesh( params, theDesc, theTempBuf );
-//			theMesh = inArgs.physics.createTriangleMesh( theTempBuf );
-			theMesh = static_cast<PxBVH34TriangleMesh*>(inArgs.physics.createTriangleMesh( theTempBuf ));
+			if(PxCookTriangleMesh( params, theDesc, theTempBuf ))
+				theMesh = static_cast<PxBVH34TriangleMesh*>(inArgs.physics.createTriangleMesh( theTempBuf ));
 		}
 
 		return PxCreateRepXObject(theMesh);
@@ -360,8 +347,19 @@ namespace physx {
 		PxHeightFieldDesc theDesc;
 		readAllProperties( inArgs, inReader, &theDesc, inAllocator, *inCollection );
 		//Now read the data...
-		PxU64 count = 0; //ignored because numRows and numColumns tells the story
+		PxU64 count = 0;
 		readStridedBufferProperty<PxHeightFieldSample>( inReader, "samples", theDesc.samples, count, inAllocator);
+		//PxHeightFieldDesc::isValid() does not look at the sample buffer, but height field creation
+		//reads nbRows * nbColumns samples out of it, so the size has to be checked here. The buffer
+		//is missing or short when the file declares more samples than it carries, or when the sample
+		//data was rejected as malformed.
+		// ### DEFENSIVE against NvBugs 6408886 / OMPE-100163
+		if ( theDesc.samples.data == NULL || count < PxU64(theDesc.nbRows) * PxU64(theDesc.nbColumns) )
+		{
+			PxGetFoundation().error(PxErrorCode::eINVALID_PARAMETER, PX_FL, "RepX: height field carries fewer samples than nbRows * nbColumns. The height field is not created.");
+			PxHeightField* theNullField = NULL;
+			return PxCreateRepXObject(theNullField);
+		}
 		PxHeightField* retval = PxCreateHeightField( theDesc, inArgs.physics.getPhysicsInsertionCallback() );
 		return PxCreateRepXObject(retval);
 	}
@@ -398,7 +396,7 @@ namespace physx {
 		readStridedBufferProperty<PxVec3>( inReader, "points", theDesc.points, inAllocator);
 		theDesc.flags = PxConvexFlag::eCOMPUTE_CONVEX;
 
-		PxStridedData cookedData;
+		PxBoundedData cookedData;
 		cookedData.stride = sizeof(PxU8);
 		PxU64 dataSize;
 		readStridedBufferProperty<PxU8>( inReader, "CookedData", cookedData, dataSize, inAllocator);
@@ -416,11 +414,17 @@ namespace physx {
 
 		if(theMesh == NULL)
 		{
+			// ### DEFENSIVE against NvBugs 6408886 / OMPE-100163
+			if(!theDesc.isValid())
+			{
+				PxGetFoundation().error(PxErrorCode::eINVALID_PARAMETER, PX_FL, "RepX: invalid convex mesh descriptor. The mesh is not created.");
+				return PxCreateRepXObject(theMesh);
+			}
 			PX_ASSERT(inArgs.cooker);
 			theTempBuf.clear();
 
-			PxCookConvexMesh( *inArgs.cooker, theDesc, theTempBuf );
-			theMesh = inArgs.physics.createConvexMesh( theTempBuf );
+			if(PxCookConvexMesh( *inArgs.cooker, theDesc, theTempBuf ))
+				theMesh = inArgs.physics.createConvexMesh( theTempBuf );
 		}
 
 		return PxCreateRepXObject(theMesh);

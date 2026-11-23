@@ -1,28 +1,5 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "ScShapeSimBase.h"
 #include "ScSqBoundsManager.h"
@@ -31,6 +8,7 @@
 #include "CmTransformUtils.h"
 #include "ScShapeInteraction.h"
 #include "ScArticulationSim.h"
+#include "ScArticulationCore.h"
 
 #if PX_SUPPORT_GPU_PHYSX
 	#include "cudamanager/PxCudaContextManager.h"
@@ -131,8 +109,6 @@ void ShapeSimBase::reinsertBroadPhase()
 
 		scene.unregisterShapeFromNphase(getCore(), getElementID());
 	}
-	PxU32 indexFrom = getElementID();
-
 	// Call ShapeSim dtor
 	{
 		resetElementID(scene, *this);
@@ -163,7 +139,7 @@ void ShapeSimBase::reinsertBroadPhase()
 
 	// Call ShapeSim ctor
 	{
-		initSubsystemsDependingOnElementID(indexFrom);
+		initSubsystemsDependingOnElementID();
 	}
 
 	// Scene::addShape
@@ -193,7 +169,7 @@ PX_FORCE_INLINE bool ShapeSimBase::internalRemoveFromBroadPhase(bool wakeOnLostT
 	return res;
 }
 
-void ShapeSimBase::initSubsystemsDependingOnElementID(PxU32 indexFrom)
+void ShapeSimBase::initSubsystemsDependingOnElementID()
 {
 	Scene& scScene = getScene();
 
@@ -226,7 +202,31 @@ void ShapeSimBase::initSubsystemsDependingOnElementID(PxU32 indexFrom)
 #endif
 	cache.setTransformCache(absPos, 0, index);
 
-	boundsArray.updateBounds(absPos, getCore().getGeometryUnion().getGeometry(), index, indexFrom);
+	ActorSim& owner = mActor;
+	// In a direct GPU API scene, a shape of a body or articulation on the GPU is computed from the GPU pose, also when it is newly
+	// attached or re-inserted. Any other shape, including one whose body or articulation has not been uploaded yet, counts as new and
+	// is copied from the CPU.
+	bool isNew = true;
+	const BodySim* bodySim = getBodySim();
+	if(bodySim && (scScene.getFlags() & PxSceneFlag::eENABLE_DIRECT_GPU_API))
+	{
+		if(bodySim->isArticulationLink())
+		{
+			// The shapes of new links are created before the links join the simulation object of their articulation.
+			const ArticulationSim* articulationSim = bodySim->getArticulation();
+			if(articulationSim)
+			{
+				const PxU32 gpuIndex = articulationSim->getCore().getGpuArticulationIndex();
+				PX_ASSERT(gpuIndex != 0xffffffff);
+				isNew = scScene.getSimulationController()->isArticulationUploadPending(gpuIndex);
+			}
+		}
+		else
+		{
+			isNew = bool(bodySim->getLowLevelBody().mInternalFlags & PxsRigidBody::eFIRST_BODY_COPY_GPU);
+		}
+	}
+	boundsArray.updateBounds(absPos, getCore().getGeometryUnion().getGeometry(), index, isNew, bool(owner.isDynamicRigid()));
 
 	{
 		PX_PROFILE_ZONE("API.simAddShapeToBroadPhase", scScene.getContextId());
@@ -239,8 +239,6 @@ void ShapeSimBase::initSubsystemsDependingOnElementID(PxU32 indexFrom)
 
 	//	if(scScene.getDirtyShapeSimMap().size() <= index)
 	//		scScene.getDirtyShapeSimMap().resize(PxMax(index+1, (scScene.getDirtyShapeSimMap().size()+1) * 2u));
-
-	ActorSim& owner = mActor;
 
 	if (owner.isDynamicRigid() && static_cast<BodySim&>(owner).isActive())
 		createSqBounds();
@@ -398,12 +396,16 @@ void ShapeSimBase::updateCached(const UpdateCachedParams& params, PinnableBitMap
 	if(fromTask)
 	{
 		// PT: this one bypasses the virtual call (that's why it is thread-safe) and skips the setChangedState() call
+		// Bypassing the virtual call also skips marking the shape for the direct GPU API upload. After the solver, the GPU
+		// computes the shape bounds and transforms of the active bodies from their poses on the GPU. updateDirtyShapes() marks
+		// its shapes before its tasks run, and updateKinematicCached() marks the shapes of moved kinematics, for steps without
+		// a solve.
 		Gu::computeBounds(boundsArray.begin()[index], shapeCore.getGeometryUnion().getGeometry(), ct.transform, 0.0f, 1.0f);
 		//boundsArray.setChangedState();
 	}
 	else
 	{
-		boundsArray.updateBounds(ct.transform, shapeCore.getGeometryUnion().getGeometry(), index, index);
+		boundsArray.updateBounds(ct.transform, shapeCore.getGeometryUnion().getGeometry(), index, false, bool(getActor().isDynamicRigid()));
 	}
 
 	///////////////////////////////////////////////////////////////////////////
@@ -427,6 +429,38 @@ void ShapeSimBase::updateCached(const UpdateCachedParams& params, PinnableBitMap
 	}
 }
 
+bool ShapeSimBase::updateCachedIfChanged(const UpdateCachedParams& params, PinnableBitMap* shapeChangedMap)
+{
+	const ShapeCore& shapeCore = getCore();
+	if(!needsBounds(shapeCore.getFlags()))
+		return false;
+
+	const PxU32 index = getElementID();
+	PxsCachedTransform& ct = params.mTransformCache.getTransformCache(index);
+
+	PX_ALIGN(16, PxTransform absPose);
+	getAbsPoseAligned(&absPose);
+
+	// The bounds are a function of the transform and the geometry, so when the transform cache already holds this pose
+	// the bounds entry and the broadphase are current as well.
+	if(ct.flags == params.mTransformFlags && ct.transform == absPose)
+		return false;
+
+	ct.transform = absPose;
+	ct.flags = params.mTransformFlags;
+
+	Gu::computeBounds(params.mBoundsArray.begin()[index], shapeCore.getGeometryUnion().getGeometry(), absPose, 0.0f, 1.0f);
+
+	PX_ASSERT(isInBroadPhase() == (isBroadPhase(shapeCore.getFlags())!=0) );
+	if(shapeChangedMap && isInBroadPhase())
+	{
+		PxU32* PX_RESTRICT dirtyMap = shapeChangedMap->getWords();
+		PX_ASSERT(index < shapeChangedMap->getWordCount() * 32);
+		PxAtomicOr(reinterpret_cast<volatile PxI32*>(&dirtyMap[index >> 5]), 1 << (index & 31));
+	}
+	return true;
+}
+
 void BodySim::updateCached(const UpdateCachedParams& params, PinnableBitMap* shapeChangedMap, bool fromTask, bool useAtomics)
 {
 	if(!(mLLBody.mInternalFlags & PxsRigidBody::eFROZEN))
@@ -438,6 +472,41 @@ void BodySim::updateCached(const UpdateCachedParams& params, PinnableBitMap* sha
 			ShapeSim* current = static_cast<ShapeSim*>(*elems++);
 			current->updateCached(params, shapeChangedMap, fromTask, useAtomics);
 		}
+	}
+}
+
+bool BodySim::updateCachedIfChanged(const UpdateCachedParams& params, PinnableBitMap* shapeChangedMap)
+{
+	bool changed = false;
+	if(!(mLLBody.mInternalFlags & PxsRigidBody::eFROZEN))
+	{
+		PxU32 nbElems = getNbElements();
+		ElementSim** elems = getElements();
+		while(nbElems--)
+		{
+			ShapeSim* current = static_cast<ShapeSim*>(*elems++);
+			changed |= current->updateCachedIfChanged(params, shapeChangedMap);
+		}
+	}
+	return changed;
+}
+
+void BodySim::prefetchShapesForUpdateCached(const UpdateCachedParams& params, bool bounds) const
+{
+	PxU32 nbElems = getNbElements();
+	ElementSim*const* elems = getElements();
+	while(nbElems--)
+	{
+		const ShapeSimBase* shape = static_cast<const ShapeSimBase*>(*elems++);
+
+		const ShapeCore& shapeCore = shape->getCore();
+		PxPrefetchLine(&shapeCore);
+		PxPrefetchLine(&shapeCore, 64);
+
+		const PxU32 index = shape->getElementID();
+		PxPrefetchLine(&params.mTransformCache.getTransformCache(index));
+		if(bounds)
+			PxPrefetchLine(&params.mBoundsArray.begin()[index]);
 	}
 }
 

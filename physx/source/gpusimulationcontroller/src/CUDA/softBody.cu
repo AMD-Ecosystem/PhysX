@@ -1,32 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
-
-
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "vector_types.h"
 #include "foundation/PxVec3.h"
@@ -60,11 +35,11 @@
 #include "particleSystem.cuh"
 #include "utils.cuh"
 #include "deformableUtils.cuh"
+#include "deformableAndParticleUtils.cuh"
 
 using namespace physx;
 
 extern "C" __host__ void initSoftBodyKernels0() {}
-
 
 //static __device__ __forceinline__
 //PxVec3 shuffleMin(physx::PxVec3 v)
@@ -146,7 +121,6 @@ void sb_refitBoundLaunch(
 		s_warpScratch->bv32PackedNodes = bv32PackedNodes;
 		tetmeshGeomPtr += sizeof(const Gu::BV32DataPacked)* nbBv32PackedNodes;
 
-
 		Gu::BV32DataDepthInfo* bv32DepthInfo = reinterpret_cast<Gu::BV32DataDepthInfo*>(tetmeshGeomPtr);
 		s_warpScratch->bv32DepthInfo = bv32DepthInfo;
 		tetmeshGeomPtr += sizeof(const Gu::BV32DataDepthInfo) * maxDepth;
@@ -157,7 +131,6 @@ void sb_refitBoundLaunch(
 	}
 
 	__syncthreads();
-
 
 	//Depth Buffer will be all the node index
 	const Gu::BV32DataDepthInfo* depthInfo = s_warpScratch->bv32DepthInfo;
@@ -245,7 +218,6 @@ void sb_refitBoundLaunch(
 					ty2 = PxMax(worldV2.y, worldV3.y);
 					tz2 = PxMax(worldV2.z, worldV3.z);
 
-
 					tx = PxMax(tx, tx2);
 					ty = PxMax(ty, ty2);
 					tz = PxMax(tz, tz2);
@@ -264,7 +236,6 @@ void sb_refitBoundLaunch(
 				printf("leaf min(%f, %f, %f), max(%f, %f, %f)\n", min.x, min.y, min.z,
 					max.x, max.y, max.z);
 			}*/
-
 
 			if (idx < nbChildren && !currentNode.isLeaf(idx))
 			{
@@ -456,8 +427,6 @@ struct sbScratch
 //	}
 //}
 
-
-
 //__device__ void computeTetrahedronRotations(const uint4* tetmeshTetIndices, const PxU32 tetrahedronIdx,
 //	const float4* tetmeshVerts, const PxMat33* restPoses, float4* tetRotations, const PxQuat initialRotation)
 //{
@@ -526,8 +495,6 @@ struct sbScratch
 //	tetRotations[tetrahedronIdx] = make_float4(q.x, q.y, q.z, q.w);
 //}
 
-
-
 __device__ void computeBarycentric(const PxVec3& a, const PxVec3& b, const PxVec3& c, const PxVec3& d, 
 	const PxVec3& p, PxReal& v, PxReal& w, PxReal& x)
 {
@@ -535,7 +502,6 @@ __device__ void computeBarycentric(const PxVec3& a, const PxVec3& b, const PxVec
 	const PxVec3 ca = c - a;
 	const PxVec3 da = d - a;
 	const PxVec3 pa = p - a;
-
 
 	//PxMat33 bcd(ba, ca, da);
 	//const PxReal detBcd = bcd.getDeterminant();
@@ -585,19 +551,19 @@ __device__ PxReal computeTriInvMass(const uint4 triVertIdx, const float4* positi
 }
 
 extern "C" __global__ void sb_rigidContactPrepareLaunch(
-	PxgSoftBody*					softbodies,
-	float4*							contacts_restW,
-	float4*							normalPens,
-	float4*							barycentrics,
-	PxgFemOtherContactInfo*			contactInfos,
-	PxU32*							numContacts,
-	PxgDbRigidContactBlock*			contactBlocks,
-	PxgPrePrepDesc*					preDesc,
-	PxgConstraintPrepareDesc*		prepareDesc,
-	PxReal*							rigidAppliedForces,
-	const PxReal					invDt,
-	PxgSolverSharedDescBase*		sharedDesc,
-	const bool						isTGS
+	PxgSoftBody*				softbodies,
+	float4*						contacts_restW,
+	float4*						normalPens,
+	float4*						barycentrics,
+	PxgDeformablePairInfo*		contactInfos,
+	PxU32*						numContacts,
+	PxgRigidDbContactBlock*		contactBlocks,
+	PxgPrePrepDesc*				preDesc,
+	PxgConstraintPrepareDesc*	prepareDesc,
+	float2*						rigidAppliedForces,
+	const PxReal				invDt,
+	PxgSolverSharedDescBase*	sharedDesc,
+	const bool					isTGS
 )
 {
 	const PxU32 tNumContacts = *numContacts;
@@ -614,23 +580,20 @@ extern "C" __global__ void sb_rigidContactPrepareLaunch(
 		if (workIndex >= tNumContacts)
 			return;
 
-		rigidAppliedForces[workIndex] = 0.0f;
+		rigidAppliedForces[workIndex] = make_float2(0.f, 0.f);
 
-		PxgFemOtherContactInfo contactInfo = contactInfos[workIndex];
-		PxgDbRigidContactBlock& block = contactBlocks[workIndex/32];
+		PxgDeformablePairInfo contactInfo = contactInfos[workIndex];
+		PxgRigidDbContactBlock& block = contactBlocks[workIndex/32];
 
 		// First actor: rigid body
-		const PxU64 pairInd0 = contactInfo.pairInd0;
-		const PxNodeIndex& rigidId = reinterpret_cast<const PxNodeIndex&>(pairInd0);
+		const PxNodeIndex rigidId = PxgGetRigidNode(contactInfo.ref0);
+
+		if (!PxgIsValidPairInfo(contactInfo))
+			continue;
 
 		// Second actor: soft body
-		PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-
-		PxgSoftBody& softbody = softbodies[PxGetSoftBodyId(pairInd1)];
-		const PxU32 tetInd = PxGetSoftBodyElementIndex(pairInd1);
-
-		if (tetInd == 0xfffff)
-			continue;
+		PxgSoftBody& softbody = softbodies[PxgGetDeformableId(contactInfo.ref1)];
+		const PxU32 tetInd = PxgGetDeformableFeatureId(contactInfo.ref1);
 
 		const uint4 tetrahedronIdx = softbody.mSimTetIndices[tetInd];
 
@@ -649,23 +612,21 @@ extern "C" __global__ void sb_rigidContactPrepareLaunch(
 		const PxVec3 normal(-normal_pen.x, -normal_pen.y, -normal_pen.z);
 		const PxReal pen = normal_pen.w - rest;
 
-		prepareDbRigidContact(block, normal, sharedDesc, p, pen, delta, rigidId, barycentric, prepareDesc, solverBodyIndices, softbody.mPenBiasClamp, invDt, isTGS);
+		prepareRigidDbContact(block, normal, sharedDesc, p, pen, delta, rigidId, prepareDesc, solverBodyIndices, softbody.mPenBiasClamp, invDt, isTGS);
 	}
 }
 
-
-
 extern "C" __global__ void sb_particleContactPrepareLaunch(
-	PxgSoftBody*					softbodies,
-	PxgParticleSystem*				particlesystems,
-	float4*							contacts,
-	float4*							normalPens,
-	float4*							barycentrics,
-	PxgFemOtherContactInfo*			contactInfos,
-	PxU32*							numContacts,
-	PxgDbParticleContactBlock*		contactBlocks,
-	float2*							softBodyAppliedForces,
-	float2*							particleAppliedForces
+	PxgSoftBody*				softbodies,
+	PxgParticleSystem*			particlesystems,
+	float4*						contacts,
+	float4*						normalPens,
+	float4*						barycentrics,
+	PxgDeformablePairInfo*		contactInfos,
+	PxU32*						numContacts,
+	PxgParticleDbContactBlock*	contactBlocks,
+	float2*						softBodyAppliedForces,
+	float2*						particleAppliedForces
 )
 {
 	const PxU32 tNumContacts = *numContacts;
@@ -688,22 +649,19 @@ extern "C" __global__ void sb_particleContactPrepareLaunch(
 		softBodyAppliedForces[workIndex] = make_float2(0.f, 0.f);
 		particleAppliedForces[workIndex] = make_float2(0.f, 0.f);
 
-		PxgFemOtherContactInfo contactInfo = contactInfos[workIndex];
-		PxgDbParticleContactBlock& block = contactBlocks[workIndex/32];
+		PxgDeformablePairInfo contactInfo = contactInfos[workIndex];
+		PxgParticleDbContactBlock& block = contactBlocks[workIndex/32];
 
-		PxU64 pairInd0 = contactInfo.pairInd0;
+		if(!PxgIsValidPairInfo(contactInfo))
+			continue;
 
-		//pairInd0 is a particle system
-		const PxU32 tParticleSystemId = PxGetParticleSystemId(pairInd0);
-		const PxU32 tParticleIndex = PxGetParticleIndex(pairInd0);
+		const PxU64 particleRef = contactInfo.ref0;
+		const PxU32 tParticleSystemId = PxgGetParticleSystemId(particleRef);
+		const PxU32 tParticleIndex = PxgGetParticleIndex(particleRef);
 		
 		//second one will be soft body
-		PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-		PxgSoftBody& softbody = softbodies[PxGetSoftBodyId(pairInd1)];
-		const PxU32 tetInd = PxGetSoftBodyElementIndex(pairInd1);
-
-		/*printf("workIndex %i particleSystemId %i particleIndex %i\n", workIndex, tParticleSystemId, tParticleIndex);
-		printf("workIndex %i softbodyId %i tetInd %i\n", workIndex, pairInd1.getSoftBodyId(), tetInd);*/
+		PxgSoftBody& softbody = softbodies[PxgGetDeformableId(contactInfo.ref1)];
+		const PxU32 tetInd = PxgGetDeformableFeatureId(contactInfo.ref1);
 
 		const uint4 tetrahedronIdx = softbody.mSimTetIndices[tetInd];
 		float4* delta_invMassTet = softbody.mSimDeltaPos;
@@ -726,7 +684,9 @@ extern "C" __global__ void sb_particleContactPrepareLaunch(
 		PxgParticleSystem& particleSystem = particlesystems[tParticleSystemId];
 		const float4 delta_invMass = particleSystem.mSortedDeltaP[tParticleIndex];
 		const PxVec3 particleDelta(delta_invMass.x, delta_invMass.y, delta_invMass.z);
-		const PxReal pen = normal_pen.w - (particleDelta - tetDelta).dot(normal) - softbody.mRestDistance;
+		// Computation of rest distance as the SS/SC contact prep functions do. The narrowphase writes a raw distance.
+		const PxReal restDistance = particleSystem.mData.mRestOffset + softbody.mRestOffset;
+		const PxReal pen = normal_pen.w - (particleDelta - tetDelta).dot(normal) - restDistance;
 
 		block.normal_pen[threadIndexInWarp] = make_float4(normal.x, normal.y, normal.z, pen);
 		block.barycentric[threadIndexInWarp] = barycentric;
@@ -734,19 +694,18 @@ extern "C" __global__ void sb_particleContactPrepareLaunch(
 	}
 }
 
-
 //contact prep for self collision/soft body vs soft body contacts
 extern "C" __global__ void sb_softbodyContactPrepareLaunch(
-	PxgSoftBody*						softbodies,
-	float4*								contacts,
-	float4*								normalPens,
-	float4*								barycentrics0,
-	float4*								barycentrics1,
-	PxgFemFemContactInfo*				contactInfos,
-	PxU32*								numContacts,
-	PxgDbDbContactBlock*				contactBlocks,
-	float2*								softBodyAppliedForces,
-	const PxU32							maxContacts
+	PxgSoftBody*			softbodies,
+	float4*					contacts,
+	float4*					normalPens,
+	float4*					barycentrics0,
+	float4*					barycentrics1,
+	PxgDeformablePairInfo*	contactInfos,
+	PxU32*					numContacts,
+	PxgDbDbContactBlock*	contactBlocks,
+	float2*					softBodyAppliedForces,
+	const PxU32				maxContacts
 )
 {
 	const PxU32 tNumContacts = PxMin(maxContacts, *numContacts);
@@ -771,22 +730,21 @@ extern "C" __global__ void sb_softbodyContactPrepareLaunch(
 		//initialize appliedForces to be zero
 		softBodyAppliedForces[workIndex] = make_float2(0.f, 0.f);
 
-		PxgFemFemContactInfo contactInfo = contactInfos[workIndex];
+		// Side 1 is remapped from the collision mesh to the simulation mesh by a search that can fail to
+		// resolve a tetrahedron, which invalidates the whole pair.
+		if(!PxgIsValidPairInfo(contactInfos[workIndex]))
+			continue;
+
+		PxgDeformablePairInfo contactInfo = contactInfos[workIndex];
 		PxgDbDbContactBlock& block = contactBlocks[workIndex/32];
 
-		PxU32 pairInd0 = PxU32(contactInfo.pairInd0);
-	
-		//first pairInd is soft body
-		PxgSoftBody& softbody0 = softbodies[PxGetSoftBodyId(pairInd0)];
-		const PxU32 tetInd0 = PxGetSoftBodyElementIndex(pairInd0);
+		PxgSoftBody& softbody0 = softbodies[PxgGetDeformableId(contactInfo.ref0)];
+		const PxU32 tetInd0 = PxgGetDeformableFeatureId(contactInfo.ref0);
 
-		PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
+		PxgSoftBody& softbody1 = softbodies[PxgGetDeformableId(contactInfo.ref1)];
+		const PxU32 tetInd1 = PxgGetDeformableFeatureId(contactInfo.ref1);
 
-		//second pairInd is soft body
-		PxgSoftBody& softbody1 = softbodies[PxGetSoftBodyId(pairInd1)];
-		const PxU32 tetInd1 = PxGetSoftBodyElementIndex(pairInd1);
-
-		const PxReal rest = softbody0.mRestDistance + softbody1.mRestDistance;
+		const PxReal restDistance = softbody0.mRestOffset + softbody1.mRestOffset;
 
 		const float4 normal_pen = normalPens[workIndex];
 
@@ -803,16 +761,13 @@ extern "C" __global__ void sb_softbodyContactPrepareLaunch(
 		const float4 sb0Delta = barycentricProjectTet(sb0TetVert, softbody0.mSimDeltaPos, barycentric0);
 		const float4 sb1Delta = barycentricProjectTet(sb1TetVert, softbody1.mSimDeltaPos, barycentric1);
 		const PxVec3 ssNormal(-normal_pen.x, -normal_pen.y, -normal_pen.z);
-		const PxReal ssPen = (normal_pen.w - rest) + PxLoad3(sb0Delta - sb1Delta).dot(ssNormal);
+		const PxReal ssPen = (normal_pen.w - restDistance) + PxLoad3(sb0Delta - sb1Delta).dot(ssNormal);
 
-		block.barycentric0[threadIndexInWarp] = barycentric0;
-		block.barycentric1[threadIndexInWarp] = barycentric1;
 		block.normal_pen[threadIndexInWarp] = make_float4(ssNormal.x, ssNormal.y, ssNormal.z, ssPen);
 
 		block.maxPenBiasClamp[threadIndexInWarp] = PxMax(softbody0.mPenBiasClamp, softbody1.mPenBiasClamp);
 	}
 }
-
 
   
 //! 
@@ -820,16 +775,16 @@ extern "C" __global__ void sb_softbodyContactPrepareLaunch(
 //! 
 
 extern "C" __global__ void sb_clothContactPrepareLaunch(
-	PxgSoftBody*						softbodies,
-	PxgFEMCloth*						clothes,
-	float4*								normalPens,
-	float4*								barycentrics0,
-	float4*								barycentrics1,
-	PxgFemFemContactInfo*				contactInfos,
-	PxU32*								numContacts,
-	PxgDbDbContactBlock*				contactBlocks,
-	float2*								appliedForces,
-	const PxU32							maxContacts
+	PxgSoftBody*			softbodies,
+	PxgFEMCloth*			clothes,
+	float4*					normalPens,
+	float4*					barycentrics0,
+	float4*					barycentrics1,
+	PxgDeformablePairInfo*	contactInfos,
+	PxU32*					numContacts,
+	PxgDbDbContactBlock*	contactBlocks,
+	float2*					appliedForces,
+	const PxU32				maxContacts
 )
 {
 	const PxU32 tNumContacts = PxMin(maxContacts, *numContacts);
@@ -852,22 +807,24 @@ extern "C" __global__ void sb_clothContactPrepareLaunch(
 
 		appliedForces[workIndex] = make_float2(0.f, 0.f);
 
-		PxgFemFemContactInfo contactInfo = contactInfos[workIndex];
+		PxgDeformablePairInfo contactInfo = contactInfos[workIndex];
 		PxgDbDbContactBlock& block = contactBlocks[workIndex / 32];
 
-		// Side 0: cloth (triangle or vertex)
-		const PxU32 pairInd0 = PxU32(contactInfo.pairInd0);
-		const PxU32 clothId = PxGetClothId(pairInd0);
-		PxgFEMCloth& cloth = clothes[clothId];
-		const PxU32 triInd = PxGetClothElementIndex(pairInd0);
+		if(!PxgIsValidPairInfo(contactInfo))
+			continue;
+
+		// Side 0: cloth. The pair type allows a triangle or a vertex, but only the vertex producer
+		// runs: the face path that would put a triangle here is gated off by
+		// supportClothTriangleCollision. The delta read below indexes a per-vertex array directly and
+		// relies on that. A triangle needs the barycentricProjectTri equivalent of what side 1 does.
+		PxgFEMCloth& cloth = clothes[PxgGetDeformableId(contactInfo.ref0)];
+		PX_ASSERT(PxgGetDeformableFeatureType(contactInfo.ref0) == PxgDeformableRef::eVERTEX);
+		const PxU32 elemInd = PxgGetDeformableFeatureId(contactInfo.ref0);
 
 		// Side 1: softbody tet
-		const PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-		const PxU32 softbodyId = PxGetSoftBodyId(pairInd1);
-		PxgSoftBody& softbody = softbodies[softbodyId];
-		const PxU32 tetInd = PxGetSoftBodyElementIndex(pairInd1);
+		PxgSoftBody& softbody = softbodies[PxgGetDeformableId(contactInfo.ref1)];
+		const PxU32 tetInd = PxgGetDeformableFeatureId(contactInfo.ref1);
 
-		const float4 clothBC = barycentrics0[workIndex];
 		const float4 softBodyBC = barycentrics1[workIndex];
 
 		// The narrowphase reports pen at the predicted position; re-reference it to the start-of-step
@@ -875,21 +832,19 @@ extern "C" __global__ void sb_clothContactPrepareLaunch(
 		// sb_softbodyContactPrepareLaunch SS, which applies the same shift against its negated normal).
 		// No-op in TGS (no predicted delta yet -- soft/cloth delta buffers are 0 at prep).
 		const float4* PX_RESTRICT const clothAccumulatedDelta = cloth.mAccumulatedDeltaPos;
-		const float4 clothDelta = clothAccumulatedDelta[triInd];
+		const float4 clothDelta = clothAccumulatedDelta[elemInd];
 
 		const uint4 tetVertInd = softbody.mSimTetIndices[tetInd];
 		const float4* PX_RESTRICT const softbodyAccumulatedDelta = softbody.mSimDeltaPos;
 		const float4 softbodyDelta = barycentricProjectTet(tetVertInd, softbodyAccumulatedDelta, softBodyBC);
 
-		const PxReal thickness = cloth.mRestDistance + softbody.mRestDistance;
+		const PxReal restDistance = cloth.mRestOffset + softbody.mRestOffset;
 		const float4 normal_pen = normalPens[workIndex];
 		// normal stored directly (cloth->SB = db0->db1); SS negates -- vol-vol reports the opposite sense.
 		const PxVec3 normal(normal_pen.x, normal_pen.y, normal_pen.z);
 
-		const PxReal pen = normal_pen.w - thickness + PxLoad3(clothDelta - softbodyDelta).dot(normal);
+		const PxReal pen = normal_pen.w - restDistance + PxLoad3(clothDelta - softbodyDelta).dot(normal);
 
-		block.barycentric0[threadIndexInWarp] = clothBC;
-		block.barycentric1[threadIndexInWarp] = softBodyBC;
 		block.normal_pen[threadIndexInWarp] = make_float4(normal.x, normal.y, normal.z, pen);
 
 		// Pair max of side 0 (cloth) and side 1 (softbody) bias clamps.
@@ -899,19 +854,19 @@ extern "C" __global__ void sb_clothContactPrepareLaunch(
 
 #define kGlobalRelax  0.125f
 
-
 // SB-particle contact pre-count pass. For each active SP contact, bumps
 // softbody.mSimDelta[v].w by 1 per touched tet vertex. The SP solve consumes
 // .w for XPBD mass-splitting; the finalize divides .xyz by max(.w, 1) and zeros
 // both. Activation is decided by solveDbDbContact with checkOnlyActivity=true
-// and recorded via markInCollision so contact reports see the same state.
+// and recorded as the contact's activity so contact reports see the same state.
 extern "C" __global__ void sb_querySBParticleContactReferenceCountLaunch(
-	PxgSoftBody*								softbodies,
-	PxgParticleSystem*							particlesystems,
-	PxgFemOtherContactInfo*						contactInfos,
-	PxgDbParticleContactBlock*					contactBlocks,
-	PxU32*										numContacts,
-	const PxReal								dt
+	PxgSoftBody*				softbodies,
+	PxgParticleSystem*			particlesystems,
+	PxgDeformablePairInfo*		contactInfos,
+	PxgParticleDbContactBlock*	contactBlocks,
+	PxU32*						numContacts,
+	const PxReal				dt,
+	bool						isVelocityIteration
 )
 {
 	const PxU32 tNumContacts = *numContacts;
@@ -927,14 +882,19 @@ extern "C" __global__ void sb_querySBParticleContactReferenceCountLaunch(
 		if(workIndex >= tNumContacts)
 			return;
 
-		PxgFemOtherContactInfo& contactInfo = contactInfos[workIndex];
-		PxgDbParticleContactBlock& block = contactBlocks[workIndex / 32];
+		const PxgDeformablePairInfo& contactInfo = contactInfos[workIndex];
+		PxgParticleDbContactBlock& block = contactBlocks[workIndex / 32];
 
-		// pairInd0 = particle, pairInd1 = softbody tet (matches narrowphase).
-		const PxU64 pairInd0 = contactInfo.pairInd0;
-		const PxU32 particleSystemId = PxGetParticleSystemId(pairInd0);
-		PxgParticleSystem& particleSystem = particlesystems[particleSystemId];
-		const PxU32 particleIndex = PxGetParticleIndex(pairInd0);
+		if(!PxgIsValidPairInfo(contactInfo))
+		{
+			PxgSetActivePairInfo(contactInfos[workIndex], false);
+			continue;
+		}
+
+		// ref0 = particle, ref1 = softbody tet (matches narrowphase).
+		const PxU64 particleRef = contactInfo.ref0;
+		PxgParticleSystem& particleSystem = particlesystems[PxgGetParticleSystemId(particleRef)];
+		const PxU32 particleIndex = PxgGetParticleIndex(particleRef);
 		const float4 deltaP_invMass = particleSystem.mSortedDeltaP[particleIndex];
 		const PxReal invMass0 = deltaP_invMass.w;
 
@@ -942,77 +902,67 @@ extern "C" __global__ void sb_querySBParticleContactReferenceCountLaunch(
 		// sb_solveOutputSPDeltaVLaunch skips the whole solve body. Match here.
 		if(invMass0 == 0.f)
 		{
-			contactInfo.markInCollision(false);
+			PxgSetActivePairInfo(contactInfos[workIndex], false);
 			continue;
 		}
 
-		const PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-		const PxU32 softbodyId = PxGetSoftBodyId(pairInd1);
-		PxgSoftBody& softbody = softbodies[softbodyId];
-		const PxU32 tetId = PxGetSoftBodyElementIndex(pairInd1);
-
-		const float4 sbBcF4 = block.barycentric[threadIndexInWarp];
+		PxgSoftBody& softbody = softbodies[PxgGetDeformableId(contactInfo.ref1)];
 
 		// Side convention matches sb_solveOutputSPDeltaVLaunch:
-		// side 0 = SB tet, side 1 = particle. The prep stores state.normal
+		// side 0 = SB tet, side 1 = particle. The prep stores contactPair.normal
 		// as -narrowphase to match this db0 -> db1 convention.
 		PxgDeformablePart<PxVec4> sbPart;
-		sbPart.bc = PxVec4(sbBcF4.x, sbBcF4.y, sbBcF4.z, sbBcF4.w);
-		sbPart.penBiasClamp = block.maxPenBiasClamp[threadIndexInWarp];
-		sbPart.readSoftBody(softbody, tetId, sbBcF4, NULL, /*checkOnlyActivity*/ true);
+		sbPart.readSoftBody(softbody, contactInfo.ref1, block.barycentric, threadIndexInWarp, NULL,
+							/*checkOnlyActivity*/ true, dt, isVelocityIteration);
 
 		PxgDeformablePart<PxVec3> particlePart;
-		particlePart.bc = PxVec3(1.0f, 0.0f, 0.0f);
-		particlePart.vertexInvMasses = PxVec3(invMass0, 0.0f, 0.0f);
-		particlePart.linDelta = PxVec3(deltaP_invMass.x, deltaP_invMass.y, deltaP_invMass.z);
-		particlePart.penBiasClamp = block.maxPenBiasClamp[threadIndexInWarp];
+		particlePart.readParticle(particleSystem, particleIndex, deltaP_invMass, NULL,
+								  /*inflateByRefCount*/ false, dt, isVelocityIteration);
 
-		PxgDbContactState state;
-		state.readContactPrepDbDb(block, threadIndexInWarp);
+		PxgDbContactPair contactPair;
+		PxgDbSolveOutput solveOut;
+		contactPair.readContactPrepDbDb(block, threadIndexInWarp);
 
-		const bool isActive = solveDbDbContact(sbPart, particlePart, state,
+		const bool isActive = solveDbDbContact(sbPart, particlePart, contactPair, solveOut,
 												 /*appliedNormalLambdaRef*/ 0.0f,
 												 /*appliedTanLambdaRef*/ 0.0f,
 												 /*frictionCoefficient*/ 0.0f,
 												 dt,
-												 /*checkOnlyActivity*/ true);
+												 /*checkOnlyActivity*/ true, isVelocityIteration);
 
-		contactInfo.markInCollision(isActive);
+		PxgSetActivePairInfo(contactInfos[workIndex], isActive);
 
 		if(isActive)
 		{
 			// Integer-count refcount bump per touched tet vertex (gated |bc| > 1e-3).
-			const uint4 tetrahedronId = softbody.mSimTetIndices[tetId];
-			bumpDbRefCountTet(softbody.mSimDelta, tetrahedronId, sbBcF4.x, sbBcF4.y, sbBcF4.z, sbBcF4.w);
+			sbPart.bumpSoftBodyRefCount(softbody);
 
-#if PX_DB_PARTICLE_MASS_SPLIT
-			// Particle-side mass-split count (dual of the SB-vertex refCount).
+			// Particle-side mass-split count, the counterpart of the SB-vertex refCount.
 			atomicAdd(&particleSystem.mAccumDeltaP[particleIndex].w, 1.0f);
-#endif
 		}
 	}
 }
 
-
 // SB-particle contact solve, softbody side of the split writeback.
 // Side 0 = SB (PxVec4 tet), side 1 = particle (PxVec3, a single vertex with bc=(1,0,0) inline). The
-// prep stores state.normal as -narrowphase, which matches solveDbDbContact's
-// db0 -> db1 convention. Particles have no pen-bias, so the particle side
-// uses the -1e32 sentinel.
+// prep stores contactPair.normal as -narrowphase, which matches solveDbDbContact's
+// db0 -> db1 convention. The pair depenetration clamp folds in both the
+// softbody's and the particle's mPenBiasClamp at prep (sb_particleContactPrepareLaunch).
 //
 // Mass-splitting: sb_querySBParticleContactReferenceCountLaunch pre-populates
 // softbody.mSimDelta[v].w with the refcount; readSoftBody multiplies
 // vertexInvMasses by .w; scatter via writeSoftBody does NOT touch .w
 // so it survives to the finalize's max(.w, 1) divide.
 extern "C" __global__ void sb_solveOutputSPDeltaVLaunch(
-	PxgSoftBody*								softbodies,
-	PxgParticleSystem*							particlesystems,
-	PxgFemOtherContactInfo*						contactInfos,
-	PxgDbParticleContactBlock*					contactBlocks,
-	PxU32*										numContacts,
-	float2*										appliedForces,				//output
-	const PxReal								dt,
-	PxsDeformableVolumeMaterialData*			materials
+	PxgSoftBody*						softbodies,
+	PxgParticleSystem*					particlesystems,
+	PxgDeformablePairInfo*				contactInfos,
+	PxgParticleDbContactBlock*			contactBlocks,
+	PxU32*								numContacts,
+	float2*								appliedForces,	//output
+	const PxReal						dt,
+	PxsDeformableVolumeMaterialData*	materials,
+	bool								isVelocityIteration
 )
 {
 	const PxU32 tNumContacts = *numContacts;
@@ -1024,7 +974,6 @@ extern "C" __global__ void sb_solveOutputSPDeltaVLaunch(
 	const PxU32 idx = threadIdx.x;
 	const PxU32 threadIndexInWarp = threadIdx.x&31;
 
-
 	for (PxU32 i = 0; i < nbIterationsPerBlock; ++i)
 	{
 		const PxU32 workIndex = i * blockDim.x + idx + nbIterationsPerBlock * blockIdx.x * blockDim.x;
@@ -1032,13 +981,16 @@ extern "C" __global__ void sb_solveOutputSPDeltaVLaunch(
 		if (workIndex >= tNumContacts)
 			return;
 
-		PxgFemOtherContactInfo& contactInfo = contactInfos[workIndex];
-		PxgDbParticleContactBlock& block = contactBlocks[workIndex/32];
+		// The pre-count decided this on the same positions, this iteration.
+		if(!PxgIsActivePairInfo(contactInfos[workIndex]))
+			continue;
 
-		const PxU64 pairInd0 = contactInfo.pairInd0;
-		const PxU32 particleSystemId = PxGetParticleSystemId(pairInd0);
-		PxgParticleSystem& particleSystem = particlesystems[particleSystemId];
-		const PxU32 particleIndex = PxGetParticleIndex(pairInd0);
+		const PxgDeformablePairInfo& contactInfo = contactInfos[workIndex];
+		PxgParticleDbContactBlock& block = contactBlocks[workIndex/32];
+
+		const PxU64 particleRef = contactInfo.ref0;
+		PxgParticleSystem& particleSystem = particlesystems[PxgGetParticleSystemId(particleRef)];
+		const PxU32 particleIndex = PxgGetParticleIndex(particleRef);
 
 		const float4 deltaP_invMass = particleSystem.mSortedDeltaP[particleIndex];
 		const PxReal invMass0 = deltaP_invMass.w;
@@ -1053,73 +1005,63 @@ extern "C" __global__ void sb_solveOutputSPDeltaVLaunch(
 			const PxU32 mi = phaseToMat[group];
 			const PxsParticleMaterialData& psMat = getParticleMaterial<PxsParticleMaterialData>(particleSystem.mParticleMaterials, mi, particleSystem.mParticleMaterialStride);
 
-			const PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-			const float4 sbBcF4 = block.barycentric[threadIndexInWarp];
-			const PxU32 softbodyId = PxGetSoftBodyId(pairInd1);
-			PxgSoftBody& softbody = softbodies[softbodyId];
-			const PxU32 tetId = PxGetSoftBodyElementIndex(pairInd1);
+			PxgSoftBody& softbody = softbodies[PxgGetDeformableId(contactInfo.ref1)];
 
 			// SB side. checkOnlyActivity=false consumes the refCount in .w
 			// (populated by sb_querySBParticleContactReferenceCountLaunch) to
 			// mass-split vertexInvMasses, and reads materials for friction.
 			PxgDeformablePart<PxVec4> sbPart;
-			sbPart.bc = PxVec4(sbBcF4.x, sbBcF4.y, sbBcF4.z, sbBcF4.w);
-			sbPart.penBiasClamp = block.maxPenBiasClamp[threadIndexInWarp];
-			sbPart.readSoftBody(softbody, tetId, sbBcF4, materials, /*checkOnlyActivity*/ false);
+			sbPart.readSoftBody(softbody, contactInfo.ref1, block.barycentric, threadIndexInWarp, materials,
+								/*checkOnlyActivity*/ false, dt, isVelocityIteration);
 
 			PxgDeformablePart<PxVec3> particlePart;
-			particlePart.bc = PxVec3(1.0f, 0.0f, 0.0f);
-#if PX_DB_PARTICLE_MASS_SPLIT
-			// Inflate by the contact count so both solve halves compute the same lambda.
-			const PxReal particleRefCount = PxMax(particleSystem.mAccumDeltaP[particleIndex].w, 1.0f);
-			particlePart.vertexInvMasses = PxVec3(invMass0 * particleRefCount, 0.0f, 0.0f);
-#else
-			particlePart.vertexInvMasses = PxVec3(invMass0, 0.0f, 0.0f);
-#endif
-			particlePart.linDelta = PxVec3(deltaP_invMass.x, deltaP_invMass.y, deltaP_invMass.z);
-			particlePart.penBiasClamp = block.maxPenBiasClamp[threadIndexInWarp];
-			particlePart.friction = psMat.friction;
+			particlePart.readParticle(particleSystem, particleIndex, deltaP_invMass, &psMat,
+									  /*inflateByRefCount*/ true, dt, isVelocityIteration);
 
-			PxgDbContactState state;
-			state.readContactPrepDbDb(block, threadIndexInWarp);
+			PxgDbContactPair contactPair;
+			PxgDbSolveOutput solveOut;
+			contactPair.readContactPrepDbDb(block, threadIndexInWarp);
 
 			const PxReal frictionCoefficient = (sbPart.friction + particlePart.friction) * 0.5f;
 
 			float2 appliedForce = appliedForces[workIndex];
-			solveDbDbContact(sbPart, particlePart, state,
-							   appliedForce.x, appliedForce.y, frictionCoefficient, dt);
+			const bool hasApplied = solveDbDbContact(sbPart, particlePart, contactPair, solveOut,
+							   appliedForce.x, appliedForce.y, frictionCoefficient, dt, /*checkOnlyActivity*/ false, isVelocityIteration);
 
-			if (state.deltaLambdaN != 0.f || state.deltaLambdaT != 0.f)
+			if(hasApplied)
 			{
-				PxVec3 deltaPos;
-				state.computeDeformableDelta(deltaPos, dt);
+				// delta, the contact impulse, is expressed as a position delta in position iterations
+				// and as velocity * dt in velocity iterations. It accumulates in mSimDelta and
+				// sb_gm_applyExternalDeltasLaunch writes it to the vertex state at iteration end
+				// (velocity always, position only in position iterations).
+				PxVec3 delta;
+				solveOut.computeDelta(contactPair, delta, dt);
 
-				// SB side scatter via writeSoftBody: .xyz weighted by the refCount-inflated vertexInvMasses; the pre-count owns .w.
-				sbPart.writeSoftBody(softbody, tetId, sbBcF4, /*elemIsVertex*/ false, deltaPos);
+				// SB side scatter via writeSoftBody: .xyz weighted by the refCount-inflated vertexInvMasses. The pre-count owns .w.
+				sbPart.writeSoftBody(softbody, delta);
+
+				appliedForce.x = solveOut.accumulatedDeltaLambdaN;
+				appliedForce.y += solveOut.deltaLambdaT;
+				appliedForces[workIndex] = appliedForce;
 			}
-
-			appliedForce.x = state.accumulatedDeltaLambdaN;
-			appliedForce.y += state.deltaLambdaT;
-			appliedForces[workIndex] = appliedForce;
 		}
 	}
 }
-
-
 
 // SB-particle contact solve, particle side of the split writeback. Math
 // matches sb_solveOutputSPDeltaVLaunch above; only the scatter target
 // differs (deltaP[] vs. mSimDelta atomics).
 extern "C" __global__ void sb_solveOutputParticleDeltaVLaunch(
-	PxgSoftBody*								softbodies,
-	PxgParticleSystem*							particlesystems,
-	PxgFemOtherContactInfo*						contactInfos,
-	PxgDbParticleContactBlock*					contactBlocks,
-	PxU32*										numContacts,
-	float4*										deltaP,			//output
-	float2*										appliedForces,	//output
-	const PxReal								dt,
-	PxsDeformableVolumeMaterialData*			materials
+	PxgSoftBody*						softbodies,
+	PxgParticleSystem*					particlesystems,
+	PxgDeformablePairInfo*				contactInfos,
+	PxgParticleDbContactBlock*			contactBlocks,
+	PxU32*								numContacts,
+	float4*								deltaP,			//output
+	float2*								appliedForces,	//output
+	const PxReal						dt,
+	PxsDeformableVolumeMaterialData*	materials,
+	bool								isVelocityIteration
 )
 {
 	const PxU32 tNumContacts = *numContacts;
@@ -1138,19 +1080,25 @@ extern "C" __global__ void sb_solveOutputParticleDeltaVLaunch(
 		if (workIndex >= tNumContacts)
 			return;
 
-		PxgFemOtherContactInfo& contactInfo = contactInfos[workIndex];
-		PxgDbParticleContactBlock& block = contactBlocks[workIndex/32];
+		const PxgDeformablePairInfo& contactInfo = contactInfos[workIndex];
+		PxgParticleDbContactBlock& block = contactBlocks[workIndex/32];
 
-		const PxU64 pairInd0 = contactInfo.pairInd0;
-		const PxU32 particleSystemId = PxGetParticleSystemId(pairInd0);
-		PxgParticleSystem& particleSystem = particlesystems[particleSystemId];
-		const PxU32 particleIndex = PxGetParticleIndex(pairInd0);
+		const PxU64 particleRef = contactInfo.ref0;
+		PxgParticleSystem& particleSystem = particlesystems[PxgGetParticleSystemId(particleRef)];
+		const PxU32 particleIndex = PxgGetParticleIndex(particleRef);
 
 		const float4 deltaP_invMass = particleSystem.mSortedDeltaP[particleIndex];
 		const PxReal invMass0 = deltaP_invMass.w;
 
 		if (invMass0 != 0.f)
 		{
+			if(!PxgIsActivePairInfo(contactInfos[workIndex]))
+			{
+				// The accumulate scan reads every slot, so the slot is cleared even for an inactive contact.
+				deltaP[workIndex] = make_float4(0.f, 0.f, 0.f, 0.f);
+				continue;
+			}
+
 			const PxU32* PX_RESTRICT phases = particleSystem.mSortedPhaseArray;
 			const PxU16* const PX_RESTRICT phaseToMat = particleSystem.mPhaseGroupToMaterialHandle;
 
@@ -1159,71 +1107,75 @@ extern "C" __global__ void sb_solveOutputParticleDeltaVLaunch(
 			const PxU32 mi = phaseToMat[group];
 			const PxsParticleMaterialData& psMat = getParticleMaterial<PxsParticleMaterialData>(particleSystem.mParticleMaterials, mi, particleSystem.mParticleMaterialStride);
 
-			const PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-			const float4 sbBcF4 = block.barycentric[threadIndexInWarp];
-			const PxU32 softbodyId = PxGetSoftBodyId(pairInd1);
-			PxgSoftBody& softbody = softbodies[softbodyId];
-			const PxU32 tetId = PxGetSoftBodyElementIndex(pairInd1);
+			PxgSoftBody& softbody = softbodies[PxgGetDeformableId(contactInfo.ref1)];
 
 			PxgDeformablePart<PxVec4> sbPart;
-			sbPart.bc = PxVec4(sbBcF4.x, sbBcF4.y, sbBcF4.z, sbBcF4.w);
-			sbPart.penBiasClamp = block.maxPenBiasClamp[threadIndexInWarp];
 			// Read full (not activity-only) so both halves see the same invMass + friction and
 			// compute the identical lambda -- the impulse stays equal-and-opposite. Side-effect
 			// free here: this kernel scatters only to deltaP[], never to mSimDelta.
-			sbPart.readSoftBody(softbody, tetId, sbBcF4, materials, /*checkOnlyActivity*/ false);
+			sbPart.readSoftBody(softbody, contactInfo.ref1, block.barycentric, threadIndexInWarp, materials,
+								/*checkOnlyActivity*/ false, dt, isVelocityIteration);
 
 			PxgDeformablePart<PxVec3> particlePart;
-			particlePart.bc = PxVec3(1.0f, 0.0f, 0.0f);
-#if PX_DB_PARTICLE_MASS_SPLIT
-			// Inflate by the contact count so both solve halves compute the same lambda.
-			const PxReal particleRefCount = PxMax(particleSystem.mAccumDeltaP[particleIndex].w, 1.0f);
-			particlePart.vertexInvMasses = PxVec3(invMass0 * particleRefCount, 0.0f, 0.0f);
-#else
-			particlePart.vertexInvMasses = PxVec3(invMass0, 0.0f, 0.0f);
-#endif
-			particlePart.linDelta = PxVec3(deltaP_invMass.x, deltaP_invMass.y, deltaP_invMass.z);
-			particlePart.penBiasClamp = block.maxPenBiasClamp[threadIndexInWarp];
-			particlePart.friction = psMat.friction;
+			particlePart.readParticle(particleSystem, particleIndex, deltaP_invMass, &psMat,
+									  /*inflateByRefCount*/ true, dt, isVelocityIteration);
 
-			PxgDbContactState state;
-			state.readContactPrepDbDb(block, threadIndexInWarp);
+			PxgDbContactPair contactPair;
+			PxgDbSolveOutput solveOut;
+			contactPair.readContactPrepDbDb(block, threadIndexInWarp);
 
 			const PxReal frictionCoefficient = (sbPart.friction + particlePart.friction) * 0.5f;
 
 			float2 appliedForce = appliedForces[workIndex];
-			solveDbDbContact(sbPart, particlePart, state,
-							   appliedForce.x, appliedForce.y, frictionCoefficient, dt);
+			const bool hasApplied = solveDbDbContact(sbPart, particlePart, contactPair, solveOut,
+							   appliedForce.x, appliedForce.y, frictionCoefficient, dt, /*checkOnlyActivity*/ false, isVelocityIteration);
 
-			// Particle-side scatter into deltaP[] (aggregated into mDeltaP later); .w flags a live contact.
-			PxVec3 deltaPos;
-			state.computeDeformableDelta(deltaPos, dt);
-			const PxVec3 deltaV = -deltaPos * particlePart.vertexInvMasses.x;
-			const PxReal w = (state.deltaLambdaN != 0.f || state.deltaLambdaT != 0.f) ? 1.f : 0.f;
+			if(hasApplied)
+			{
+				// delta, the contact impulse, is expressed as a position delta in position iterations
+				// and as velocity * dt in velocity iterations. It is aggregated into mAccumDeltaP
+				// (.w flags a live contact), and ps_updateParticleLaunch writes it to the particle
+				// state at iteration end (velocity always, position only in position iterations).
+				PxVec3 delta;
+				solveOut.computeDelta(contactPair, delta, dt);
+				particlePart.writeParticle(deltaP, workIndex, -delta, solveOut);
 
-			deltaP[workIndex] = make_float4(deltaV.x, deltaV.y, deltaV.z, w);
-
-			appliedForce.x = state.accumulatedDeltaLambdaN;
-			appliedForce.y += state.deltaLambdaT;
-			appliedForces[workIndex] = appliedForce;
+				appliedForce.x = solveOut.accumulatedDeltaLambdaN;
+				appliedForce.y += solveOut.deltaLambdaT;
+				appliedForces[workIndex] = appliedForce;
+			}
+			else
+			{
+				// The accumulate scan reads every slot, so the slot is cleared even when nothing was applied.
+				deltaP[workIndex] = make_float4(0.f, 0.f, 0.f, 0.f);
+			}
+		}
+		else
+		{
+			// A kinematic particle takes no delta, and the accumulate scan reads every slot, so this
+			// one is cleared for the same reason as the branch above.
+			deltaP[workIndex] = make_float4(0.f, 0.f, 0.f, 0.f);
 		}
 	}
 }
-
 
 // SB-SB contact pre-count pass. Runs once per outer position-iter before
 // sb_solveOutputSSDeltaVLaunch. For each active contact, bumps
 // softbody{0,1}.mSimDelta[v].w by 1 per touched tet vertex; the solve
 // consumes .w for XPBD mass-splitting and the finalize divides .xyz by
-// max(.w, 1) and zeros both. Activation is decided by solveDbDbContact
-// with checkOnlyActivity=true; markInCollision is sticky across iters so
-// the .w refcount stays consistent if the contact toggles activity.
+// max(.w, 1) and zeros both. Activation is decided by solveDbDbContact with
+// checkOnlyActivity=true and recorded on the pair. This path recomputes it every
+// iteration rather than latching it, which is what keeps the refcount consistent
+// with the contacts that go on to write deltas.
 extern "C" __global__ void sb_querySSContactReferenceCountLaunch(
-	PxgSoftBody*								softbodies,
-	PxgFemFemContactInfo*						contactInfos,
-	PxgDbDbContactBlock*						contactBlocks,
-	PxU32*										numContacts,
-	const PxReal								dt
+	PxgSoftBody*			softbodies,
+	PxgDeformablePairInfo*	contactInfos,
+	const float4*			barycentrics0,
+	const float4*			barycentrics1,
+	PxgDbDbContactBlock*	contactBlocks,
+	PxU32*					numContacts,
+	const PxReal			dt,
+	bool					isVelocityIteration
 )
 {
 	const PxU32 tNumContacts = *numContacts;
@@ -1240,65 +1192,63 @@ extern "C" __global__ void sb_querySSContactReferenceCountLaunch(
 		if (workIndex >= tNumContacts)
 			return;
 
-		PxgFemFemContactInfo& contactInfo = contactInfos[workIndex];
+		const PxgDeformablePairInfo& contactInfo = contactInfos[workIndex];
 		PxgDbDbContactBlock& block = contactBlocks[workIndex / 32];
 
-		const PxU32 pairInd0 = PxU32(contactInfo.pairInd0);
-		const PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-		const PxU32 softbodyId0 = PxGetSoftBodyId(pairInd0);
-		const PxU32 softbodyId1 = PxGetSoftBodyId(pairInd1);
-		const PxU32 tetId0 = PxGetSoftBodyElementIndex(pairInd0);
-		const PxU32 tetId1 = PxGetSoftBodyElementIndex(pairInd1);
+		if(!PxgIsValidPairInfo(contactInfo))
+		{
+			PxgSetActivePairInfo(contactInfos[workIndex], false);
+			continue;
+		}
 
-		PxgSoftBody& softbody0 = softbodies[softbodyId0];
-		PxgSoftBody& softbody1 = softbodies[softbodyId1];
-
-		const float4 barycentric0 = block.barycentric0[threadIndexInWarp];
-		const float4 barycentric1 = block.barycentric1[threadIndexInWarp];
+		PxgSoftBody& softbody0 = softbodies[PxgGetDeformableId(contactInfo.ref0)];
+		PxgSoftBody& softbody1 = softbodies[PxgGetDeformableId(contactInfo.ref1)];
 
 		PxgDeformablePart<PxVec4> db0;
 		PxgDeformablePart<PxVec4> db1;
 		// checkOnlyActivity=true: skip the refcount multiply (the pre-count
 		// hasn't populated .w yet) and the friction read (only the activation
 		// predicate is consumed below).
-		db0.readSoftBody(softbody0, tetId0, barycentric0, NULL, /*checkOnlyActivity*/ true);
-		db1.readSoftBody(softbody1, tetId1, barycentric1, NULL, /*checkOnlyActivity*/ true);
+		db0.readSoftBody(softbody0, contactInfo.ref0, barycentrics0, workIndex, NULL,
+						 /*checkOnlyActivity*/ true, dt, isVelocityIteration);
+		db1.readSoftBody(softbody1, contactInfo.ref1, barycentrics1, workIndex, NULL,
+						 /*checkOnlyActivity*/ true, dt, isVelocityIteration);
 
-		db0.readContactPrepDbSide0(block, threadIndexInWarp);
-		db1.readContactPrepDbSide1(block, threadIndexInWarp);
+		PxgDbContactPair contactPair;
+		PxgDbSolveOutput solveOut;
+		contactPair.readContactPrepDbDb(block, threadIndexInWarp);
 
-		PxgDbContactState state;
-		state.readContactPrepDbDb(block, threadIndexInWarp);
-
-		const bool isActive = solveDbDbContact(db0, db1, state,
+		const bool isActive = solveDbDbContact(db0, db1, contactPair, solveOut,
 												 /*appliedNormalLambdaRef*/ 0.0f,
 												 /*appliedTanLambdaRef*/ 0.0f,
 												 /*frictionCoefficient*/ 0.0f,
 												 dt,
-												 /*checkOnlyActivity*/ true);
+												 /*checkOnlyActivity*/ true,
+												 isVelocityIteration);
 
-		contactInfo.markInCollision(isActive);
+		PxgSetActivePairInfo(contactInfos[workIndex], isActive);
 
 		if(isActive)
 		{
 			// Integer-count refcount bump per touched tet vertex (gated |bc| > 1e-3).
-			const uint4 tetrahedronId0 = softbody0.mSimTetIndices[tetId0];
-			const uint4 tetrahedronId1 = softbody1.mSimTetIndices[tetId1];
-			bumpDbRefCountTet(softbody0.mSimDelta, tetrahedronId0, barycentric0.x, barycentric0.y, barycentric0.z, barycentric0.w);
-			bumpDbRefCountTet(softbody1.mSimDelta, tetrahedronId1, barycentric1.x, barycentric1.y, barycentric1.z, barycentric1.w);
+			db0.bumpSoftBodyRefCount(softbody0);
+			db1.bumpSoftBodyRefCount(softbody1);
 		}
 	}
 }
 
 //solve soft bodies contacts, store positional change to soft body buffer
 extern "C" __global__ void sb_solveOutputSSDeltaVLaunch(
-	PxgSoftBody*								softbodies,
-	PxgFemFemContactInfo*						contactInfos,
-	PxgDbDbContactBlock*						contactBlocks,
-	PxU32*										numContacts,
-	const PxReal								dt,
-	float2*										appliedForces,				//output
-	PxsDeformableVolumeMaterialData*			materials
+	PxgSoftBody*						softbodies,
+	PxgDeformablePairInfo*				contactInfos,
+	const float4*						barycentrics0,
+	const float4*						barycentrics1,
+	PxgDbDbContactBlock*				contactBlocks,
+	PxU32*								numContacts,
+	const PxReal						dt,
+	float2*								appliedForces,	//output
+	PxsDeformableVolumeMaterialData*	materials,
+	bool								isVelocityIteration
 )
 {
 	// SS contact body. Single kernel serves both PGS and TGS -- the math is
@@ -1327,52 +1277,52 @@ extern "C" __global__ void sb_solveOutputSSDeltaVLaunch(
 		if (workIndex >= tNumContacts)
 			return;
 
-		PxgFemFemContactInfo& contactInfo = contactInfos[workIndex];
+		// The pre-count decided this on the same positions, this iteration.
+		if(!PxgIsActivePairInfo(contactInfos[workIndex]))
+			continue;
+
+		const PxgDeformablePairInfo& contactInfo = contactInfos[workIndex];
 		PxgDbDbContactBlock& block = contactBlocks[workIndex / 32];
 
-		const PxU32 pairInd0 = PxU32(contactInfo.pairInd0);
-		const PxU32 softbodyId0 = PxGetSoftBodyId(pairInd0);
-		PxgSoftBody& softbody0 = softbodies[softbodyId0];
-		const PxU32 tetId0 = PxGetSoftBodyElementIndex(pairInd0);
+		PxgSoftBody& softbody0 = softbodies[PxgGetDeformableId(contactInfo.ref0)];
 
-		const PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-		const PxU32 softbodyId1 = PxGetSoftBodyId(pairInd1);
-		PxgSoftBody& softbody1 = softbodies[softbodyId1];
-		const PxU32 tetId1 = PxGetSoftBodyElementIndex(pairInd1);
-
-		const float4 barycentric0 = block.barycentric0[threadIndexInWarp];
-		const float4 barycentric1 = block.barycentric1[threadIndexInWarp];
+		PxgSoftBody& softbody1 = softbodies[PxgGetDeformableId(contactInfo.ref1)];
 
 		PxgDeformablePart<PxVec4> db0;
 		PxgDeformablePart<PxVec4> db1;
-		db0.readSoftBody(softbody0, tetId0, barycentric0, materials, /*checkOnlyActivity*/ false);
-		db1.readSoftBody(softbody1, tetId1, barycentric1, materials, /*checkOnlyActivity*/ false);
+		db0.readSoftBody(softbody0, contactInfo.ref0, barycentrics0, workIndex, materials,
+						 /*checkOnlyActivity*/ false, dt, isVelocityIteration);
+		db1.readSoftBody(softbody1, contactInfo.ref1, barycentrics1, workIndex, materials,
+						 /*checkOnlyActivity*/ false, dt, isVelocityIteration);
 
 		const PxReal frictionCoefficient = (db0.friction + db1.friction) * 0.5f;
 
-		db0.readContactPrepDbSide0(block, threadIndexInWarp);
-		db1.readContactPrepDbSide1(block, threadIndexInWarp);
-
-		PxgDbContactState state;
-		state.readContactPrepDbDb(block, threadIndexInWarp);
+		PxgDbContactPair contactPair;
+		PxgDbSolveOutput solveOut;
+		contactPair.readContactPrepDbDb(block, threadIndexInWarp);
 
 		float2 appliedForce = appliedForces[workIndex]; // (lambdaN_accum, lambdaT_accum)
 
-		solveDbDbContact(db0, db1, state, appliedForce.x, appliedForce.y, frictionCoefficient, dt);
+		const bool hasApplied = solveDbDbContact(db0, db1, contactPair, solveOut, appliedForce.x, appliedForce.y, frictionCoefficient, dt,
+		                 /*checkOnlyActivity*/ false, isVelocityIteration);
 
-		if (state.deltaLambdaN != 0.f || state.deltaLambdaT != 0.f)
+		if(hasApplied)
 		{
-			PxVec3 deltaPos;
-			state.computeDeformableDelta(deltaPos, dt);
+			// delta, the contact impulse, is expressed as a position delta in position iterations
+			// and as velocity * dt in velocity iterations. It accumulates in mSimDelta and
+			// sb_gm_applyExternalDeltasLaunch writes it to the vertex state at iteration end
+			// (velocity always, position only in position iterations).
+			PxVec3 delta;
+			solveOut.computeDelta(contactPair, delta, dt);
 
-			// Scatter .xyz weighted by the refCount-inflated vertexInvMasses; the pre-count owns .w.
-			db0.writeSoftBody(softbody0, tetId0, barycentric0, /*elemIsVertex*/ false, deltaPos);
-			db1.writeSoftBody(softbody1, tetId1, barycentric1, /*elemIsVertex*/ false, -deltaPos);
+			// Scatter .xyz weighted by the refCount-inflated vertexInvMasses. The pre-count owns .w.
+			db0.writeSoftBody(softbody0, delta);
+			db1.writeSoftBody(softbody1, -delta);
+
+			appliedForce.x = solveOut.accumulatedDeltaLambdaN;
+			appliedForce.y += solveOut.deltaLambdaT;
+			appliedForces[workIndex] = appliedForce;
 		}
-
-		appliedForce.x = state.accumulatedDeltaLambdaN;
-		appliedForce.y += state.deltaLambdaT;
-		appliedForces[workIndex] = appliedForce;
 	}
 }
 
@@ -1385,12 +1335,15 @@ extern "C" __global__ void sb_solveOutputSSDeltaVLaunch(
 // The SC solve consumes both .w buffers for XPBD mass-splitting; each
 // side's finalize divides .xyz by max(.w, 1) and zeros both.
 extern "C" __global__ void sb_querySCContactReferenceCountLaunch(
-	PxgSoftBody*								softbodies,
-	PxgFEMCloth*								clothes,
-	PxgFemFemContactInfo*						contactInfos,
-	PxgDbDbContactBlock*						contactBlocks,
-	PxU32*										numContacts,
-	const PxReal								dt
+	PxgSoftBody*			softbodies,
+	PxgFEMCloth*			clothes,
+	PxgDeformablePairInfo*	contactInfos,
+	const float4*			barycentrics0,
+	const float4*			barycentrics1,
+	PxgDbDbContactBlock*	contactBlocks,
+	PxU32*					numContacts,
+	const PxReal			dt,
+	bool					isVelocityIteration
 )
 {
 	const PxU32 tNumContacts = *numContacts;
@@ -1406,74 +1359,64 @@ extern "C" __global__ void sb_querySCContactReferenceCountLaunch(
 		if (workIndex >= tNumContacts)
 			return;
 
-		PxgFemFemContactInfo& contactInfo = contactInfos[workIndex];
+		const PxgDeformablePairInfo& contactInfo = contactInfos[workIndex];
 		PxgDbDbContactBlock& block = contactBlocks[workIndex / 32];
 
-		// Side 0: cloth (triangle or vertex per clothBC.w).
-		const PxU32 pairInd0 = PxU32(contactInfo.pairInd0);
-		const PxU32 clothId = PxGetClothId(pairInd0);
-		PxgFEMCloth& cloth = clothes[clothId];
-		const PxU32 clothElemIdx = PxGetClothElementIndex(pairInd0);
-		const float4 clothBC = block.barycentric0[threadIndexInWarp];
+		if(!PxgIsValidPairInfo(contactInfo))
+		{
+			PxgSetActivePairInfo(contactInfos[workIndex], false);
+			continue;
+		}
+
+		// Side 0: cloth.
+		PxgFEMCloth& cloth = clothes[PxgGetDeformableId(contactInfo.ref0)];
 
 		// Side 1: softbody tet.
-		const PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-		const PxU32 softbodyId = PxGetSoftBodyId(pairInd1);
-		PxgSoftBody& softbody = softbodies[softbodyId];
-		const PxU32 tetId = PxGetSoftBodyElementIndex(pairInd1);
-		const float4 sbBC = block.barycentric1[threadIndexInWarp];
+		PxgSoftBody& softbody = softbodies[PxgGetDeformableId(contactInfo.ref1)];
 
 		PxgDeformablePart<PxVec3> dbCloth;
 		PxgDeformablePart<PxVec4> dbSb;
-		dbCloth.readCloth(cloth, clothElemIdx, clothBC, NULL, /*countReferenceOnly*/ true);
-		dbSb.readSoftBody(softbody, tetId, sbBC, NULL, /*checkOnlyActivity*/ true);
+		dbCloth.readCloth(cloth, contactInfo.ref0, barycentrics0, workIndex, NULL,
+						  /*countReferenceOnly*/ true, dt, isVelocityIteration);
+		dbSb.readSoftBody(softbody, contactInfo.ref1, barycentrics1, workIndex, NULL,
+						  /*checkOnlyActivity*/ true, dt, isVelocityIteration);
 
-		dbCloth.readContactPrepDbSide0(block, threadIndexInWarp);
-		dbSb.readContactPrepDbSide1(block, threadIndexInWarp);
+		PxgDbContactPair contactPair;
+		PxgDbSolveOutput solveOut;
+		contactPair.readContactPrepDbDb(block, threadIndexInWarp);
 
-		PxgDbContactState state;
-		state.readContactPrepDbDb(block, threadIndexInWarp);
-
-		const bool isActive = solveDbDbContact(dbCloth, dbSb, state,
+		const bool isActive = solveDbDbContact(dbCloth, dbSb, contactPair, solveOut,
 												 /*appliedNormalLambdaRef*/ 0.0f,
 												 /*appliedTanLambdaRef*/ 0.0f,
 												 /*frictionCoefficient*/ 0.0f,
 												 dt,
-												 /*checkOnlyActivity*/ true);
+												 /*checkOnlyActivity*/ true,
+												 isVelocityIteration);
 
-		contactInfo.markInCollision(isActive);
+		PxgSetActivePairInfo(contactInfos[workIndex], isActive);
 
 		if(isActive)
 		{
-			// Integer-count refcount bump per side (gated |bc| > 1e-3).
-			// Cloth-triangle (clothBC.w == 0): bumps per touched triangle
-			// vertex; cloth-vertex (clothBC.w != 0): bumps the lone vertex.
-			if(clothBC.w == 0.0f)
-			{
-				const uint4 triVertId = cloth.mTriangleVertexIndices[clothElemIdx];
-				bumpDbRefCountTri(cloth.mDeltaPos, triVertId, clothBC.x, clothBC.y, clothBC.z);
-			}
-			else
-			{
-				bumpDbRefCountVtx(cloth.mDeltaPos, clothElemIdx);
-			}
-
-			const uint4 tetrahedronId = softbody.mSimTetIndices[tetId];
-			bumpDbRefCountTet(softbody.mSimDelta, tetrahedronId, sbBC.x, sbBC.y, sbBC.z, sbBC.w);
+			// Integer-count refcount bump per side, gated |bc| > 1e-3.
+			dbCloth.bumpClothRefCount(cloth);
+			dbSb.bumpSoftBodyRefCount(softbody);
 		}
 	}
 }
 
 extern "C" __global__ void sb_solveOutputSCDeltaVLaunch(
-	PxgSoftBody*								softbodies,
-	PxgFEMCloth*								clothes,
-	PxgFemFemContactInfo*						contactInfos,
-	PxgDbDbContactBlock*						contactBlocks,
-	PxU32*										numContacts,
-	const PxReal								dt,
-	float2*										appliedForces, //output
-	PxsDeformableVolumeMaterialData*			sbMaterials,
-	PxsDeformableSurfaceMaterialData*			clothMaterials
+	PxgSoftBody*						softbodies,
+	PxgFEMCloth*						clothes,
+	PxgDeformablePairInfo*				contactInfos,
+	const float4*						barycentrics0,
+	const float4*						barycentrics1,
+	PxgDbDbContactBlock*				contactBlocks,
+	PxU32*								numContacts,
+	const PxReal						dt,
+	float2*								appliedForces,	//output
+	PxsDeformableVolumeMaterialData*	sbMaterials,
+	PxsDeformableSurfaceMaterialData*	clothMaterials,
+	bool								isVelocityIteration
 )
 {
 	// SC contact body: PxgDeformablePart<PxVec3> (cloth) + <PxVec4> (softbody)
@@ -1502,69 +1445,73 @@ extern "C" __global__ void sb_solveOutputSCDeltaVLaunch(
 		if (workIndex >= tNumContacts)
 			return;
 
-		PxgFemFemContactInfo& contactInfo = contactInfos[workIndex];
+		// The pre-count decided this on the same positions, this iteration.
+		if(!PxgIsActivePairInfo(contactInfos[workIndex]))
+			continue;
+
+		const PxgDeformablePairInfo& contactInfo = contactInfos[workIndex];
 		PxgDbDbContactBlock& block = contactBlocks[workIndex / 32];
 
-		// Side 0: cloth (triangle or vertex).
-		const PxU32 pairInd0 = PxU32(contactInfo.pairInd0);
-		const PxU32 clothId = PxGetClothId(pairInd0);
-		PxgFEMCloth& cloth = clothes[clothId];
-		const PxU32 clothElemIdx = PxGetClothElementIndex(pairInd0);
-		const float4 clothBC = block.barycentric0[threadIndexInWarp];
+		// Side 0: cloth.
+		PxgFEMCloth& cloth = clothes[PxgGetDeformableId(contactInfo.ref0)];
 
 		// Side 1: softbody tet.
-		const PxU32 pairInd1 = PxU32(contactInfo.pairInd1);
-		const PxU32 softbodyId = PxGetSoftBodyId(pairInd1);
-		PxgSoftBody& softbody = softbodies[softbodyId];
-		const PxU32 tetId = PxGetSoftBodyElementIndex(pairInd1);
-		const float4 sbBC = block.barycentric1[threadIndexInWarp];
+		PxgSoftBody& softbody = softbodies[PxgGetDeformableId(contactInfo.ref1)];
 
 		PxgDeformablePart<PxVec3> dbCloth;
 		PxgDeformablePart<PxVec4> dbSb;
-		dbCloth.readCloth(cloth, clothElemIdx, clothBC, clothMaterials, /*countReferenceOnly*/ false);
-		dbSb.readSoftBody(softbody, tetId, sbBC, sbMaterials, /*checkOnlyActivity*/ false);
+		dbCloth.readCloth(cloth, contactInfo.ref0, barycentrics0, workIndex, clothMaterials,
+						  /*countReferenceOnly*/ false, dt, isVelocityIteration);
+		dbSb.readSoftBody(softbody, contactInfo.ref1, barycentrics1, workIndex, sbMaterials,
+						  /*checkOnlyActivity*/ false, dt, isVelocityIteration);
 
 		const PxReal frictionCoefficient = (dbCloth.friction + dbSb.friction) * 0.5f;
 
-		dbCloth.readContactPrepDbSide0(block, threadIndexInWarp);
-		dbSb.readContactPrepDbSide1(block, threadIndexInWarp);
-
-		PxgDbContactState state;
-		state.readContactPrepDbDb(block, threadIndexInWarp);
+		PxgDbContactPair contactPair;
+		PxgDbSolveOutput solveOut;
+		contactPair.readContactPrepDbDb(block, threadIndexInWarp);
 
 		float2 appliedForce = appliedForces[workIndex]; // (lambdaN_accum, lambdaT_accum)
 
-		solveDbDbContact(dbCloth, dbSb, state, appliedForce.x, appliedForce.y, frictionCoefficient, dt);
+		const bool hasApplied = solveDbDbContact(dbCloth, dbSb, contactPair, solveOut, appliedForce.x, appliedForce.y, frictionCoefficient, dt,
+		                 /*checkOnlyActivity*/ false, isVelocityIteration);
 
-		if (state.deltaLambdaN != 0.f || state.deltaLambdaT != 0.f)
+		if(hasApplied)
 		{
-			PxVec3 deltaPos;
-			state.computeDeformableDelta(deltaPos, dt);
+			// delta, the contact impulse, is expressed as a position delta in position iterations
+			// and as velocity * dt in velocity iterations. It accumulates in the per-iteration
+			// scratch of each side (mSimDelta / mDeltaPos) and the apply kernels write it to
+			// the vertex state at iteration end (velocity always, position only in position
+			// iterations).
+			PxVec3 delta;
+			solveOut.computeDelta(contactPair, delta, dt);
 
-			// Scatter .xyz weighted by the refCount-inflated vertexInvMasses; the pre-count owns .w.
-			dbCloth.writeCloth(cloth, clothElemIdx, clothBC, /*elemIsVertex*/ clothBC.w != 0.0f, deltaPos);
-			dbSb.writeSoftBody(softbody, tetId, sbBC, /*elemIsVertex*/ false, -deltaPos);
+			// Scatter .xyz weighted by the refCount-inflated vertexInvMasses. The pre-count owns .w.
+			dbCloth.writeCloth(cloth, delta);
+			dbSb.writeSoftBody(softbody, -delta);
+
+			appliedForce.x = solveOut.accumulatedDeltaLambdaN;
+			appliedForce.y += solveOut.deltaLambdaT;
+			appliedForces[workIndex] = appliedForce;
 		}
-
-		appliedForce.x = state.accumulatedDeltaLambdaN;
-		appliedForce.y += state.deltaLambdaT;
-		appliedForces[workIndex] = appliedForce;
 	}
 }
 
 static __device__ void queryRigidSoftBodyContactReferenceCount(
 	PxgSoftBody* softbodies,
-	PxgFemOtherContactInfo* contactInfos,
-	PxgDbRigidContactBlock* contactBlocks,
+	PxgDeformablePairInfo* contactInfos,
+	const float4* barycentrics,
+	PxgRigidDbContactBlock* contactBlocks,
 	PxU32* numContacts,
 	PxgPrePrepDesc* prePrepDesc,
 	PxgSolverCoreDesc* solverCoreDesc,
 	PxgArticulationCoreDesc* artiCoreDesc,
 	float4* solverBodyVelPool,
 	const PxReal dt,
-	PxReal* appliedForces,
+	float2* appliedForces,
 	PxU32* rigidBodyRefCounts,
-	bool isTGS)
+	bool isTGS,
+	bool isVelocityIteration)
 {
 	const PxU32 numSolverBodies = solverCoreDesc->numSolverBodies;
 	const PxU32 tNumContacts = *numContacts;
@@ -1584,37 +1531,34 @@ static __device__ void queryRigidSoftBodyContactReferenceCount(
 		if(workIndex >= tNumContacts)
 			return;
 
-		PxgFemOtherContactInfo& contactInfo = contactInfos[workIndex];
-		const bool wasActive = contactInfo.isInCollision();
-		const PxU64 pairInd0 = contactInfo.pairInd0;
-		const PxU32 pairInd1 = contactInfo.pairInd1;
+		const PxgDeformablePairInfo& contactInfo = contactInfos[workIndex];
+		const bool wasActive = PxgIsActivePairInfo(contactInfos[workIndex]);
 
-		PxgDbRigidContactBlock& block = contactBlocks[workIndex / 32];
-		const float4 fricTan0_invMass0 = block.fricTan0_invMass0[threadIndexInWarp];
-		const float4 bc = block.barycentric[threadIndexInWarp];
+		PxgRigidDbContactBlock& block = contactBlocks[workIndex / 32];
 
 		// First actor: rigid body
-		const PxU64 tRigidId = pairInd0;
-		const PxNodeIndex rigidId = reinterpret_cast<const PxNodeIndex&>(tRigidId);
+		const PxNodeIndex rigidId = PxgGetRigidNode(contactInfo.ref0);
 
-		// Second actor: soft body
-		const PxU32 softbodyId = PxGetSoftBodyId(pairInd1);
-		const PxU32 tetId = PxGetSoftBodyElementIndex(pairInd1);
-
-		if(tetId < PX_MAX_NB_DEFORMABLE_VOLUME_TET)
+		if(PxgIsValidPairInfo(contactInfo))
 		{
+			// Only the invMass is wanted from the block here. The tangent in .xyz is read by
+			// PxgDbContactPair::readContactPrep.
+			const int globalRigidBodyId = getGlobalRigidBodyId(prePrepDesc, rigidId, numSolverBodies, artiCoreDesc->mMaxLinksPerArticulation);
+			const PxReal rigidInvMass = block.fricTan0_invMass0[threadIndexInWarp].w;
+
 			const bool checkOnlyActivity = true; // Check only if the constraint is active, without evaluating forces/impulses.
 			bool isActive = false;
 
-			PxgSoftBody& softbody = softbodies[softbodyId];
+			// Second actor: soft body
+			PxgSoftBody& softbody = softbodies[PxgGetDeformableId(contactInfo.ref1)];
 
 			PxgRigidPart rigid;
 			PxgDeformablePart<PxVec4> db;
-			PxgDbContactState state;
+			PxgDbContactPair contactPair;
+			PxgDbSolveOutput solveOut;
 
-			const int globalRigidBodyId = rigid.getGlobalRigidBodyId(prePrepDesc, rigidId, numSolverBodies, artiCoreDesc->mMaxLinksPerArticulation);
-
-			db.readSoftBody(softbody, tetId, bc, NULL, checkOnlyActivity);
+			db.readSoftBody(softbody, contactInfo.ref1, barycentrics, workIndex, NULL,
+							checkOnlyActivity, dt, isVelocityIteration);
 
 			if(wasActive)
 			{
@@ -1623,26 +1567,25 @@ static __device__ void queryRigidSoftBodyContactReferenceCount(
 			}
 			else
 			{
-				rigid.readBodyProperties(rigidId, globalRigidBodyId, fricTan0_invMass0.w, NULL, NULL);
+				rigid.readBodyProperties(rigidId, globalRigidBodyId, rigidInvMass, NULL, NULL);
 				rigid.readContactPrep(block, threadIndexInWarp);
-				db.readContactPrep(block, threadIndexInWarp);
-				state.readContactPrep(block, threadIndexInWarp);
 				rigid.readVelocity(velocityReader, rigidId, isTGS);
-				isActive = solveRbDbContact(rigid, db, state, appliedForces[workIndex], dt, wasActive, checkOnlyActivity);
+				contactPair.readContactPrep(block, threadIndexInWarp);
+				isActive = solveRigidDbContact(rigid, db, contactPair, solveOut, appliedForces[workIndex].x, appliedForces[workIndex].y, dt, wasActive, checkOnlyActivity, isVelocityIteration);
 
 				if(isActive)
 				{
-					contactInfo.markInCollision(true);
+					PxgSetActivePairInfo(contactInfos[workIndex], true);
 				}
 			}
 
 			if(isActive)
 			{
 				// Update soft body
-				bumpDbRefCountTet(softbody.mSimDelta, softbody.mSimTetIndices[tetId], bc.x, bc.y, bc.z, bc.w);
+				db.bumpSoftBodyRefCount(softbody);
 
 				// Update rigidbody
-				if(globalRigidBodyId != -1 && fricTan0_invMass0.w != 0.0f)
+				if(rigidIsRefCounted(globalRigidBodyId, rigidInvMass))
 				{
 					// Increment the reference count of the rigid body.
 					atomicAdd(&rigidBodyRefCounts[globalRigidBodyId], 1);
@@ -1655,38 +1598,42 @@ static __device__ void queryRigidSoftBodyContactReferenceCount(
 extern "C" __global__
 void sb_queryRigidSoftContactReferenceCountLaunch(
 	PxgSoftBody* softbodies,
-	PxgFemOtherContactInfo* contactInfos,
-	PxgDbRigidContactBlock* contactBlocks,
+	PxgDeformablePairInfo* contactInfos,
+	const float4* barycentrics,
+	PxgRigidDbContactBlock* contactBlocks,
 	PxU32* numContacts,
 	PxgPrePrepDesc* prePrepDesc,
 	PxgSolverCoreDesc* solverCoreDesc,
 	PxgArticulationCoreDesc* artiCoreDesc,
 	float4* solverBodyVelPool,
 	const PxReal dt,
-	PxReal* appliedForces,
+	float2* appliedForces,
 	PxU32* rigidBodyRefCounts,
-	bool isTGS)
+	bool isTGS,
+	bool isVelocityIteration)
 {
-	queryRigidSoftBodyContactReferenceCount(softbodies, contactInfos, contactBlocks, numContacts, prePrepDesc, solverCoreDesc, artiCoreDesc,
-											solverBodyVelPool, dt, appliedForces, rigidBodyRefCounts, isTGS);
+	queryRigidSoftBodyContactReferenceCount(softbodies, contactInfos, barycentrics, contactBlocks, numContacts, prePrepDesc, solverCoreDesc, artiCoreDesc,
+											solverBodyVelPool, dt, appliedForces, rigidBodyRefCounts, isTGS, isVelocityIteration);
 }
 
 static __device__ void solveRigidSoftBodyContact(
 	PxgSoftBody* softbodies,
-	PxgFemOtherContactInfo* contactInfos,
-	PxgDbRigidContactBlock* contactBlocks,
+	const PxgDeformablePairInfo* contactInfos,
+	const PxU16* contactRigidMaterials,
+	const float4* barycentrics,
+	PxgRigidDbContactBlock* contactBlocks,
 	PxU32* numContacts,
 	PxgPrePrepDesc* prePrepDesc,
 	PxgSolverCoreDesc* solverCoreDesc,
 	PxgArticulationCoreDesc* artiCoreDesc,
 	float4* solverBodyVelPool,
 	float4* rigidDeltaVel,
-	PxReal* appliedForces,
+	float2* appliedForces,
 	PxU32* rigidBodyRefCounts,
 	const PxReal dt,
 	PxsDeformableVolumeMaterialData* materials,
 	const PxsMaterialData* PX_RESTRICT rigidBodyMaterials,
-	bool isTGS)
+	bool isTGS, bool isVelocityIteration)
 {
 	const PxU32 numSolverBodies = solverCoreDesc->numSolverBodies;
 	const PxU32 tNumContacts = *numContacts;
@@ -1706,58 +1653,63 @@ static __device__ void solveRigidSoftBodyContact(
 		if(workIndex >= tNumContacts)
 			return;
 
-		PxgFemOtherContactInfo& contactInfo = contactInfos[workIndex];
-		const bool isActive = contactInfo.isInCollision();
-		const PxU64 pairInd0 = contactInfo.pairInd0;
-		const PxU32 pairInd1 = contactInfo.pairInd1;
+		const PxgDeformablePairInfo& contactInfo = contactInfos[workIndex];
+		const bool isActive = PxgIsActivePairInfo(contactInfos[workIndex]);
 
-		PxgDbRigidContactBlock& block = contactBlocks[workIndex / 32];
-		const float4 fricTan0_invMass0 = block.fricTan0_invMass0[threadIndexInWarp];
-		const float4 bc = block.barycentric[threadIndexInWarp];
+		PxgRigidDbContactBlock& block = contactBlocks[workIndex / 32];
 
 		// First actor: rigid body
-		const PxU64 tRigidId = pairInd0;
-		const PxNodeIndex rigidId = reinterpret_cast<const PxNodeIndex&>(tRigidId);
+		const PxNodeIndex rigidId = PxgGetRigidNode(contactInfo.ref0);
 
-		// Second actor: soft body
-		const PxU32 softbodyId = PxGetSoftBodyId(pairInd1);
-		const PxU32 tetId = PxGetSoftBodyElementIndex(pairInd1);
-
-		if(tetId < PX_MAX_NB_DEFORMABLE_VOLUME_TET)
+		if(PxgIsValidPairInfo(contactInfo))
 		{
+			// Only the invMass is wanted from the block here. The tangent in .xyz is read by
+			// PxgDbContactPair::readContactPrep.
+			const int globalRigidBodyId = getGlobalRigidBodyId(prePrepDesc, rigidId, numSolverBodies, artiCoreDesc->mMaxLinksPerArticulation);
+			const PxReal rigidInvMass = block.fricTan0_invMass0[threadIndexInWarp].w;
+
 			const bool checkOnlyActivity = false;
 
 			PxgRigidPart rigid;
 			PxgDeformablePart<PxVec4> db;
-			PxgDbContactState state;
-
-			const int globalRigidBodyId = rigid.getGlobalRigidBodyId(prePrepDesc, rigidId, numSolverBodies, artiCoreDesc->mMaxLinksPerArticulation);
+			PxgDbContactPair contactPair;
+			PxgDbSolveOutput solveOut;
 
 			if(isActive)
 			{
-				PxgSoftBody& softbody = softbodies[softbodyId];
+				// Second actor: soft body
+				PxgSoftBody& softbody = softbodies[PxgGetDeformableId(contactInfo.ref1)];
 
-				rigid.readBodyProperties(rigidId, globalRigidBodyId, fricTan0_invMass0.w, rigidBodyRefCounts,
-						   &rigidBodyMaterials[contactInfo.getRigidMaterialIndex()]);
-				db.readSoftBody(softbody, tetId, bc, materials, checkOnlyActivity);
+				rigid.readBodyProperties(rigidId, globalRigidBodyId, rigidInvMass, rigidBodyRefCounts,
+						   &rigidBodyMaterials[contactRigidMaterials[workIndex]]);
+				db.readSoftBody(softbody, contactInfo.ref1, barycentrics, workIndex, materials,
+								checkOnlyActivity, dt, isVelocityIteration);
 
 				rigid.readContactPrep(block, threadIndexInWarp);
-				db.readContactPrep(block, threadIndexInWarp);
-				state.readContactPrep(block, threadIndexInWarp);
 				rigid.readVelocity(velocityReader, rigidId, isTGS);
-				solveRbDbContact(rigid, db, state, appliedForces[workIndex], dt, isActive, checkOnlyActivity);
+				contactPair.readContactPrep(block, threadIndexInWarp);
+				const bool hasApplied = solveRigidDbContact(rigid, db, contactPair, solveOut, appliedForces[workIndex].x, appliedForces[workIndex].y, dt, isActive, checkOnlyActivity, isVelocityIteration);
 
-				// Compute soft body delta
-				PxVec3 deltaPos;
-				appliedForces[workIndex] = state.computeDeformableDelta(deltaPos, dt);
+				if(hasApplied)
+				{
+					// delta, the contact impulse, is expressed as a position delta in position iterations
+					// and as velocity * dt in velocity iterations. It accumulates in mSimDelta and
+					// sb_gm_applyExternalDeltasLaunch writes it to the vertex state at iteration end
+					// (velocity always, position only in position iterations).
+					PxVec3 delta;
+					solveOut.computeDelta(contactPair, delta, dt);
+					appliedForces[workIndex] = make_float2(solveOut.accumulatedDeltaLambdaN, appliedForces[workIndex].y + solveOut.deltaLambdaT);
 
-				// Update soft body: scatter .xyz weighted by the refCount-inflated vertexInvMasses; the pre-count owns .w.
-				db.writeSoftBody(softbody, tetId, bc, /*elemIsVertex*/ false, deltaPos);
+					// Update soft body: scatter .xyz weighted by the refCount-inflated vertexInvMasses. The pre-count owns .w.
+					db.writeSoftBody(softbody, delta);
+				}
 			}
 
-			// Update rigid body. Must write every iteration even when !isActive (the
-			// accumulate scan reads every slot); writeContactDeltas zeroes the no-op cases.
-			rigid.writeContactDeltas(rigidDeltaVel, rigidId, state, workIndex, workIndex + tNumContacts);
+			// Update rigid body. Every slot must be written every iteration, !isActive included:
+			// accumulateDeltaVRigidFirstLaunch sums the whole contact range, so one left unwritten
+			// feeds it stale state. invMass is still zero on that path, which is writeContactDeltas'
+			// no-op sentinel, so it writes zeros without reading the unpopulated pair and output.
+			rigid.writeContactDeltas(rigidDeltaVel, rigidId, contactPair, solveOut, workIndex, workIndex + tNumContacts);
 		}
 	}
 }
@@ -1765,22 +1717,25 @@ static __device__ void solveRigidSoftBodyContact(
 //solve collision between soft body and primitives based on the sorted contact by rigid id
 //store new velocity to rigid body buffer
 extern "C" __global__ void sb_solveRigidSoftCollisionLaunch(
-	PxgSoftBody*								softbodies,
-	PxgFemOtherContactInfo*						contactInfos,
-	PxgDbRigidContactBlock*						contactBlocks,
-	PxU32*										numContacts,
-	PxgPrePrepDesc*								prePrepDesc,
-	PxgSolverCoreDesc*							solverCoreDesc,
-	PxgArticulationCoreDesc*					artiCoreDesc,
-	float4*										solverBodyVelPool,
-	float4*										rigidDeltaVel,				//output
-	PxReal*										appliedForces,				//output
-	PxU32*										rigidBodyRefCounts,
-	const PxReal								dt,
-	PxsDeformableVolumeMaterialData*			materials,
-	const PxsMaterialData * PX_RESTRICT			rigidBodyMaterials,
-	bool										isTGS)
+	PxgSoftBody*						softbodies,
+	PxgDeformablePairInfo*				contactInfos,
+	const PxU16*						contactRigidMaterials,
+	const float4*						barycentrics,
+	PxgRigidDbContactBlock*				contactBlocks,
+	PxU32*								numContacts,
+	PxgPrePrepDesc*						prePrepDesc,
+	PxgSolverCoreDesc*					solverCoreDesc,
+	PxgArticulationCoreDesc*			artiCoreDesc,
+	float4*								solverBodyVelPool,
+	float4*								rigidDeltaVel,	//output
+	float2*								appliedForces,	//output
+	PxU32*								rigidBodyRefCounts,
+	const PxReal						dt,
+	PxsDeformableVolumeMaterialData*	materials,
+	const PxsMaterialData * PX_RESTRICT	rigidBodyMaterials,
+	bool								isTGS,
+	bool								isVelocityIteration)
 {
-	solveRigidSoftBodyContact(softbodies, contactInfos, contactBlocks, numContacts, prePrepDesc, solverCoreDesc, artiCoreDesc, solverBodyVelPool,
-		rigidDeltaVel, appliedForces, rigidBodyRefCounts, dt, materials, rigidBodyMaterials, isTGS);
+	solveRigidSoftBodyContact(softbodies, contactInfos, contactRigidMaterials, barycentrics, contactBlocks, numContacts, prePrepDesc, solverCoreDesc, artiCoreDesc, solverBodyVelPool,
+		rigidDeltaVel, appliedForces, rigidBodyRefCounts, dt, materials, rigidBodyMaterials, isTGS, isVelocityIteration);
 }

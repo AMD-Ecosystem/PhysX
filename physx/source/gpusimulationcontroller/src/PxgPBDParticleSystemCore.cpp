@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
-// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 
 #include "PxgPBDParticleSystemCore.h"
@@ -308,7 +285,6 @@ namespace physx
 		}
 	}
 
-
 	//this is for solving selfCollsion and contacts between particles and primitives based on sorted by particle id
 	void PxgPBDParticleSystemCore::solveParticleCollision(const PxReal dt, bool /*isTGS*/, PxReal coefficient)
 	{
@@ -348,39 +324,52 @@ namespace physx
 		synchronizeStreams(mCudaContext, solverStream, mStream);
 	}
 
-	void PxgPBDParticleSystemCore::updateParticles(const PxReal dt)
+	void PxgPBDParticleSystemCore::updateParticles(const PxReal dt, bool isVelocityIteration)
 	{
 		updateSortedVelocity(getParticleSystemBuffer().getDevicePtr(),
-			getActiveParticleSystemBuffer().getDevicePtr(), mSimController->getBodySimManager().mActivePBDParticleSystems.size(), dt);
+			getActiveParticleSystemBuffer().getDevicePtr(), mSimController->getBodySimManager().mActivePBDParticleSystems.size(), dt,
+			isVelocityIteration);
 	}
 
-	void PxgPBDParticleSystemCore::solve(CUdeviceptr prePrepDescd, CUdeviceptr solverCoreDescd,
-		CUdeviceptr artiCoreDescd, const PxReal dt, CUstream solverStream, PxReal biasCoefficient)
+	void PxgPBDParticleSystemCore::solve(CUdeviceptr prePrepDescd, CUdeviceptr solverCoreDescd, CUdeviceptr artiCoreDescd,
+		const PxReal particleBiasCoefficient, const PxReal dt, const PxReal totalInvDt,
+		const bool isFirstIteration, const bool isVelocityIteration, CUstream solverStream)
 	{
 #if PS_GPU_DEBUG
 		PX_PROFILE_ZONE("PxgParticleSystemCore.solve", 0);
 #endif
-		//const PxU32 numTotalParticleSystems = mSimController->getNbParticleSystems();
 		const PxU32 nbActiveParticles = mSimController->getBodySimManager().mActivePBDParticleSystems.size();
 
 		if (nbActiveParticles == 0)
 			return;
 
-		CUdeviceptr particleSystemd = getParticleSystemBuffer().getDevicePtr();
+		const bool isTGS = mGpuContext->isTGS();
 
+		CUdeviceptr particleSystemd = getParticleSystemBuffer().getDevicePtr();
 		CUdeviceptr activeParticleSystemd = getActiveParticleSystemBuffer().getDevicePtr();
 
-		solveParticleCollision(dt, false, biasCoefficient);
+		// TGS integrates per sub-step here, while PGS steps once at the start of the time step elsewhere.
+		if (isTGS && !isVelocityIteration)
+		{
+			stepParticleSystems(particleSystemd, activeParticleSystemd, nbActiveParticles, dt, totalInvDt, isFirstIteration);
+		}
+
+		// Particle-particle (density / self-collision) is internal, so it is skipped in velocity iterations,
+		// like the deformable internal-energy solve. Only contacts (particle-rigid, one-way, and
+		// particle-deformable via the cloth/softbody cores) project velocity.
+		PX_ASSERT(!isVelocityIteration || particleBiasCoefficient == 0.0f);
+		if (!isVelocityIteration)
+			solveParticleCollision(dt, isTGS, particleBiasCoefficient);
 
 		//Wait for mStream to finish (all particle-particle work) before primitive collision can run on solverStream
 		synchronizeStreams(mCudaContext, mStream, solverStream);
 		//Wait for solverStream to finish so mStream can do particle-rigid and rigid-particle work
 		synchronizeStreams(mCudaContext, solverStream, mStream);
 
-		solvePrimitiveCollisionForParticles(prePrepDescd, solverCoreDescd, artiCoreDescd, dt, false, false);
-		solvePrimitiveCollisionForRigids(prePrepDescd, solverCoreDescd, artiCoreDescd, solverStream, dt, false, false);
+		solvePrimitiveCollisionForParticles(prePrepDescd, solverCoreDescd, artiCoreDescd, dt, isTGS, isVelocityIteration);
+		solvePrimitiveCollisionForRigids(prePrepDescd, solverCoreDescd, artiCoreDescd, solverStream, dt, isTGS, isVelocityIteration);
 
-		solveOneWayCollision(particleSystemd, activeParticleSystemd, nbActiveParticles, dt, false);
+		solveOneWayCollision(particleSystemd, activeParticleSystemd, nbActiveParticles, dt, isVelocityIteration);
 
 		synchronizeStreams(mCudaContext, mStream, solverStream);
 	}
@@ -442,50 +431,6 @@ namespace physx
 		}
 	}
 
-	void PxgPBDParticleSystemCore::solveTGS(CUdeviceptr prePrepDescd, CUdeviceptr solverCoreDescd,
-		CUdeviceptr artiCoreDescd, const PxReal dt, const PxReal totalInvDt, CUstream solverStream, const bool isVelocityIteration,
-		PxI32 iterationIndex, PxI32 /*numTGSIterations*/, PxReal coefficient)
-	{
-		bool isFirstIteration = iterationIndex == 0;
-#if PS_GPU_DEBUG
-		PX_PROFILE_ZONE("PxgParticleSystemCore.solveTGS", 0);
-#endif
-		//const PxU32 numTotalParticleSystems = mSimController->getNbParticleSystems();
-		const PxU32 nbActiveParticles = mSimController->getBodySimManager().mActivePBDParticleSystems.size();
-
-		if (nbActiveParticles == 0)
-			return;
-
-
-		CUdeviceptr particleSystemd = getParticleSystemBuffer().getDevicePtr();
-
-		//PxgParticleSystem* particleSystems = mParticleSystemPool.begin(); //mSimController->getPBDParticleSystems();
-		CUdeviceptr activeParticleSystemd = getActiveParticleSystemBuffer().getDevicePtr();
-
-		if (!isVelocityIteration)
-		{
-			stepParticleSystems(particleSystemd, activeParticleSystemd, nbActiveParticles, dt, totalInvDt, isFirstIteration);
-		}
-
-		solveParticleCollision(dt, true, coefficient);
-
-		//Wait for mStream to finish (all particle-particle work) before primitive collision can run on solverStream
-		synchronizeStreams(mCudaContext, mStream, solverStream);
-		//Wait for solverStream to finish so mStream can do particle-rigid and rigid-particle work
-		synchronizeStreams(mCudaContext, solverStream, mStream);
-
-		solvePrimitiveCollisionForParticles(prePrepDescd, solverCoreDescd, artiCoreDescd, dt, true, isVelocityIteration);
-		solvePrimitiveCollisionForRigids(prePrepDescd, solverCoreDescd, artiCoreDescd, solverStream, dt, true, isVelocityIteration);
-
-		solveOneWayCollision(particleSystemd, activeParticleSystemd, nbActiveParticles, dt, isVelocityIteration);
-
-		synchronizeStreams(mCudaContext, mStream, solverStream);
-
-	}
-
-
-
-
 	void PxgPBDParticleSystemCore::integrateSystems(const PxReal dt, const PxReal epsilonSq)
 	{
 		const PxU32 nbActiveParticleSystems = mSimController->getBodySimManager().mActivePBDParticleSystems.size();
@@ -534,7 +479,6 @@ namespace physx
 		//copy unsortedPositions_InvMass and velocity to user buffer
 		copyUnsortedArrayToUserBuffer(particleSystemsd, activeParticleSystemsd, nbActiveParticleSystems);
 
-		copyUserBufferDataToHost(particleSystems, activeParticleSystems, nbActiveParticleSystems);
 
 		//Wait for diffuse particles to complete
 		synchronizeStreams(mCudaContext, mStream, mFinalizeStream);
@@ -697,10 +641,11 @@ namespace physx
 		CUdeviceptr activeParticelSystemd = getActiveParticleSystemBuffer().getDevicePtr();
 		const PxU32 nbActiveParticles = mSimController->getBodySimManager().mActivePBDParticleSystems.size();
 
-		CUdeviceptr totalContactCountsd = getParticleContactCount().getDevicePtr();
-		CUdeviceptr contactsd = mPrimitiveContactSortedByParticleBuf.getDevicePtr();
-		CUdeviceptr contactBlocksd = mRigidContactBlocksSortedByParticle.getDevicePtr();
-		CUdeviceptr appliedForced = mPrimitiveConstraintAppliedParticleForces.getDevicePtr();
+		CUdeviceptr totalContactCountsd = getRigidParticleContactCount().getDevicePtr();
+		CUdeviceptr contactInfosd = mRigidParticleContactInfoSortedByParticleBuffer.getDevicePtr();
+		CUdeviceptr contactNormalPensd = mRigidParticleContactNormalPenSortedByParticleBuffer.getDevicePtr();
+		CUdeviceptr contactBlocksd = mRigidParticleContactBlocksSortedByParticle.getDevicePtr();
+		CUdeviceptr appliedForced = mRigidParticleAppliedParticleForcesBuffer.getDevicePtr();
 		void* nullContactDeltaV = NULL;
 
 		//prepare primitive constraints sorted by particle id
@@ -710,7 +655,8 @@ namespace physx
 			PxCudaKernelParam kernelParams[] =
 			{
 				PX_CUDA_KERNEL_PARAM(particleSystemd),
-				PX_CUDA_KERNEL_PARAM(contactsd),
+				PX_CUDA_KERNEL_PARAM(contactInfosd),
+				PX_CUDA_KERNEL_PARAM(contactNormalPensd),
 				PX_CUDA_KERNEL_PARAM(totalContactCountsd),
 				PX_CUDA_KERNEL_PARAM(contactBlocksd),
 				PX_CUDA_KERNEL_PARAM(prePrepDescd),
@@ -764,15 +710,16 @@ namespace physx
 		{
 
 			CUdeviceptr pairCountd = mTempHistogramCountBuf.getDevicePtr();
-			CUdeviceptr startd = mTempContactBuf.getDevicePtr();
-			CUdeviceptr	endd = mTempContactRemapBuf.getDevicePtr();
+			CUdeviceptr startd = mTempContactBuffer.getDevicePtr();
+			CUdeviceptr	endd = mTempContactRemapBuffer.getDevicePtr();
 
 			const CUfunction rigidDensityFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::PS_ACCUMULATE_RIGID_DENSITY);
 
 			PxCudaKernelParam kernelParams[] =
 			{
 				PX_CUDA_KERNEL_PARAM(particleSystemd),
-				PX_CUDA_KERNEL_PARAM(contactsd),
+				PX_CUDA_KERNEL_PARAM(contactInfosd),
+				PX_CUDA_KERNEL_PARAM(contactNormalPensd),
 				PX_CUDA_KERNEL_PARAM(pairCountd),
 				PX_CUDA_KERNEL_PARAM(startd),
 				PX_CUDA_KERNEL_PARAM(endd)
@@ -1085,6 +1032,11 @@ namespace physx
 						PxParticleBufferFlag::eUPDATE_PHASE);
 		    }
 
+#if PX_SUPPORT_OMNI_PVD
+			if (srcBuffer.mBufferFlags & PxParticleBufferFlag::eUPDATE_PHASE)
+				srcBuffer.mOmniPvdPhasesChanged = true;
+#endif
+
 			anyDirty |= ((srcBuffer.mBufferFlags & PxParticleBufferFlag::eUPDATE_PHASE) || (srcBuffer.mBufferFlags & PxParticleBufferFlag::eUPDATE_POSITION)
 				|| (srcBuffer.mBufferFlags & PxParticleBufferFlag::eUPDATE_VELOCITY));
 		}
@@ -1100,6 +1052,11 @@ namespace physx
 					(PxParticleBufferFlag::eUPDATE_POSITION | PxParticleBufferFlag::eUPDATE_VELOCITY |
 					 PxParticleBufferFlag::eUPDATE_PHASE | PxParticleBufferFlag::eUPDATE_DIFFUSE_PARAM);
 		    }
+
+#if PX_SUPPORT_OMNI_PVD
+			if (srcBuffer.mBufferFlags & PxParticleBufferFlag::eUPDATE_PHASE)
+				srcBuffer.mOmniPvdPhasesChanged = true;
+#endif
 
 			anyDirty |= ((srcBuffer.mBufferFlags & PxParticleBufferFlag::eUPDATE_PHASE) || (srcBuffer.mBufferFlags & PxParticleBufferFlag::eUPDATE_POSITION)
 				|| (srcBuffer.mBufferFlags & PxParticleBufferFlag::eUPDATE_VELOCITY) || (srcBuffer.mBufferFlags & PxParticleBufferFlag::eUPDATE_DIFFUSE_PARAM));
@@ -1626,19 +1583,6 @@ namespace physx
 				dyParticleSystem->mFlag &= (~Dy::ParticleSystemFlag::eUPDATE_PHASE);
 			}
 
-			if (dyParticleSystem->mFlag & Dy::ParticleSystemFlag::eENABLE_GPU_DATA_SYNC)
-			{
-				PxgParticleBuffer** particleBuffers = reinterpret_cast<PxgParticleBuffer**>(dyParticleSystemCore.mParticleBuffers.begin());
-				for (PxU32 j = 0; j < dyParticleSystemCore.mParticleBuffers.size(); ++j)
-				{
-					particleBuffers[j]->allocHostBuffers();
-				}
-				PxgParticleBuffer** particleDiffuseBuffers = reinterpret_cast<PxgParticleBuffer**>(dyParticleSystemCore.mParticleDiffuseBuffers.begin());
-				for (PxU32 j = 0; j < dyParticleSystemCore.mParticleDiffuseBuffers.size(); ++j)
-				{
-					particleDiffuseBuffers[j]->allocHostBuffers();
-				}
-			}
 		}
 
 		CUdeviceptr activeParticleSystemsd = getActiveParticleSystemBuffer().getDevicePtr();

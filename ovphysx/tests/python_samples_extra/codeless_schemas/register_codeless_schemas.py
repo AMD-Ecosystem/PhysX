@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
 # NOTE: This file is included verbatim in documentation via literalinclude.
 # Tutorial marker comments below define the included range.
 
-"""Register ovphysx's codeless PhysX USD schemas with a stock usd-core runtime.
+"""Register the separately installed PhysX USD schemas with a stock usd-core runtime.
 
 This is the reference example for external authoring and validation tooling
 (OMPE-86833). It uses stock ``usd-core`` from PyPI together with
-``ovphysx``, registers the codeless PhysX USD schemas exposed by ovphysx, and
+``ovphysx``, registers the separately installed codeless PhysX USD schemas, and
 applies a PhysX API schema to a prim on an in-memory stage. It doubles as a CI
 regression test for schema exposure: it asserts on every step and exits
 non-zero on failure.
@@ -16,20 +16,19 @@ non-zero on failure.
 This runs in a fresh process, which is what makes ``RegisterPlugins()`` viable
 here. In a process that already opened a stage or queried the schema registry,
 registration is silently ineffective and ``PXR_PLUGINPATH_NAME`` must be preset
-instead; ``schema_registry_ordering.py`` covers both orderings (NVBug 6530141).
+instead. ``schema_registry_ordering.py`` covers both orderings (NVBug 6530141).
 """
 
 # [tutorial-start]
 import sys
 
 import ovphysx
+from ovphysx.samples.python_samples.schema_support import physx_schema_paths
 
 try:
     from pxr import Plug, Tf, Usd
 except ImportError:
-    # Stock usd-core has no wheel for some platforms (e.g. linux-aarch64). The
-    # codeless schemas still ship in the wheel; there is simply no stock USD
-    # runtime to register them into here, so skip rather than fail.
+    # Stock usd-core has no wheel on some platforms, including linux-aarch64.
     print("usd-core is not available on this platform; skipping codeless schema demo.")
     sys.exit(0)
 
@@ -37,17 +36,14 @@ except ImportError:
 def main() -> int:
     print("ovphysx version:", ovphysx.__version__)
 
-    # Discover the codeless PhysX USD schema packages bundled with ovphysx.
-    # Each path is a resources/ directory holding a codeless plugInfo.json
-    # (Type=resource) and generatedSchema.usda -- no compiled library.
-    schema_paths = ovphysx.codeless_schema_paths()
+    schema_paths = physx_schema_paths()
     print("Codeless schema packages:")
     for path in schema_paths:
         print("  ", path)
 
     # Register them with the stock usd-core runtime. This must happen before
-    # anything in the process opens a stage or queries USD's schema registry --
-    # that registry is built once, on first access, and a late call fails
+    # anything in the process opens a stage or queries USD's schema registry.
+    # That registry is built once, on first access, and a late call fails
     # silently. If USD may already be initialised (any DCC host), preset
     # PXR_PLUGINPATH_NAME before the process launches instead. Refer to
     # docs/physics_schemas.md.

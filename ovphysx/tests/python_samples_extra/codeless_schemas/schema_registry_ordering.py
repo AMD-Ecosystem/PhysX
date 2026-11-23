@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
 """Regression coverage for codeless schema registration ordering (NVBug 6530141).
 
@@ -7,13 +7,13 @@ USD builds its *schema* registry lazily on first access and never rebuilds it.
 ``Plug.Registry().RegisterPlugins()`` populates the *plugin* registry, a
 different structure, and nothing propagates from there into an already-built
 schema registry. So the ``register_codeless_schemas.py`` recipe only works in a
-process where nothing has touched USD yet -- which is not the case inside a DCC
+process where nothing has touched USD yet. That is not the case inside a DCC
 host, where any USD import/export or any other addon builds the registry first.
 
 The failure is silent: the registered-plugin count and ``Tf.Type.FindByName``
 both still report success, and the plugin reports ``isLoaded=True``. Only
 ``ApplyAPI`` fails. That is why ``register_codeless_schemas.py`` cannot catch
-this on its own -- it runs in a fresh process and only ever exercises the
+this on its own. It runs in a fresh process and only ever exercises the
 passing case.
 
 This script pins both halves of the documented contract, each arm in a fresh
@@ -33,6 +33,7 @@ import subprocess
 import sys
 
 import ovphysx
+from ovphysx.samples.python_samples.schema_support import physx_schema_paths
 
 # Fallback declared for this attribute in physxSchema's generatedSchema.usda.
 # Reading it back on a prim that never authored it proves the schema was
@@ -56,7 +57,7 @@ def run_arm(pre_touch: str, register: bool) -> int:
     """
     from pxr import Plug, Tf, Usd
 
-    # Hold every stage alive; an expired prim would be a bug in this test
+    # Hold every stage alive. An expired prim would be a bug in this test
     # rather than the behavior under study.
     keep = []
     if pre_touch == "stage":
@@ -69,7 +70,7 @@ def run_arm(pre_touch: str, register: bool) -> int:
     registered = 0
     if register:
         registry = Plug.Registry()
-        for path in ovphysx.codeless_schema_paths():
+        for path in physx_schema_paths():
             registered += len(registry.RegisterPlugins(str(path)))
 
     type_found = Tf.Type.FindByName("PhysxSchemaPhysxRigidBodyAPI") != Tf.Type.Unknown
@@ -117,7 +118,7 @@ def _arm(pre_touch: str, register: bool, preset_plugin_path: bool) -> dict:
     # place before the process starts. Setting it from inside is too late.
     if preset_plugin_path:
         env["PXR_PLUGINPATH_NAME"] = os.pathsep.join(
-            str(path) for path in ovphysx.codeless_schema_paths()
+            str(path) for path in physx_schema_paths()
         )
     else:
         env.pop("PXR_PLUGINPATH_NAME", None)
@@ -150,7 +151,7 @@ def _arm(pre_touch: str, register: bool, preset_plugin_path: bool) -> dict:
 def main() -> int:
     print("ovphysx version:", ovphysx.__version__)
     print("Codeless schema packages:")
-    for path in ovphysx.codeless_schema_paths():
+    for path in physx_schema_paths():
         print("  ", path)
 
     print("\n--- RegisterPlugins() before any USD access: supported ---")
@@ -166,7 +167,7 @@ def main() -> int:
     # These pin OpenUSD's registry lifecycle, not an ovphysx defect: a late
     # RegisterPlugins() cannot repair an already-populated schema registry, and
     # it reports success while doing so. If an arm here ever starts applying,
-    # OpenUSD changed its lifecycle -- revisit the ordering warning in
+    # OpenUSD changed its lifecycle. Revisit the ordering warning in
     # docs/physics_schemas.md before relaxing the assert.
     for pre_touch in ("registry", "stage"):
         late = _arm(pre_touch, register=True, preset_plugin_path=False)

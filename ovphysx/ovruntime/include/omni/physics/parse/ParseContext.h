@@ -1,12 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 /**
+ * @implements REQ-PARSE-PARALLEL-001
+ * @covers AC-1 AC-2 AC-3 AC-5
+ *
  * @implements REQ-PARSE-CORE-001
  * @covers AC-1
  *
  * @implements REQ-PARSE-CORE-003
  * @covers AC-5
+ *
+ * @implements REQ-PARSE-JOINT-005
+ * @covers AC-1 AC-2
  */
 
 #pragma once
@@ -15,8 +21,10 @@
 #include "Handles.h"
 #include "Descriptors.h"
 #include "IPhysicsSource.h"
+#include "KnownTokens.h"
 
 #include <map>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -128,10 +136,28 @@ using DeformableCollisionFilterHistoryMap = std::unordered_multimap<ObjectKey, O
 using EnvIdMap = std::unordered_map<TokenId, uint32_t, TokenId::Hash>;
 
 // ---------------------------------------------------------------------------
+// JointSchemaPresence: stage-wide "does any prim apply this joint sub-schema" flags
+// (exact schema membership). A backend that knows the answer sets them so parseJoint
+// skips the per-joint hasSchema probe; all default to true (USD/native unchanged).
+// ---------------------------------------------------------------------------
+
+struct JointSchemaPresence
+{
+    bool physxLimit = true;         // PhysxLimitAPI:<instance>
+    bool physxJointAxis = true;     // PhysxJointAxisAPI:<instance>
+    bool drivePerfEnvelope = true;  // PhysxDrivePerformanceEnvelopeAPI:<instance>
+    bool jointState = true;         // PhysicsJointStateAPI:<instance>
+    bool physicsDrive = true;       // PhysicsDriveAPI:<instance> (walker-side)
+    bool physxDistanceJoint = true; // PhysxPhysicsDistanceJointAPI (concrete)
+};
+
+// ---------------------------------------------------------------------------
 // ParseContext — parse-time state container.
 // Owns the ObjectDatabase, collision group maps, deformable history maps,
 // and environment-ID tables. All keyed by ObjectKey/TokenId (USD-free).
 // ---------------------------------------------------------------------------
+
+struct JointReadTokens;
 
 class ParseContext
 {
@@ -143,6 +169,29 @@ public:
     const IPhysicsSource& source() const { return mSource; }
     SourceUnits units() const { return mUnits; }
 
+    // Lazily resolved because some short-lived contexts never parse a concept
+    // that consumes the well-known vocabulary. References the source's own batch
+    // when IPhysicsSource::knownTokens() provides one (no copy, no intern);
+    // otherwise interns once into mKnownTokens (REQ-LOAD-TOKENS-001 AC-5).
+    const KnownTokens& knownTokens();
+    const JointReadTokens& jointReadTokens();
+
+    // Seed from a batch already interned for the same source (e.g. the attach-scoped
+    // AttachedStage::getKnownTokens()) so a per-object short-lived context does not
+    // re-intern the whole vocabulary (REQ-LOAD-TOKENS-001). When the source caches
+    // its own batch that one is referenced instead -- same source, same ids -- so
+    // there is exactly one KnownTokens instance per such source.
+    void adoptKnownTokens(const KnownTokens& tok)
+    {
+        if (const KnownTokens* cached = mSource.knownTokens())
+        {
+            mKnownTokensRef = cached;
+            return;
+        }
+        mKnownTokens = tok;
+        mKnownTokensRef = &mKnownTokens;
+    }
+
     // Allocator the parse-lib `parseX` entry points (and the USD walker)
     // use to mint descriptor allocations. Supplied by the consumer at
     // ctor time.
@@ -153,6 +202,10 @@ public:
     // /physics/outputVelocitiesLocalSpace). Per-prim metadata overrides this.
     bool outputVelocitiesLocalSpaceDefault() const { return mOutputVelocitiesLocalSpaceDefault; }
     void setOutputVelocitiesLocalSpaceDefault(bool v) { mOutputVelocitiesLocalSpaceDefault = v; }
+
+    // --- Joint sub-schema stage presence (perf gate; see JointSchemaPresence) ---
+    JointSchemaPresence& jointSchemaPresence() { return mJointSchemaPresence; }
+    const JointSchemaPresence& jointSchemaPresence() const { return mJointSchemaPresence; }
 
     // --- Object database ---
     ObjectDatabase& objects() { return mObjects; }
@@ -211,6 +264,14 @@ private:
     uint32_t mEnvIdCounter = 0;
     EnvIdMap mEnvIdMap;
     bool mOutputVelocitiesLocalSpaceDefault = false;
+    JointSchemaPresence mJointSchemaPresence;
+    std::shared_ptr<JointReadTokens> mJointReadTokens;
+    // Fallback storage, used only for sources whose knownTokens() is nullptr.
+    KnownTokens mKnownTokens;
+    // The resolved batch: mSource.knownTokens() or &mKnownTokens; nullptr until first use.
+    // A pointer into the source is safe: the source outlives every ParseContext built on
+    // it (mSource is a reference) and its batch lives as long as the source.
+    const KnownTokens* mKnownTokensRef = nullptr;
 };
 
 } // namespace omni::physics::parse

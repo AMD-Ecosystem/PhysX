@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "ScBodySim.h"
 #include "ScShapeSim.h"
@@ -377,6 +354,8 @@ void BodySim::postActorFlagChange(PxU32 oldFlags, PxU32 newFlags)
 
 		if(mArticulation)
 			mArticulation->setArticulationDirty(ArticulationDirtyFlag::eDIRTY_LINKS); // forces an update in PxgSimulationController::updateGpuArticulationSim
+		else
+			mScene.gpu_updateBodySim(*this);
 	}
 }
 
@@ -476,6 +455,79 @@ void BodySim::deactivate()
 
 	// reset speculative CCD bit map if speculative CCD flag is on
 	if(core.getFlags() & PxRigidBodyFlag::eENABLE_SPECULATIVE_CCD)
+		removeFromSpeculativeCCDMap();
+}
+
+PxU32 BodySim::deactivateThreadSafe(PxU32& activeListIndex)
+{
+	PX_ASSERT(isActive());
+	activeListIndex = mActiveListIndex;
+	mActiveListIndex = SC_NOT_IN_ACTIVE_LIST_INDEX;
+
+	PxU32 work = 0;
+	if(readInternalFlag(BF_IS_COMPOUND_RIGID))
+		work |= eCOMPOUND;
+	if(readInternalFlag(BF_HAS_NON_IG_INTERACTIONS))
+		work |= eDEACTIVATE_INTERACTIONS;
+
+	BodyCore& core = getBodyCore();
+
+	PX_ASSERT((!isKinematic()) || notInScene() || !readInternalFlag(BF_KINEMATIC_MOVED));	// kinematics should only get deactivated when no target is set.
+	if(!readInternalFlag(BF_ON_DEATHROW))
+	{
+		PX_ASSERT(core.getWakeCounter() == 0.0f);
+		const PxVec3 zero(0.0f);
+		core.setLinearVelocityInternal(zero);
+		core.setAngularVelocityInternal(zero);
+
+		setForcesToDefaults(!core.getCore().disableGravity);
+	}
+
+	if(!isArticulationLink() && mScene.needsSleepNotifications())	// Articulations have their own sleep logic.
+		work |= eSLEEP_NOTIFICATION;
+
+	const PxU32 flags = core.getFlags();
+	if(flags & PxRigidBodyFlag::eENABLE_POSE_INTEGRATION_PREVIEW)
+		work |= ePOSE_PREVIEW;
+	if(flags & PxRigidBodyFlag::eENABLE_SPECULATIVE_CCD)
+		work |= eSPECULATIVE_CCD;
+
+	PxU32 nbElems = getNbElements();
+	ElementSim*const* elems = getElements();
+	while(nbElems--)
+	{
+		if(static_cast<const ShapeSim*>(*elems++)->getSqBoundsId() != PX_INVALID_U32)
+		{
+			work |= eSQ_BOUNDS;
+			break;
+		}
+	}
+	return work;
+}
+
+void BodySim::finishDeactivation(PxU32 work)
+{
+	PX_ASSERT(!isActive());
+
+	if(work & eCOMPOUND)
+		mScene.removeFromActiveCompoundBodyList(*this);
+
+	if(work & eDEACTIVATE_INTERACTIONS)
+		deactivateInteractions(*this);
+
+	if(work & eSLEEP_NOTIFICATION)
+		mScene.onBodySleep(this);
+
+	if(work & ePOSE_PREVIEW)
+	{
+		PX_ASSERT(mScene.isInPosePreviewList(*this));
+		mScene.removeFromPosePreviewList(*this);
+	}
+
+	if(work & eSQ_BOUNDS)
+		destroySqBounds();
+
+	if(work & eSPECULATIVE_CCD)
 		removeFromSpeculativeCCDMap();
 }
 
@@ -718,12 +770,11 @@ bool BodySim::updateForces(PxReal dt, PxsRigidBody** updatedBodySims, PxU32* upd
 			//   velocity, causing the force effect to cancel out in the delta.
 			// - With external accelerations, the GPU integrates forces during simulation, so
 			//   velocity-delta correctly captures: accel = (curVel - prevVel) / dt = gravity + force/mass
-			// Note: Only enable for GPU when eENABLE_BODY_ACCELERATIONS is set, otherwise use the
-			// original updateVelocities path to avoid breaking eRETAIN_ACCELERATIONS behavior.
-			const bool useExternalAccelerations = 
-				(mScene.getFlags() & PxSceneFlag::eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS) ||
+
+			const bool useExternalAccelerations =
+				(mScene.getSolverType() == PxSolverType::eTGS && (mScene.getFlags() & PxSceneFlag::eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS)) ||
 				(mScene.isUsingGpuDynamics() && (mScene.getFlags() & PxSceneFlag::eENABLE_BODY_ACCELERATIONS));
-			
+
 			if (useExternalAccelerations)
 			{
 				if (linVelDt != PxVec3(0.0f) || angVelDt != PxVec3(0.0f)) 
@@ -731,6 +782,40 @@ bool BodySim::updateForces(PxReal dt, PxsRigidBody** updatedBodySims, PxU32* upd
 					const PxReal invDt = 1.f / dt;
 					PxsRigidBodyExternalAcceleration acc(linVelDt * invDt, angVelDt * invDt);
 					externalAccelerations->setValue(acc, getNodeIndex().index(), maxNumExternalAccelerations);
+				}
+
+				if (mLLBody.mCore->mFlags & PxRigidBodyFlag::eRETAIN_ACCELERATIONS)
+				{
+					if (velDirty)
+					{
+#if PX_DEBUG
+						if (!accDirty)
+						{
+							PX_ASSERT(velmod->getLinearVelModPerSec().isZero() && velmod->getAngularVelModPerSec().isZero());
+							// if VMF_ACC_DIRTY is not raised, then acceleration has to be zero when eRETAIN_ACCELERATIONS
+							// is set because the else-statement will clear the flag if acc is zero.
+						}
+#endif
+						// if there has not been any acceleration/force applied ever (or has been cleared) but an
+						// impulse/deltaVelocity is applied, then updateForces() has to run again next step to
+						// ensure the external acceleration value gets set to zero (assuming no more impulse or
+						// deltaVelocity is applied) and is uploaded to the GPU. Applied impulse/deltaVelocity
+						// should last for one step only. If the next step does not update forces, the applied
+						// impulse or deltaVelocity will stay active. CPU does in theory not need this because the
+						// accelerations get cleared all the time but clearing the flag in the else-statement also
+						// avoids running the updateForces() code again and again for no good reason.
+						// The if-statement does not check for (!accDirty) because it does not hurt to raise a flag
+						// that has been raised already.
+						raiseVelocityModFlag(VMF_ACC_DIRTY);
+					}
+					else if (velmod->getLinearVelModPerSec().isZero() && velmod->getAngularVelModPerSec().isZero())
+					{
+						// this is the counterpart to the logic described further above. If this is the frame after
+						// VMF_ACC_DIRTY has been raised but no acceleration/force or impulse/deltaVelocity has
+						// been applied (or maybe has been cleared), then the flag should be cleared again even with
+						// eRETAIN_ACCELERATIONS on because it will be pointless to upload zero to GPU again and again.
+						clearVelocityModFlag(VMF_ACC_DIRTY);
+					}
 				}
 			}
 			else

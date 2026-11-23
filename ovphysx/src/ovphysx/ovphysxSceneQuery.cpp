@@ -1,20 +1,36 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 
 // Scene query API: raycast, sweep, and overlap against the physics scene.
 // Results are stored in an internal hit buffer per instance.
 
+/**
+ * @implements REQ-CAPI-SCENEQUERY-001
+ * @covers AC-1 AC-2 AC-3 AC-4
+ *
+ * @implements REQ-CAPI-PROFILER-001
+ * @covers AC-5
+ *
+ * @implements REQ-CAPI-LANE-001
+ * @covers AC-1
+ *
+ * @implements REQ-CAPI-REENTRY-001
+ * @covers AC-2
+ */
+
 #include "ovphysx/ovphysx.h"
+#include "internal/Profiling.h"
 #include "internal/sdk/ovphysxSDK.hpp"
-#include "internal/sidecar/ovphysxInternalInterop.h"  // g_sidecarEncodeSdfPath
 #include <omni/physx/PhysXRuntime.h>
+#include <omni/physx/IPhysx.h>
 
 #include <omni/physx/IPhysxSceneQuery.h>
 #include <carb/Framework.h>
 
 #include <cmath>
 #include <cstddef>
+#include <string>
 
 static_assert(sizeof(ovphysx_scene_query_hit_t) == 64,
     "ovphysx_scene_query_hit_t size changed -- update ctypes mirror in _bindings.py");
@@ -27,29 +43,19 @@ static_assert(offsetof(ovphysx_scene_query_hit_t, distance) == 44, "distance off
 static_assert(offsetof(ovphysx_scene_query_hit_t, face_index) == 48, "face_index offset");
 static_assert(offsetof(ovphysx_scene_query_hit_t, material) == 56, "material offset");
 
-// Sidecar encode-sdf-path atomic owned here next to its consumer; loader
-// writes it during loadInternalSidecar() via the extern in
-// ovphysxInternalInterop.h. (g_sidecarGetPhysXPtr lives in ovphysxPhysXInterop.cpp.)
-std::atomic<OvphysxSidecarEncodeSdfPathFn> g_sidecarEncodeSdfPath{nullptr};
+// IPhysxSceneQuery's hit-result identity fields are opaque
+// omni::physics::parse::ObjectKey values (ADR-0019), so shape-geometry prim paths
+// are resolved via IPhysx::resolveObjectKey (see encodeShapePrimPath below).
 
 namespace {
-
-// SdfPath encoding is resolved in the internal sidecar (which links USD) and
-// published by the sidecar loader via g_sidecarEncodeSdfPath.
-
-uint64_t encodeSdfPath(const char* prim_path)
-{
-    auto fn = g_sidecarEncodeSdfPath.load(std::memory_order_acquire);
-    return fn ? fn(prim_path) : 0;
-}
 
 // ---- Hit conversion helpers ----
 
 ovphysx_scene_query_hit_t convertLocationHit(const omni::physx::SceneQueryHitLocation& src)
 {
     ovphysx_scene_query_hit_t h{};
-    h.collision   = src.collision;
-    h.rigid_body  = src.rigidBody;
+    h.collision   = src.collision.handle;
+    h.rigid_body  = src.rigidBody.handle;
     h.proto_index = src.protoIndex;
     h.normal[0]   = src.normal.x;
     h.normal[1]   = src.normal.y;
@@ -59,54 +65,60 @@ ovphysx_scene_query_hit_t convertLocationHit(const omni::physx::SceneQueryHitLoc
     h.position[2] = src.position.z;
     h.distance    = src.distance;
     h.face_index  = src.faceIndex;
-    h.material    = src.material;
+    h.material    = src.material.handle;
     return h;
 }
 
 ovphysx_scene_query_hit_t convertOverlapHit(const omni::physx::OverlapHit& src)
 {
     ovphysx_scene_query_hit_t h{};
-    h.collision   = src.collision;
-    h.rigid_body  = src.rigidBody;
+    h.collision   = src.collision.handle;
+    h.rigid_body  = src.rigidBody.handle;
     h.proto_index = src.protoIndex;
     return h;
 }
 
 // ---- Common validation ----
 
-// Validate a SHAPE geometry's prim_path and encode it via the sidecar.
-// Returns success() with out_encoded set on success, or a specific error result.
-ovphysx_result_t encodeShapePrimPath(const ovphysx_string_t& prim_path, uint64_t& out_encoded)
+// Validate a SHAPE geometry's prim_path and resolve it to an ObjectKey via IPhysx.
+ovphysx_result_t encodeShapePrimPath(omni::physics::AttachHandle attach, const ovphysx_string_t& prim_path, omni::physics::parse::ObjectKey& out_key)
 {
     if (!isValid(prim_path))
         return set_error(OVPHYSX_API_INVALID_ARGUMENT, "shape prim_path is NULL or empty");
     if (hasEmbeddedNul(prim_path))
         return set_error(OVPHYSX_API_INVALID_ARGUMENT, "shape prim_path contains an embedded NUL byte");
 
+    omni::physx::IPhysx* physx = omni::physx::runtime::tryGetPhysxInterface();
+    if (!physx)
+        return set_error(OVPHYSX_API_ERROR, "IPhysx interface not available");
+
     const std::string prim_path_str = toStdString(prim_path);
-    out_encoded = encodeSdfPath(prim_path_str.c_str());
-    if (out_encoded == 0)
-        return set_error(OVPHYSX_API_ERROR, "failed to encode prim path (internal sidecar not loaded?)");
+    out_key = physx->resolveObjectKey(attach, prim_path_str.c_str());
+    if (!out_key.valid())
+        return set_error(OVPHYSX_API_ERROR, "failed to resolve prim path to an object");
     return success();
 }
 
+// Takes the instance lane into `lane`; the caller keeps it for the whole query.
 ovphysx_result_t validateSceneQueryArgs(
-    ovphysx_handle_t handle,
+    ovphysx_instance_handle_t handle,
     const ovphysx_scene_query_hit_t** out_hits,
     uint32_t* out_count,
-    InstanceData** out_instance)
+    InstanceData** out_instance,
+    ovphysx::InstanceLane& lane)
 {
     if (!out_hits || !out_count)
         return set_error(OVPHYSX_API_INVALID_ARGUMENT, "output pointer is NULL");
     *out_hits = nullptr;
     *out_count = 0;
 
-    omni_sdk_physx_wait_all_pending_internal(handle);
+    if (lane.acquire(handle) == OVPHYSX_API_INVALID_STATE)
+        return {OVPHYSX_API_INVALID_STATE};
 
     std::shared_lock<std::shared_mutex> map_lock(g_instances_mutex);
     InstanceData* instance = get_instance_ptr(handle);
-    if (!instance || instance->attachedStageId == 0)
-        return set_error(OVPHYSX_API_ERROR, "no USD stage loaded");
+    if (!instance || !instance->ovstage_attached)
+        return set_error(OVPHYSX_API_ERROR, "no physics stage attached");
 
     *out_instance = instance;
     return success();
@@ -123,7 +135,7 @@ omni::physx::IPhysxSceneQuery* acquireSceneQuery()
 // ---- Raycast ----
 
 OVPHYSX_API ovphysx_result_t ovphysx_raycast(
-    ovphysx_handle_t handle,
+    ovphysx_instance_handle_t handle,
     const float origin[3],
     const float direction[3],
     float distance,
@@ -132,9 +144,11 @@ OVPHYSX_API ovphysx_result_t ovphysx_raycast(
     const ovphysx_scene_query_hit_t** out_hits,
     uint32_t* out_count)
 {
+    OVPHYSX_API_PROFILE_ZONE(raycast);
     InstanceData* instance = nullptr;
+    ovphysx::InstanceLane lane;
     {
-        auto check = validateSceneQueryArgs(handle, out_hits, out_count, &instance);
+        auto check = validateSceneQueryArgs(handle, out_hits, out_count, &instance, lane);
         if (check.status != OVPHYSX_API_SUCCESS)
             return check;
     }
@@ -160,13 +174,13 @@ OVPHYSX_API ovphysx_result_t ovphysx_raycast(
     case OVPHYSX_SCENE_QUERY_MODE_CLOSEST:
     {
         omni::physx::RaycastHit hit{};
-        if (sq->raycastClosest(o, d, distance, hit, both_sides))
+        if (sq->raycastClosest(instance->attachHandle, o, d, distance, hit, both_sides))
             buf.push_back(convertLocationHit(hit));
         break;
     }
     case OVPHYSX_SCENE_QUERY_MODE_ANY:
     {
-        if (sq->raycastAny(o, d, distance, both_sides))
+        if (sq->raycastAny(instance->attachHandle, o, d, distance, both_sides))
         {
             ovphysx_scene_query_hit_t h{};
             buf.push_back(h);
@@ -175,7 +189,7 @@ OVPHYSX_API ovphysx_result_t ovphysx_raycast(
     }
     case OVPHYSX_SCENE_QUERY_MODE_ALL:
     {
-        sq->raycastAll(o, d, distance,
+        sq->raycastAll(instance->attachHandle, o, d, distance,
             [&buf](const omni::physx::RaycastHit& hit) -> bool {
                 buf.push_back(convertLocationHit(hit));
                 return true;
@@ -196,7 +210,7 @@ OVPHYSX_API ovphysx_result_t ovphysx_raycast(
 // ---- Sweep ----
 
 OVPHYSX_API ovphysx_result_t ovphysx_sweep(
-    ovphysx_handle_t handle,
+    ovphysx_instance_handle_t handle,
     const ovphysx_scene_query_geometry_desc_t* geometry,
     const float direction[3],
     float distance,
@@ -205,9 +219,11 @@ OVPHYSX_API ovphysx_result_t ovphysx_sweep(
     const ovphysx_scene_query_hit_t** out_hits,
     uint32_t* out_count)
 {
+    OVPHYSX_API_PROFILE_ZONE(sweep);
     InstanceData* instance = nullptr;
+    ovphysx::InstanceLane lane;
     {
-        auto check = validateSceneQueryArgs(handle, out_hits, out_count, &instance);
+        auto check = validateSceneQueryArgs(handle, out_hits, out_count, &instance, lane);
         if (check.status != OVPHYSX_API_SUCCESS)
             return check;
     }
@@ -239,13 +255,13 @@ OVPHYSX_API ovphysx_result_t ovphysx_sweep(
         case OVPHYSX_SCENE_QUERY_MODE_CLOSEST:
         {
             omni::physx::SweepHit hit{};
-            if (sq->sweepSphereClosest(r, pos, dir, distance, hit, both_sides))
+            if (sq->sweepSphereClosest(instance->attachHandle, r, pos, dir, distance, hit, both_sides))
                 buf.push_back(convertLocationHit(hit));
             break;
         }
         case OVPHYSX_SCENE_QUERY_MODE_ANY:
         {
-            if (sq->sweepSphereAny(r, pos, dir, distance, both_sides))
+            if (sq->sweepSphereAny(instance->attachHandle, r, pos, dir, distance, both_sides))
             {
                 ovphysx_scene_query_hit_t h{};
                 buf.push_back(h);
@@ -254,7 +270,7 @@ OVPHYSX_API ovphysx_result_t ovphysx_sweep(
         }
         case OVPHYSX_SCENE_QUERY_MODE_ALL:
         {
-            sq->sweepSphereAll(r, pos, dir, distance,
+            sq->sweepSphereAll(instance->attachHandle, r, pos, dir, distance,
                 [&buf](const omni::physx::SweepHit& hit) -> bool {
                     buf.push_back(convertLocationHit(hit));
                     return true;
@@ -284,13 +300,13 @@ OVPHYSX_API ovphysx_result_t ovphysx_sweep(
         case OVPHYSX_SCENE_QUERY_MODE_CLOSEST:
         {
             omni::physx::SweepHit hit{};
-            if (sq->sweepBoxClosest(halfExt, pos, rot, dir, distance, hit, both_sides))
+            if (sq->sweepBoxClosest(instance->attachHandle, halfExt, pos, rot, dir, distance, hit, both_sides))
                 buf.push_back(convertLocationHit(hit));
             break;
         }
         case OVPHYSX_SCENE_QUERY_MODE_ANY:
         {
-            if (sq->sweepBoxAny(halfExt, pos, rot, dir, distance, both_sides))
+            if (sq->sweepBoxAny(instance->attachHandle, halfExt, pos, rot, dir, distance, both_sides))
             {
                 ovphysx_scene_query_hit_t h{};
                 buf.push_back(h);
@@ -299,7 +315,7 @@ OVPHYSX_API ovphysx_result_t ovphysx_sweep(
         }
         case OVPHYSX_SCENE_QUERY_MODE_ALL:
         {
-            sq->sweepBoxAll(halfExt, pos, rot, dir, distance,
+            sq->sweepBoxAll(instance->attachHandle, halfExt, pos, rot, dir, distance,
                 [&buf](const omni::physx::SweepHit& hit) -> bool {
                     buf.push_back(convertLocationHit(hit));
                     return true;
@@ -314,8 +330,8 @@ OVPHYSX_API ovphysx_result_t ovphysx_sweep(
     }
     case OVPHYSX_SCENE_QUERY_GEOMETRY_SHAPE:
     {
-        uint64_t encoded = 0;
-        auto shape_check = encodeShapePrimPath(geometry->shape.prim_path, encoded);
+        omni::physics::parse::ObjectKey encoded;
+        auto shape_check = encodeShapePrimPath(instance->attachHandle, geometry->shape.prim_path, encoded);
         if (shape_check.status != OVPHYSX_API_SUCCESS)
             return shape_check;
 
@@ -324,13 +340,13 @@ OVPHYSX_API ovphysx_result_t ovphysx_sweep(
         case OVPHYSX_SCENE_QUERY_MODE_CLOSEST:
         {
             omni::physx::SweepHit hit{};
-            if (sq->sweepShapeClosest(encoded, dir, distance, hit, both_sides))
+            if (sq->sweepShapeClosest(instance->attachHandle, encoded, dir, distance, hit, both_sides))
                 buf.push_back(convertLocationHit(hit));
             break;
         }
         case OVPHYSX_SCENE_QUERY_MODE_ANY:
         {
-            if (sq->sweepShapeAny(encoded, dir, distance, both_sides))
+            if (sq->sweepShapeAny(instance->attachHandle, encoded, dir, distance, both_sides))
             {
                 ovphysx_scene_query_hit_t h{};
                 buf.push_back(h);
@@ -339,7 +355,7 @@ OVPHYSX_API ovphysx_result_t ovphysx_sweep(
         }
         case OVPHYSX_SCENE_QUERY_MODE_ALL:
         {
-            sq->sweepShapeAll(encoded, dir, distance,
+            sq->sweepShapeAll(instance->attachHandle, encoded, dir, distance,
                 [&buf](const omni::physx::SweepHit& hit) -> bool {
                     buf.push_back(convertLocationHit(hit));
                     return true;
@@ -365,15 +381,17 @@ OVPHYSX_API ovphysx_result_t ovphysx_sweep(
 // ---- Overlap ----
 
 OVPHYSX_API ovphysx_result_t ovphysx_overlap(
-    ovphysx_handle_t handle,
+    ovphysx_instance_handle_t handle,
     const ovphysx_scene_query_geometry_desc_t* geometry,
     ovphysx_scene_query_mode_t mode,
     const ovphysx_scene_query_hit_t** out_hits,
     uint32_t* out_count)
 {
+    OVPHYSX_API_PROFILE_ZONE(overlap);
     InstanceData* instance = nullptr;
+    ovphysx::InstanceLane lane;
     {
-        auto check = validateSceneQueryArgs(handle, out_hits, out_count, &instance);
+        auto check = validateSceneQueryArgs(handle, out_hits, out_count, &instance, lane);
         if (check.status != OVPHYSX_API_SUCCESS)
             return check;
     }
@@ -412,7 +430,7 @@ OVPHYSX_API ovphysx_result_t ovphysx_overlap(
                          geometry->sphere.position[2]};
         if (anyHit)
         {
-            if (sq->overlapSphereAny(r, pos))
+            if (sq->overlapSphereAny(instance->attachHandle, r, pos))
             {
                 ovphysx_scene_query_hit_t h{};
                 buf.push_back(h);
@@ -420,7 +438,7 @@ OVPHYSX_API ovphysx_result_t ovphysx_overlap(
         }
         else
         {
-            sq->overlapSphere(r, pos, overlapReport, false);
+            sq->overlapSphere(instance->attachHandle, r, pos, overlapReport, false);
         }
         break;
     }
@@ -438,7 +456,7 @@ OVPHYSX_API ovphysx_result_t ovphysx_overlap(
                          geometry->box.rotation[3]};
         if (anyHit)
         {
-            if (sq->overlapBoxAny(halfExt, pos, rot))
+            if (sq->overlapBoxAny(instance->attachHandle, halfExt, pos, rot))
             {
                 ovphysx_scene_query_hit_t h{};
                 buf.push_back(h);
@@ -446,20 +464,20 @@ OVPHYSX_API ovphysx_result_t ovphysx_overlap(
         }
         else
         {
-            sq->overlapBox(halfExt, pos, rot, overlapReport, false);
+            sq->overlapBox(instance->attachHandle, halfExt, pos, rot, overlapReport, false);
         }
         break;
     }
     case OVPHYSX_SCENE_QUERY_GEOMETRY_SHAPE:
     {
-        uint64_t encoded = 0;
-        auto shape_check = encodeShapePrimPath(geometry->shape.prim_path, encoded);
+        omni::physics::parse::ObjectKey encoded;
+        auto shape_check = encodeShapePrimPath(instance->attachHandle, geometry->shape.prim_path, encoded);
         if (shape_check.status != OVPHYSX_API_SUCCESS)
             return shape_check;
 
         if (anyHit)
         {
-            if (sq->overlapShapeAny(encoded))
+            if (sq->overlapShapeAny(instance->attachHandle, encoded))
             {
                 ovphysx_scene_query_hit_t h{};
                 buf.push_back(h);
@@ -467,7 +485,7 @@ OVPHYSX_API ovphysx_result_t ovphysx_overlap(
         }
         else
         {
-            sq->overlapShape(encoded, overlapReport, false);
+            sq->overlapShape(instance->attachHandle, encoded, overlapReport, false);
         }
         break;
     }
@@ -477,5 +495,62 @@ OVPHYSX_API ovphysx_result_t ovphysx_overlap(
 
     *out_hits = buf.data();
     *out_count = static_cast<uint32_t>(buf.size());
+    return success();
+}
+
+
+// ---- Hit identity resolution ----
+
+OVPHYSX_API ovphysx_result_t ovphysx_scene_query_get_paths_from_ids(
+    ovphysx_instance_handle_t handle,
+    const uint64_t* ids,
+    uint32_t id_count,
+    ovphysx_string_t* out_paths,
+    uint32_t max_paths,
+    uint32_t* out_count)
+{
+    OVPHYSX_API_PROFILE_ZONE(scene_query_get_paths_from_ids);
+    if (!out_count)
+        return set_error(OVPHYSX_API_INVALID_ARGUMENT, "out_count is NULL");
+    *out_count = 0;
+
+    if (!ids && id_count > 0)
+        return set_error(OVPHYSX_API_INVALID_ARGUMENT, "ids is NULL");
+    if (!out_paths && max_paths > 0)
+        return set_error(OVPHYSX_API_INVALID_ARGUMENT, "out_paths is NULL");
+
+    ovphysx::InstanceLane lane;
+    if (lane.acquire(handle) == OVPHYSX_API_INVALID_STATE)
+        return {OVPHYSX_API_INVALID_STATE};
+
+    std::shared_lock<std::shared_mutex> map_lock(g_instances_mutex);
+    InstanceData* instance = get_instance_ptr(handle);
+    if (!instance)
+        return set_error(OVPHYSX_API_ERROR, "invalid handle");
+
+    omni::physx::IPhysx* physx = omni::physx::runtime::tryGetPhysxInterface();
+    if (!physx)
+        return set_error(OVPHYSX_API_ERROR, "IPhysx interface not available");
+
+    // objectKeyToPath returns a string owned by the currently attached source,
+    // empty when the key is invalid or no source is attached. The pointer stays
+    // valid until that source is torn down, so unlike
+    // ovphysx_contact_binding_get_other_actor_paths_from_ids no per-call cache
+    // is needed.
+    const uint32_t toWrite = (id_count < max_paths) ? id_count : max_paths;
+    for (uint32_t i = 0; i < toWrite; ++i)
+    {
+        const omni::physics::parse::ObjectKey key{ ids[i] };
+        out_paths[i] = ovphysx_cstr(physx->objectKeyToPath(instance->attachHandle, key));
+    }
+
+    *out_count = id_count; // total needed, only toWrite entries are written
+    if (id_count > max_paths)
+    {
+        return set_error(
+            OVPHYSX_API_BUFFER_TOO_SMALL,
+            "Scene-query path buffer too small: " + std::to_string(id_count) +
+                " paths required but max_paths is " + std::to_string(max_paths));
+    }
     return success();
 }

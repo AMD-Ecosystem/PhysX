@@ -1,5 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+/** @implements REQ-PARSE-FEED-006
+ * @covers AC-1
+ *
+ * @implements REQ-SIM-OVSTAGE-WRITEAPPLY-001
+ * @covers AC-20
+ */
 
 #pragma once
 
@@ -48,6 +55,22 @@ struct ColumnView
     int         device = -1;
     size_t      count  = 0;
     const void* data   = nullptr;
+    //! Producer-ordering handles for a device column (`device >= 0`), mirroring
+    //! ovstage's `ovstage_cuda_sync_t { stream, wait_event }` as opaque values so
+    //! this parse interface stays CUDA-free. A consumer that borrows the device
+    //! buffer must wait on `deviceWaitEvent` (on its own stream) before reading
+    //! it, so its work is ordered behind the producer that filled the column.
+    //! Both `0` ⇒ host-resident or already-synchronized data (no wait needed).
+    uint64_t    deviceStream    = 0;
+    uint64_t    deviceWaitEvent = 0;
+    //! Optional HOST indirection array of `count` indices into `data`'s rows. When non-null, logical
+    //! row `i`'s element is at `data[rowMap[i]]` (so `data` addresses a shared buffer of more than
+    //! `count` rows); when null, `data` is the ordinary `count` contiguous elements. It lets a feed that
+    //! cannot compact a device buffer itself (it holds no device context) deliver a SELECTION of a shared
+    //! device column without a copy — a device consumer uploads `rowMap` and gathers through it. The
+    //! array, like `data`, is valid only for the OnChangeFn callback. Stays CUDA-free: it is plain host
+    //! indices, not a device pointer.
+    const uint32_t* rowMap = nullptr;
 };
 
 /// @brief One change group, delivered per (objectType, property).
@@ -74,10 +97,24 @@ struct ChangeBatch
     const ColumnView* changedIndices = nullptr; //!< sparse gather indices, or nullptr
     const ColumnView* mask           = nullptr; //!< dense bitmask, or nullptr (exclusive with changedIndices)
     uint64_t          userData       = 0;     //!< value passed at registration
+    //! Ragged (variable-length-per-prim) values, as for a deformable's per-vertex points. When
+    //! non-null, this points at `numChanges + 1` CSR offsets measured in ELEMENTS of `values.type`
+    //! (e.g. vec3 rows): prim `i` owns `values[valueRowOffsets[i] : valueRowOffsets[i + 1]]`, and the
+    //! final offset equals `values.count`. Null means fixed-width rows (the ordinary case). A consumer
+    //! that does not support ragged rows MUST reject a non-null offset table -- reading `values` as a
+    //! flat, fixed-width column would misassociate values with prims once the row widths vary.
+    const uint32_t*   valueRowOffsets = nullptr;
 };
 
 /// @brief Callback invoked by the feed for each matching change group.
-using OnChangeFn = std::function<void(const ChangeBatch&)>;
+///
+/// Returns whether the batch was consumed. `true` (the ordinary outcome — applied, fell back, or a
+/// no-op) lets a pull feed advance its cursor past the batch. `false` means the consumer committed
+/// part of the batch and then failed partway: the batch was neither fully applied nor safely
+/// skippable, so a pull feed must HOLD its cursor at this batch (not advance the external ordinal)
+/// so the same range is redelivered on the next drain. A push feed (USD), which buffers its own
+/// window and has no external ordinal to hold, ignores the result.
+using OnChangeFn = std::function<bool(const ChangeBatch&)>;
 
 /// @brief Callback invoked once at the end of each delivery group, after all
 /// of the group's `OnChangeFn`s have fired: for a push backend (USD) at the
@@ -127,8 +164,22 @@ public:
     /// @brief Process the changes within an explicit producer-supplied version
     /// range [from, to] (pull backends whose discovery is version/ordinal keyed,
     /// e.g. ovstage's range read). The default ignores the range and falls back
-    /// to drain() — correct for push backends (USD), which buffer their own
-    /// window. Returns false if the range could not be served (caller re-attaches).
+    /// to drain() — correct for push backends (USD), which buffer their own window.
+    ///
+    /// `false` carries TWO meanings with OPPOSITE recoveries, and the return alone
+    /// does not distinguish them:
+    ///   - HOLD — a consumer committed part of a batch and then failed (an OnChangeFn
+    ///     returned false). The range is still valid; the caller must hold its cursor
+    ///     and REDELIVER the same range on the next drain (retry).
+    ///   - UNSERVABLE — the range cannot be served: `from` predates the retained-history
+    ///     frontier, or a read/enqueue/fetch failed. Retrying the same range never
+    ///     succeeds; the caller must RE-ATTACH (re-parse from a fresh sealed ordinal).
+    /// The caller distinguishes them out of band — e.g. probe whether `from` is within
+    /// retained history, or re-attach after N consecutive failures. Folding the
+    /// distinction into the result (an {Ok, Hold, Unservable} status) so the caller can
+    /// auto-recover is the open question ADR-0003 / ADR-0006 track; today
+    /// `updateFromOvStage` treats every false as HOLD, so an unservable range stalls
+    /// until a re-attach is triggered out of band.
     virtual bool drainRange(uint64_t from, uint64_t to)
     {
         (void)from;
@@ -138,6 +189,26 @@ public:
 
     /// @brief Pause/resume change accumulation without dropping registrations.
     virtual void setEnabled(bool enabled) = 0;
+
+    /// @brief Declare the consumer's residency for value delivery: `-1` host
+    /// (default), `>= 0` a CUDA device ordinal. A columnar backend that can read
+    /// device-resident may then deliver value columns straight from device memory
+    /// (with `ColumnView::device`/`deviceWaitEvent` set) so the consumer borrows
+    /// them with no host copy. Set per drain by the engine, which learns the sim's
+    /// residency only once its scenes exist. The default is a no-op — a backend
+    /// that only produces host columns (USD) ignores it.
+    virtual void setDeviceOrdinal(int ordinal)
+    {
+        (void)ordinal;
+    }
+
+    /// Opt in only when all consumers initialize added prims from a full source
+    /// resync before completing the update. A supporting backend may omit initial
+    /// property and transform deltas after every structural-add callback accepts.
+    /// Existing-object edits and structural events remain required. Disabled by
+    /// default; backends that do not support the optimization ignore this hint.
+    /// Change this setting only between drains, under the consumer's admission.
+    virtual void setAddedPrimPropertiesCoveredByResync(bool covered) { (void)covered; }
 };
 
 } // namespace parse

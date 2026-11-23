@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef PXG_ARTICULATION_CORE_H
 #define PXG_ARTICULATION_CORE_H
@@ -147,6 +124,7 @@ namespace physx
 		// so a late attach recovers retained link forces applied before sampling started. gpuIndices are
 		// articulation GPU indices.
 		void ovdSnapshotArticulationForces(const PxArticulationGPUIndex* gpuIndices, PxU32 nbElements, PxU32 maxLinks, PxU32 maxDofs, PxU32 maxFixedTendons, PxU32 maxTendonJoints, PxU32 maxSpatialTendons, PxU32 maxSpatialTendonAttachments);
+		bool ovdReadbackArticulationData(const PxArticulationGPUIndex* indices, PxU32 nbElements, PxArticulationGPUAPIReadType::Enum dataType, PxU32 maxLinks, PxU32 maxDofs);
 #endif
 
 	private:
@@ -214,8 +192,10 @@ namespace physx
 			PxU32 maxLinks, PxU32 maxDofs, PxU32 maxFixedTendons, PxU32 maxTendonJoints, PxU32 maxSpatialTendons, PxU32 maxSpatialTendonAttachments);				
 		Cm::PinnableArray<PxU8> mOvdDataBuffer;
 		Cm::PinnableArray<PxU8> mOvdIndexBuffer;
+		PxArray<PxU32> mOvdBatchPositions;
+		PxgTypedCudaBuffer<PxU8> mOvdReadbackDataBuffer;
 		// Scratch for the full-state snapshot link force/torque readback (ovdSnapshotArticulationForces).
-		PxArray<PxArticulationGPUIndex>				mOvdSnapshotValidIndices;	// host: incoming indices, dropped if past the resident pool
+		Cm::PinnableArray<PxArticulationGPUIndex> mOvdSnapshotValidIndices; // host: indices uploaded on the gather stream
 		PxgTypedCudaBuffer<PxArticulationGPUIndex>	mOvdSnapshotIndexBuffer;	// device: gathered articulation GPU indices
 		PxgTypedCudaBuffer<PxVec3>					mOvdSnapshotDataBuffer;		// device: kernel output, nbValid * maxLinks PxVec3
 #endif

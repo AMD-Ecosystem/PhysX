@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: Apache-2.0
 
 """Pytest configuration for CPU-mode PhysX tests.
 
@@ -22,8 +22,8 @@ def _cpu_session_instance():
     be re-initialized after destroy, so one long-lived instance avoids the
     problematic destroy/recreate cycle.
 
-    We intentionally do NOT call release() at session end — Carbonite
-    shutdown can hang.  The OS reclaims all resources when the process exits.
+    destroy() is intentionally NOT called at session end, because Carbonite
+    shutdown can hang. The OS reclaims all resources when the process exits.
     """
     from ovphysx import PhysX
 
@@ -37,11 +37,11 @@ def _cpu_session_instance():
     except Exception:
         pass
     try:
-        physx.reset_stage()
+        physx.detach_ovstage()
         physx.wait_all()
     except RuntimeError:
         logging.getLogger(__name__).warning(
-            "physx CPU session teardown: reset_stage() failed; process shutdown will reclaim remaining resources"
+            "physx CPU session teardown: detach_ovstage() failed; process shutdown will reclaim remaining resources"
         )
 
 
@@ -50,31 +50,12 @@ def physx_sdk(_cpu_session_instance):
     """Provide the shared CPU-mode PhysX instance for each test.
 
     Teardown is resilient to prevent cascading failures from error-path tests.
+    A task failure the test left uncollected is reported once the instance is reset.
     """
+    from test_utils import reset_shared_instance
+
     yield _cpu_session_instance
-    try:
-        _cpu_session_instance.wait_all()
-    except RuntimeError:
-        pass
-    try:
-        from test_utils import destroy_ovstage_test_attachments
-
-        destroy_ovstage_test_attachments(_cpu_session_instance)
-    except Exception:
-        pass
-    try:
-        _cpu_session_instance.reset_stage()
-        _cpu_session_instance.wait_all()
-    except RuntimeError:
-        logging.getLogger(__name__).warning(
-            "physx_sdk teardown: reset_stage() failed — instance may be degraded for subsequent tests"
-        )
-    try:
-        from test_utils import destroy_ovstage_test_attachments
-
-        destroy_ovstage_test_attachments(_cpu_session_instance)
-    except Exception:
-        pass
+    reset_shared_instance(_cpu_session_instance)
 
 
 @pytest.fixture(scope="function")

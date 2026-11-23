@@ -1,7 +1,29 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * @implements REQ-ATTACH-BACKENDS-001
+ * @covers AC-1 AC-4
+ */
+
+/**
+ * @implements REQ-SIM-OVSTAGE-ATTACH-001
+ * @covers AC-1
+ *
+ * @implements REQ-BUILD-UNIBUILD-001
+ * @covers AC-6
+ *
+ * @implements REQ-RUNTIME-ERROR-001
+ * @covers AC-3 AC-4
+ */
 
 #include <omni/physics/parse/ScanBackend.h>
+#include <omni/physics/parse/ScannedStage.h>
+#include <omni/physx/RuntimeError.h>
+
+#include <carb/logging/Log.h>
+
+#include <exception>
 
 namespace omni::physics::parse
 {
@@ -22,6 +44,38 @@ void setScanBackend(std::unique_ptr<IScanBackend> backend)
 IScanBackend* scanBackend()
 {
     return activeSlot().get();
+}
+
+std::unique_ptr<IScanBackend> takeScanBackend()
+{
+    return std::move(activeSlot());
+}
+
+ScannedStage scanStage(IScanBackend* backend, const parse::AttachTarget& target,
+                       const std::vector<std::string>& scanRoots,
+                       const std::vector<std::string>& excludePaths,
+                       const parse::ScanOptions& options,
+                       parse::IDescriptorAllocator& allocator)
+{
+    if (!backend)
+        return {};
+    // A backend scan failure is reported as an empty ScannedStage (null sourcePtr), never as
+    // an escaping exception: callers (loadFromRange) treat that as a clean fail-closed load,
+    // which is what drives the transactional attach rollback. Mirrors the identical guard in
+    // omni::physics::usd::scanStage.
+    try
+    {
+        return backend->scan(target, scanRoots, excludePaths, options, allocator);
+    }
+    catch (const std::exception& error)
+    {
+        OVX_RUNTIME_ERROR("Physics scan backend failed: %s", error.what());
+    }
+    catch (...)
+    {
+        OVX_RUNTIME_ERROR("Physics scan backend failed with an unknown exception");
+    }
+    return {};
 }
 
 } // namespace omni::physics::parse

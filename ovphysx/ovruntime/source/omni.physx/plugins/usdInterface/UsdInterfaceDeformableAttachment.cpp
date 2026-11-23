@@ -1,7 +1,24 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+// @implements REQ-ATTACH-RESOLVE-001
+// @covers AC-3
+
+/**
+ * @implements REQ-PARSE-CONSUMER-001
+ * @covers AC-24
+ *
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-27
+ *
+ * @implements REQ-SIM-AUTOATTACH-001
+ * @covers AC-4
+ *
+ * @implements REQ-SIM-ATTACH-ARRAYS-001
+ * @covers AC-1 AC-2 AC-3
+ */
+
+#include <omni/physics/parse/KnownTokens.h>
 
 #include "UsdInterface.h"
 
@@ -17,7 +34,6 @@
 #include <OmniPhysX.h>
 #include <PhysXTools.h>
 #include <ObjectDataQuery.h>
-#include <attachment/PhysXAttachment.h>
 #include <attachment/PhysXTetFinder.h>
 #include <attachment/PhysXPointFinder.h>
 #include <attachment/PhysXTriFinder.h>
@@ -25,12 +41,19 @@
 #include <common/utilities/MemoryMacros.h>
 
 using namespace omni::physx::usdparser;
-using namespace PXR_NS;
 using namespace ::physx;
 using namespace omni::physx::internal;
 using namespace omni::physx;
 
-extern ObjectId getObjectId(const PXR_NS::SdfPath& path, PhysXType type);
+
+// createDeformableAttachment/createDeformableCollisionFilter below are ObjectKey-native and
+// unconditional: every read routes through IPhysicsSource/getArrayValue/KnownTokens already,
+// and the object-database registration goes through AttachedStage::registerObjectId(ObjectKey, ...)
+// (AttachedStage.h), so there is no remaining pxr dependency in this file.
+namespace omni
+{
+namespace physx
+{
 
 namespace
 {
@@ -59,14 +82,8 @@ struct ResultBuffer
 
 } // namespace
 
-
-namespace omni
-{
-namespace physx
-{
-
 void copyLocalPositionsToPhysx(InternalDeformableAttachment::AttachmentData& attachmentData,
-                               const PXR_NS::VtArray<GfVec3f>& localPositions,
+                               const std::vector<carb::Float3>& localPositions,
                                ::physx::PxVec3 scale)
 {
     copyBuffer(attachmentData.coords, localPositions.data(), (unsigned int)localPositions.size(), scale);
@@ -75,17 +92,17 @@ void copyLocalPositionsToPhysx(InternalDeformableAttachment::AttachmentData& att
                                 PxDeformableAttachmentTargetType::eWORLD;
 }
 
-void copyVtxToPhysx(InternalDeformableAttachment::AttachmentData& attachmentData, const PXR_NS::VtArray<int>& vtxIndices)
+void copyVtxToPhysx(InternalDeformableAttachment::AttachmentData& attachmentData, const std::vector<int32_t>& vtxIndices)
 {
     attachmentData.indices.assign(vtxIndices.begin(), vtxIndices.end());
     attachmentData.targetType = PxDeformableAttachmentTargetType::eVERTEX;
 }
 
-void convertVtxToPhysx(InternalDeformableAttachment::AttachmentData& attachmentData, const PXR_NS::VtArray<int>& vtxIndices)
+void convertVtxToPhysx(const usdparser::AttachedStage& attachedStage, InternalDeformableAttachment::AttachmentData& attachmentData, const std::vector<int32_t>& vtxIndices)
 {
     if (attachmentData.physxType == ePTDeformableSurface)
     {
-        InternalSurfaceDeformableBody* internalPtr = omni::physx::getInternalPtr<InternalSurfaceDeformableBody>(ePTDeformableSurface, attachmentData.objId);
+        InternalSurfaceDeformableBody* internalPtr = omni::physx::getInternalPtr<InternalSurfaceDeformableBody>(attachedStage.getInternalPhysXDatabase(), ePTDeformableSurface, attachmentData.objId);
 
         std::vector<PxU32> vtxIds;
         std::vector<PxU32> triIds;
@@ -101,7 +118,7 @@ void convertVtxToPhysx(InternalDeformableAttachment::AttachmentData& attachmentD
     }
     else if (attachmentData.physxType == ePTDeformableVolume)
     {
-        InternalVolumeDeformableBody* internalPtr = omni::physx::getInternalPtr<InternalVolumeDeformableBody>(ePTDeformableVolume, attachmentData.objId);
+        InternalVolumeDeformableBody* internalPtr = omni::physx::getInternalPtr<InternalVolumeDeformableBody>(attachedStage.getInternalPhysXDatabase(), ePTDeformableVolume, attachmentData.objId);
 
         std::vector<PxU32> vtxIds;
         std::vector<PxU32> tetIds;
@@ -119,8 +136,11 @@ void convertVtxToPhysx(InternalDeformableAttachment::AttachmentData& attachmentD
     }
 }
 
-void convertTriToPhysx(InternalDeformableAttachment::AttachmentData& attachmentData, const PXR_NS::VtArray<int>& triIds, const PXR_NS::VtArray<GfVec3f>& triBarycentrics)
+bool convertTriToPhysx(InternalDeformableAttachment::AttachmentData& attachmentData, const std::vector<int32_t>& triIds, const std::vector<carb::Float3>& triBarycentrics)
 {
+    if (triIds.size() != triBarycentrics.size())
+        return false;
+
     if (attachmentData.physxType == ePTDeformableSurface)
     {
         // PhysX SDK does not support distance attachment for surface deformable. Set w component is 0.
@@ -131,15 +151,19 @@ void convertTriToPhysx(InternalDeformableAttachment::AttachmentData& attachmentD
         {
             attachmentData.indices[i] = triIds[i];
             const float w = 0.0f;
-            attachmentData.coords[i] = { triBarycentrics[i][0], triBarycentrics[i][1], triBarycentrics[i][2], w };
+            attachmentData.coords[i] = { triBarycentrics[i].x, triBarycentrics[i].y, triBarycentrics[i].z, w };
         }
 
         attachmentData.targetType = PxDeformableAttachmentTargetType::eTRIANGLE;
     }
+    return true;
 }
 
-void convertTetToPhysx(InternalDeformableAttachment::AttachmentData& attachmentData, const PXR_NS::VtArray<int>& tetIds, const PXR_NS::VtArray<GfVec3f>& tetBarycentrics)
+bool convertTetToPhysx(InternalDeformableAttachment::AttachmentData& attachmentData, const std::vector<int32_t>& tetIds, const std::vector<carb::Float3>& tetBarycentrics)
 {
+    if (tetIds.size() != tetBarycentrics.size())
+        return false;
+
     if (attachmentData.physxType == ePTDeformableVolume)
     {
         attachmentData.indices.resize(tetIds.size());
@@ -148,48 +172,44 @@ void convertTetToPhysx(InternalDeformableAttachment::AttachmentData& attachmentD
         for (PxU32 i = 0; i < tetIds.size(); i++)
         {
             attachmentData.indices[i] = tetIds[i];
-            const float w = 1.0f - tetBarycentrics[i][0] - tetBarycentrics[i][1] - tetBarycentrics[i][2];
-            attachmentData.coords[i] = { tetBarycentrics[i][0], tetBarycentrics[i][1], tetBarycentrics[i][2], w };
+            const float w = 1.0f - tetBarycentrics[i].x - tetBarycentrics[i].y - tetBarycentrics[i].z;
+            attachmentData.coords[i] = { tetBarycentrics[i].x, tetBarycentrics[i].y, tetBarycentrics[i].z, w };
         }
 
         attachmentData.targetType = PxDeformableAttachmentTargetType::eTETRAHEDRON;
     }
-}
-
-void copyGeneratedIntArray(PXR_NS::VtArray<int>& out, const PXR_NS::VtArray<int32_t>& in)
-{
-    out.resize(in.size());
-    for (size_t i = 0; i < in.size(); ++i)
-        out[i] = static_cast<int>(in[i]);
+    return true;
 }
 
 bool readGeneratedAttachmentArray(const GeneratedDeformableAttachmentData& data,
-                                  const PXR_NS::TfToken& attr,
-                                  PXR_NS::VtArray<int>& out)
+                                  const omni::physics::parse::KnownTokens& tok,
+                                  omni::physics::parse::TokenId attr,
+                                  std::vector<int32_t>& out)
 {
-    if (attr == OmniUsdPhysicsDeformableSchemaTokens->omniphysicsVtxIndicesSrc0)
+    if (attr == tok.omniphysicsVtxIndicesSrc0)
     {
-        copyGeneratedIntArray(out, data.vtxIndicesSrc0);
+        out = data.vtxIndicesSrc0;
         return true;
     }
-    if (attr == OmniUsdPhysicsDeformableSchemaTokens->omniphysicsTetIndicesSrc1)
+    if (attr == tok.omniphysicsTetIndicesSrc1)
     {
-        copyGeneratedIntArray(out, data.tetIndicesSrc1);
+        out = data.tetIndicesSrc1;
         return true;
     }
     return false;
 }
 
 bool readGeneratedAttachmentArray(const GeneratedDeformableAttachmentData& data,
-                                  const PXR_NS::TfToken& attr,
-                                  PXR_NS::VtArray<GfVec3f>& out)
+                                  const omni::physics::parse::KnownTokens& tok,
+                                  omni::physics::parse::TokenId attr,
+                                  std::vector<carb::Float3>& out)
 {
-    if (attr == OmniUsdPhysicsDeformableSchemaTokens->omniphysicsTetCoordsSrc1)
+    if (attr == tok.omniphysicsTetCoordsSrc1)
     {
         out = data.tetCoordsSrc1;
         return true;
     }
-    if (attr == OmniUsdPhysicsDeformableSchemaTokens->omniphysicsLocalPositionsSrc1)
+    if (attr == tok.omniphysicsLocalPositionsSrc1)
     {
         out = data.localPositionsSrc1;
         return true;
@@ -198,25 +218,26 @@ bool readGeneratedAttachmentArray(const GeneratedDeformableAttachmentData& data,
 }
 
 bool readGeneratedCollisionFilterArray(const GeneratedDeformableCollisionFilterData& data,
-                                       const PXR_NS::TfToken& attr,
-                                       PXR_NS::VtArray<uint32_t>& out)
+                                       const omni::physics::parse::KnownTokens& tok,
+                                       omni::physics::parse::TokenId attr,
+                                       std::vector<uint32_t>& out)
 {
-    if (attr == OmniUsdPhysicsDeformableSchemaTokens->omniphysicsGroupElemCounts0)
+    if (attr == tok.omniphysicsGroupElemCounts0)
     {
         out = data.groupElemCounts0;
         return true;
     }
-    if (attr == OmniUsdPhysicsDeformableSchemaTokens->omniphysicsGroupElemIndices0)
+    if (attr == tok.omniphysicsGroupElemIndices0)
     {
         out = data.groupElemIndices0;
         return true;
     }
-    if (attr == OmniUsdPhysicsDeformableSchemaTokens->omniphysicsGroupElemCounts1)
+    if (attr == tok.omniphysicsGroupElemCounts1)
     {
         out = data.groupElemCounts1;
         return true;
     }
-    if (attr == OmniUsdPhysicsDeformableSchemaTokens->omniphysicsGroupElemIndices1)
+    if (attr == tok.omniphysicsGroupElemIndices1)
     {
         out = data.groupElemIndices1;
         return true;
@@ -224,15 +245,18 @@ bool readGeneratedCollisionFilterArray(const GeneratedDeformableCollisionFilterD
     return false;
 }
 
-ObjectId PhysXUsdPhysicsInterface::createDeformableAttachment(usdparser::AttachedStage& attachedStage, const SdfPath& path, const PhysxDeformableAttachmentDesc& desc)
+ObjectId PhysXUsdPhysicsInterface::createDeformableAttachment(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey attachmentKey, const PhysxDeformableAttachmentDesc& desc)
 {
     InternalDeformableAttachment* internalDeformableAttachment = nullptr;
     const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
-    const omni::physics::parse::ObjectKey attachmentKey = attachedStage.keyFor(path);
-    if (!src || !src->exists(attachmentKey))
+    // A generated (in-memory) auto-attachment child has no prim behind its key.
+    const GeneratedAutoAttachmentChild* generatedChild = attachedStage.findGeneratedAutoAttachmentChild(attachmentKey);
+    if (!src || !(generatedChild || src->exists(attachmentKey)))
     {
         return kInvalidObjectId;
     }
+    omni::physics::parse::KnownTokens tok;
+    tok.intern(*src);
 
     const GeneratedDeformableAttachmentData* generatedData =
         attachedStage.getGeneratedDeformableAttachmentData(attachmentKey);
@@ -243,39 +267,57 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableAttachment(usdparser::Attache
     // Attachment array reads + IsA type checks route through the source rather
     // than reaching into USD via the prim. Auto-generated attachment data can be
     // newer than the scanned source, so prefer the AttachedStage cache when present.
-    auto readArray = [&](const PXR_NS::TfToken& attr, auto& out)
+    // TokenId end to end: readGeneratedAttachmentArray now dispatches on TokenId
+    // identity against the auto-generated cache, and getArrayValue's ObjectKey +
+    // TokenId + ReadTime sibling (PhysXTools.h) replaces the SdfPath/TfToken/
+    // UsdTimeCode overload -- ReadTime::defaultTime() is exactly what toReadTime()
+    // maps a default-constructed UsdTimeCode to.
+    auto readArray = [&](omni::physics::parse::TokenId attr, auto& out)
     {
-        if (generatedData && readGeneratedAttachmentArray(*generatedData, attr, out))
+        if (generatedData && readGeneratedAttachmentArray(*generatedData, tok, attr, out))
             return;
-        getArrayValue(attachedStage, path, attr, PXR_NS::UsdTimeCode(), out);
+        if (generatedChild)
+            return; // nothing authored to fall back to
+        getArrayValue(attachedStage, attachmentKey, attr, omni::physics::parse::ReadTime::defaultTime(), out);
     };
-    auto isAttachmentType = [&](const PXR_NS::TfToken& typeName)
+    // isA takes a TokenId directly, so this skips the TfToken round trip entirely.
+    auto isAttachmentType = [&](omni::physics::parse::TokenId typeToken, ObjectType generatedType)
     {
-        return src->isA(attachmentKey, src->internToken(typeName.GetString()));
+        return generatedChild ? generatedChild->type == generatedType : src->isA(attachmentKey, typeToken);
+    };
+
+    auto rejectArrayMismatch = [&](const char* indicesAttr, size_t indexCount, const char* coordsAttr, size_t coordCount)
+    {
+        const std::string errorStr = "Failed to create Physics Deformable Attachment " +
+            std::string(src->sourceKeyToString(attachmentKey)) + ": " + indicesAttr + " has " + std::to_string(indexCount) +
+            " entries but " + coordsAttr + " has " + std::to_string(coordCount) + "; counts must match.";
+        reportLoadError(usdparser::ErrorCode::eError, errorStr.c_str());
+        SAFE_DELETE_SINGLE(internalDeformableAttachment);
+        return kInvalidObjectId;
     };
 
     switch (desc.type)
     {
         case eAttachmentVtxXform:
         {
-            if (!isAttachmentType(OmniUsdPhysicsDeformableSchemaTokens->OmniPhysicsVtxXformAttachment))
+            if (!isAttachmentType(tok.omniPhysicsVtxXformAttachmentType, eAttachmentVtxXform))
             {
                 return kInvalidObjectId;
             }
 
-            internalDeformableAttachment = ICE_NEW(InternalDeformableAttachment)(path, effectiveDesc);
+            internalDeformableAttachment = ICE_NEW(InternalDeformableAttachment)(attachedStage, attachmentKey, effectiveDesc);
             if (!internalDeformableAttachment->isValid())
             {
                 SAFE_DELETE_SINGLE(internalDeformableAttachment);
                 return kInvalidObjectId;
             }
 
-            PXR_NS::VtArray<int> vtxIndices;
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsVtxIndicesSrc0, vtxIndices);
+            std::vector<int32_t> vtxIndices;
+            readArray(tok.omniphysicsVtxIndicesSrc0, vtxIndices);
             copyVtxToPhysx(internalDeformableAttachment->mData[0], vtxIndices);
 
-            PXR_NS::VtArray<GfVec3f> localPositions;
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsLocalPositionsSrc1, localPositions);
+            std::vector<carb::Float3> localPositions;
+            readArray(tok.omniphysicsLocalPositionsSrc1, localPositions);
             copyLocalPositionsToPhysx(internalDeformableAttachment->mData[1], localPositions, internalDeformableAttachment->mScale);
 
             break;
@@ -283,26 +325,28 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableAttachment(usdparser::Attache
 
         case eAttachmentTetXform:
         {
-            if (!isAttachmentType(OmniUsdPhysicsDeformableSchemaTokens->OmniPhysicsTetXformAttachment))
+            if (!isAttachmentType(tok.omniPhysicsTetXformAttachmentType, eAttachmentTetXform))
             {
                 return kInvalidObjectId;
             }
 
-            internalDeformableAttachment = ICE_NEW(InternalDeformableAttachment)(path, effectiveDesc);
+            internalDeformableAttachment = ICE_NEW(InternalDeformableAttachment)(attachedStage, attachmentKey, effectiveDesc);
             if (!internalDeformableAttachment->isValid())
             {
                 SAFE_DELETE_SINGLE(internalDeformableAttachment);
                 return kInvalidObjectId;
             }
 
-            PXR_NS::VtArray<int> tetIndices;
-            PXR_NS::VtArray<GfVec3f> tetCoords;
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsTetIndicesSrc0, tetIndices);
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsTetCoordsSrc0, tetCoords);
-            convertTetToPhysx(internalDeformableAttachment->mData[0], tetIndices, tetCoords);
+            std::vector<int32_t> tetIndices;
+            std::vector<carb::Float3> tetCoords;
+            readArray(tok.omniphysicsTetIndicesSrc0, tetIndices);
+            readArray(tok.omniphysicsTetCoordsSrc0, tetCoords);
+            if (!convertTetToPhysx(internalDeformableAttachment->mData[0], tetIndices, tetCoords))
+                return rejectArrayMismatch("omniphysics:tetIndicesSrc0", tetIndices.size(),
+                                           "omniphysics:tetCoordsSrc0", tetCoords.size());
 
-            PXR_NS::VtArray<GfVec3f> localPositions;
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsLocalPositionsSrc1, localPositions);
+            std::vector<carb::Float3> localPositions;
+            readArray(tok.omniphysicsLocalPositionsSrc1, localPositions);
             copyLocalPositionsToPhysx(internalDeformableAttachment->mData[1], localPositions, internalDeformableAttachment->mScale);
 
             break;
@@ -310,12 +354,12 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableAttachment(usdparser::Attache
 
         case eAttachmentVtxVtx:
         {
-            if (!isAttachmentType(OmniUsdPhysicsDeformableSchemaTokens->OmniPhysicsVtxVtxAttachment))
+            if (!isAttachmentType(tok.omniPhysicsVtxVtxAttachmentType, eAttachmentVtxVtx))
             {
                 return kInvalidObjectId;
             }
 
-            internalDeformableAttachment = ICE_NEW(InternalDeformableAttachment)(path, effectiveDesc);
+            internalDeformableAttachment = ICE_NEW(InternalDeformableAttachment)(attachedStage, attachmentKey, effectiveDesc);
             if (!internalDeformableAttachment->isValid())
             {
                 SAFE_DELETE_SINGLE(internalDeformableAttachment);
@@ -323,25 +367,25 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableAttachment(usdparser::Attache
             }
 
             // PhysX SDK does not natively support vtx to vtx attachment so we need to convert them to tri/tet id with barycentrics.
-            PXR_NS::VtArray<int> vtxIndices0;
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsVtxIndicesSrc0, vtxIndices0);
-            convertVtxToPhysx(internalDeformableAttachment->mData[0], vtxIndices0);
+            std::vector<int32_t> vtxIndices0;
+            readArray(tok.omniphysicsVtxIndicesSrc0, vtxIndices0);
+            convertVtxToPhysx(attachedStage, internalDeformableAttachment->mData[0], vtxIndices0);
 
-            PXR_NS::VtArray<int> vtxIndices1;
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsVtxIndicesSrc1, vtxIndices1);
-            convertVtxToPhysx(internalDeformableAttachment->mData[1], vtxIndices1);
+            std::vector<int32_t> vtxIndices1;
+            readArray(tok.omniphysicsVtxIndicesSrc1, vtxIndices1);
+            convertVtxToPhysx(attachedStage, internalDeformableAttachment->mData[1], vtxIndices1);
 
             break;
         }
 
         case eAttachmentVtxTri:
         {
-            if (!isAttachmentType(OmniUsdPhysicsDeformableSchemaTokens->OmniPhysicsVtxTriAttachment))
+            if (!isAttachmentType(tok.omniPhysicsVtxTriAttachmentType, eAttachmentVtxTri))
             {
                 return kInvalidObjectId;
             }
 
-            internalDeformableAttachment = ICE_NEW(InternalDeformableAttachment)(path, effectiveDesc);
+            internalDeformableAttachment = ICE_NEW(InternalDeformableAttachment)(attachedStage, attachmentKey, effectiveDesc);
             if (!internalDeformableAttachment->isValid())
             {
                 SAFE_DELETE_SINGLE(internalDeformableAttachment);
@@ -349,27 +393,29 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableAttachment(usdparser::Attache
             }
 
             // PhysX SDK does not natively support vtx for deformable/deformable attachment so we need to convert the vtx deformable to tri/tet id with barycentrics.
-            PXR_NS::VtArray<int> vtxIndices;
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsVtxIndicesSrc0, vtxIndices);
-            convertVtxToPhysx(internalDeformableAttachment->mData[0], vtxIndices);
+            std::vector<int32_t> vtxIndices;
+            readArray(tok.omniphysicsVtxIndicesSrc0, vtxIndices);
+            convertVtxToPhysx(attachedStage, internalDeformableAttachment->mData[0], vtxIndices);
 
-            PXR_NS::VtArray<int> triIndices;
-            PXR_NS::VtArray<GfVec3f> triCoords;
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsTriIndicesSrc1, triIndices);
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsTriCoordsSrc1, triCoords);
-            convertTriToPhysx(internalDeformableAttachment->mData[1], triIndices, triCoords);
+            std::vector<int32_t> triIndices;
+            std::vector<carb::Float3> triCoords;
+            readArray(tok.omniphysicsTriIndicesSrc1, triIndices);
+            readArray(tok.omniphysicsTriCoordsSrc1, triCoords);
+            if (!convertTriToPhysx(internalDeformableAttachment->mData[1], triIndices, triCoords))
+                return rejectArrayMismatch("omniphysics:triIndicesSrc1", triIndices.size(),
+                                           "omniphysics:triCoordsSrc1", triCoords.size());
 
             break;
         }
 
         case eAttachmentVtxTet:
         {
-            if (!isAttachmentType(OmniUsdPhysicsDeformableSchemaTokens->OmniPhysicsVtxTetAttachment))
+            if (!isAttachmentType(tok.omniPhysicsVtxTetAttachmentType, eAttachmentVtxTet))
             {
                 return kInvalidObjectId;
             }
 
-            internalDeformableAttachment = ICE_NEW(InternalDeformableAttachment)(path, effectiveDesc);
+            internalDeformableAttachment = ICE_NEW(InternalDeformableAttachment)(attachedStage, attachmentKey, effectiveDesc);
             if (!internalDeformableAttachment->isValid())
             {
                 SAFE_DELETE_SINGLE(internalDeformableAttachment);
@@ -377,15 +423,17 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableAttachment(usdparser::Attache
             }
 
             // PhysX SDK does not natively support vtx for deformable/deformable attachment so we need to convert the vtx deformable to tri/tet id with barycentrics.
-            PXR_NS::VtArray<int> vtxIndices;
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsVtxIndicesSrc0, vtxIndices);
-            convertVtxToPhysx(internalDeformableAttachment->mData[0], vtxIndices);
+            std::vector<int32_t> vtxIndices;
+            readArray(tok.omniphysicsVtxIndicesSrc0, vtxIndices);
+            convertVtxToPhysx(attachedStage, internalDeformableAttachment->mData[0], vtxIndices);
 
-            PXR_NS::VtArray<int> tetIndices;
-            PXR_NS::VtArray<GfVec3f> tetCoords;
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsTetIndicesSrc1, tetIndices);
-            readArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsTetCoordsSrc1, tetCoords);
-            convertTetToPhysx(internalDeformableAttachment->mData[1], tetIndices, tetCoords);
+            std::vector<int32_t> tetIndices;
+            std::vector<carb::Float3> tetCoords;
+            readArray(tok.omniphysicsTetIndicesSrc1, tetIndices);
+            readArray(tok.omniphysicsTetCoordsSrc1, tetCoords);
+            if (!convertTetToPhysx(internalDeformableAttachment->mData[1], tetIndices, tetCoords))
+                return rejectArrayMismatch("omniphysics:tetIndicesSrc1", tetIndices.size(),
+                                           "omniphysics:tetCoordsSrc1", tetCoords.size());
 
             break;
         }
@@ -405,8 +453,8 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableAttachment(usdparser::Attache
         internalDeformableAttachment->setCreateAttachmentEvent();
     }
 
-    const ObjectId objId = OmniPhysX::getInstance().getInternalPhysXDatabase().addRecord(ePTDeformableAttachment, nullptr, internalDeformableAttachment, attachedStage.keyFor(path));
-    attachedStage.registerObjectId(path, ObjectType::eDeformableAttachment, objId);
+    const ObjectId objId = attachedStage.getInternalPhysXDatabase().addRecord(ePTDeformableAttachment, nullptr, internalDeformableAttachment, attachmentKey);
+    attachedStage.registerObjectId(attachmentKey, ObjectType::eDeformableAttachment, objId);
 
     internalDeformableAttachment->mObjectId = objId;
 
@@ -418,7 +466,7 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableAttachment(usdparser::Attache
         DeformableAttachmentHistoryMap::const_iterator itEnd = history.end();
         while (it != itEnd)
         {
-            if (it->second == path)
+            if (it->second == attachmentKey)
             {
                 it = history.erase(it);
             }
@@ -434,12 +482,12 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableAttachment(usdparser::Attache
 
 namespace
 {
-    void mapToPhysxFilterIndices(PXR_NS::VtArray<uint32_t>& elemCounts, PXR_NS::VtArray<uint32_t>& elemIndices,
+    void mapToPhysxFilterIndices(const usdparser::AttachedStage& attachedStage, std::vector<uint32_t>& elemCounts, std::vector<uint32_t>& elemIndices,
         const InternalDeformableCollisionFilter::CollisionFilterData& filterData, const uint32_t numDeformableElems)
     {
         if (filterData.physxType == ePTDeformableSurface)
         {
-            InternalSurfaceDeformableBody* surface = getInternalPtr<InternalSurfaceDeformableBody>(ePTDeformableSurface, (ObjectId)filterData.actor->userData);
+            InternalSurfaceDeformableBody* surface = getInternalPtr<InternalSurfaceDeformableBody>(attachedStage.getInternalPhysXDatabase(), ePTDeformableSurface, (ObjectId)filterData.actor->userData);
             if (surface && numDeformableElems == (uint32_t)surface->mSimToPhysxTriMap.size())
             {
                 for (uint32_t i = 0; i < elemIndices.size(); ++i)
@@ -450,7 +498,7 @@ namespace
         }
         else if (filterData.physxType == ePTDeformableVolume)
         {
-            InternalVolumeDeformableBody* volume = omni::physx::getInternalPtr<InternalVolumeDeformableBody>(ePTDeformableVolume, (ObjectId)filterData.actor->userData);
+            InternalVolumeDeformableBody* volume = omni::physx::getInternalPtr<InternalVolumeDeformableBody>(attachedStage.getInternalPhysXDatabase(), ePTDeformableVolume, (ObjectId)filterData.actor->userData);
             if (volume && numDeformableElems == (uint32_t)volume->mCollMeshSurfaceTriToTetMap.size())
             {
                 const PxTetrahedronMesh& tetMesh = *volume->mDeformableVolumeMesh->getCollisionMesh();
@@ -482,7 +530,7 @@ namespace
                 }
 
                 // now finally, map surface triangle filter indices to tet indices
-                PXR_NS::VtArray<uint32_t> elemIndicesOut;
+                std::vector<uint32_t> elemIndicesOut;
                 {
                     uint32_t totalOffset = 0;
                     for (uint32_t g = 0; g < elemCounts.size(); ++g)
@@ -525,7 +573,7 @@ namespace
     }
 }
 
-bool checkGroupElemIndicesAndCounts(const PXR_NS::VtArray<uint32_t>& groupElemCounts, const PXR_NS::VtArray<uint32_t>& groupElemIndices,
+bool checkGroupElemIndicesAndCounts(const std::vector<uint32_t>& groupElemCounts, const std::vector<uint32_t>& groupElemIndices,
     const uint32_t numCollMeshElems, const InternalDeformableCollisionFilter::CollisionFilterData& filterData)
 {
     size_t totalCounts = 0;
@@ -551,36 +599,51 @@ bool checkGroupElemIndicesAndCounts(const PXR_NS::VtArray<uint32_t>& groupElemCo
     return true;
 }
 
-uint32_t getNumCollMeshElems(const usdparser::AttachedStage& attachedStage, const SdfPath& collMeshPath)
+uint32_t getNumCollMeshElems(const usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey collMeshKey)
 {
     const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
     if (!src)
         return 0;
 
-    const omni::physics::parse::ObjectKey collMeshKey = attachedStage.keyFor(collMeshPath);
-    if (src->isA(collMeshKey, schemaTypeToken<UsdGeomTetMesh>(*src)))
+    omni::physics::parse::KnownTokens tok;
+    tok.intern(*src);
+
+    // isTetMeshLike, not isA(UsdGeomTetMesh), and checked FIRST: ovstage reports a UsdGeomTetMesh
+    // as plain "Mesh" (its populator has no TetMesh mapping), so the concrete-type check fell
+    // through to the UsdGeomMesh branch below and returned 0 elements for every tet collision mesh
+    // loaded from a non-USD source. See PhysXTools.h::isTetMeshLike.
+    if (isTetMeshLike(attachedStage, collMeshKey))
     {
-        VtArray<GfVec3i> collMeshSurfaceTriangles;
-        getArrayValue(attachedStage, collMeshPath, UsdGeomTokens->surfaceFaceVertexIndices,
-            UsdTimeCode(), collMeshSurfaceTriangles);
+        std::vector<carb::Int3> collMeshSurfaceTriangles;
+        getArrayValue(attachedStage, collMeshKey, tok.surfaceFaceVertexIndices,
+            omni::physics::parse::ReadTime::defaultTime(), collMeshSurfaceTriangles);
         return static_cast<uint32_t>(collMeshSurfaceTriangles.size());
     }
-    if (src->isA(collMeshKey, schemaTypeToken<UsdGeomMesh>(*src)))
+    if (src->isA(collMeshKey, tok.meshType))
     {
-        VtArray<int> faceVertexIndices;
-        getArrayValue(attachedStage, collMeshPath, UsdGeomTokens->faceVertexIndices,
-            UsdTimeCode(), faceVertexIndices);
+        std::vector<int32_t> faceVertexIndices;
+        getArrayValue(attachedStage, collMeshKey, tok.faceVertexIndices,
+            omni::physics::parse::ReadTime::defaultTime(), faceVertexIndices);
         return static_cast<uint32_t>(faceVertexIndices.size() / 3);
     }
 
     return 0;
 }
 
-ObjectId PhysXUsdPhysicsInterface::createDeformableCollisionFilter(usdparser::AttachedStage& attachedStage, const SdfPath& path, const PhysxDeformableCollisionFilterDesc& desc)
+ObjectId PhysXUsdPhysicsInterface::createDeformableCollisionFilter(usdparser::AttachedStage& attachedStage, omni::physics::parse::ObjectKey collisionFilterKey, const PhysxDeformableCollisionFilterDesc& desc)
 {
     const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
-    const omni::physics::parse::ObjectKey collisionFilterKey = attachedStage.keyFor(path);
-    if (!src || !src->isA(collisionFilterKey, src->internToken(OmniUsdPhysicsDeformableSchemaTokens->OmniPhysicsElementCollisionFilter.GetString())))
+    if (!src)
+    {
+        return kInvalidObjectId;
+    }
+    omni::physics::parse::KnownTokens tok;
+    tok.intern(*src);
+    // A generated (in-memory) auto-attachment child has no prim behind its key.
+    const GeneratedAutoAttachmentChild* generatedChild = attachedStage.findGeneratedAutoAttachmentChild(collisionFilterKey);
+    const bool isFilterType = generatedChild ? generatedChild->type == eDeformableCollisionFilter
+                                             : src->isA(collisionFilterKey, tok.omniPhysicsElementCollisionFilterType);
+    if (!isFilterType)
     {
         return kInvalidObjectId;
     }
@@ -591,30 +654,32 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableCollisionFilter(usdparser::At
     if (generatedData)
         effectiveDesc.enabled = generatedData->enabled;
 
-    InternalDeformableCollisionFilter* internalDeformableCollisionFilter = ICE_NEW(InternalDeformableCollisionFilter)(path, effectiveDesc);
+    InternalDeformableCollisionFilter* internalDeformableCollisionFilter = ICE_NEW(InternalDeformableCollisionFilter)(attachedStage, collisionFilterKey, effectiveDesc);
     if (!internalDeformableCollisionFilter->isValid())
     {
         SAFE_DELETE_SINGLE(internalDeformableCollisionFilter);
         return kInvalidObjectId;
     }
 
-    if (!src->exists(attachedStage.keyFor(effectiveDesc.src0)) ||
-        !src->exists(attachedStage.keyFor(effectiveDesc.src1)))
+    if (!src->exists(effectiveDesc.src0) ||
+        !src->exists(effectiveDesc.src1))
     {
         return kInvalidObjectId;
     }
 
-    auto readFilterArray = [&](const PXR_NS::TfToken& attr, auto& out)
+    auto readFilterArray = [&](omni::physics::parse::TokenId attr, auto& out)
     {
-        if (generatedData && readGeneratedCollisionFilterArray(*generatedData, attr, out))
+        if (generatedData && readGeneratedCollisionFilterArray(*generatedData, tok, attr, out))
             return;
-        getArrayValue(attachedStage, path, attr, PXR_NS::UsdTimeCode(), out);
+        if (generatedChild)
+            return; // nothing authored to fall back to
+        getArrayValue(attachedStage, collisionFilterKey, attr, omni::physics::parse::ReadTime::defaultTime(), out);
     };
 
-    PXR_NS::VtArray<uint32_t> groupElemCounts0;
-    PXR_NS::VtArray<uint32_t> groupElemIndices0;
-    readFilterArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsGroupElemCounts0, groupElemCounts0);
-    readFilterArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsGroupElemIndices0, groupElemIndices0);
+    std::vector<uint32_t> groupElemCounts0;
+    std::vector<uint32_t> groupElemIndices0;
+    readFilterArray(tok.omniphysicsGroupElemCounts0, groupElemCounts0);
+    readFilterArray(tok.omniphysicsGroupElemIndices0, groupElemIndices0);
 
     uint32_t numCollMeshElems0 = getNumCollMeshElems(attachedStage, effectiveDesc.src0);
     if (!checkGroupElemIndicesAndCounts(groupElemCounts0, groupElemIndices0, numCollMeshElems0, internalDeformableCollisionFilter->mData[0]))
@@ -622,15 +687,15 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableCollisionFilter(usdparser::At
         return kInvalidObjectId;
     }
 
-    mapToPhysxFilterIndices(groupElemCounts0, groupElemIndices0, internalDeformableCollisionFilter->mData[0], numCollMeshElems0);
+    mapToPhysxFilterIndices(attachedStage, groupElemCounts0, groupElemIndices0, internalDeformableCollisionFilter->mData[0], numCollMeshElems0);
 
     internalDeformableCollisionFilter->mData[0].groupElementCounts.assign(groupElemCounts0.begin(), groupElemCounts0.end());
     internalDeformableCollisionFilter->mData[0].groupElementIndices.assign(groupElemIndices0.begin(), groupElemIndices0.end());
 
-    PXR_NS::VtArray<uint32_t> groupElemCounts1;
-    PXR_NS::VtArray<uint32_t> groupElemIndices1;
-    readFilterArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsGroupElemCounts1, groupElemCounts1);
-    readFilterArray(OmniUsdPhysicsDeformableSchemaTokens->omniphysicsGroupElemIndices1, groupElemIndices1);
+    std::vector<uint32_t> groupElemCounts1;
+    std::vector<uint32_t> groupElemIndices1;
+    readFilterArray(tok.omniphysicsGroupElemCounts1, groupElemCounts1);
+    readFilterArray(tok.omniphysicsGroupElemIndices1, groupElemIndices1);
 
     uint32_t numCollMeshElems1 = getNumCollMeshElems(attachedStage, effectiveDesc.src1);
     if (!checkGroupElemIndicesAndCounts(groupElemCounts1, groupElemIndices1, numCollMeshElems1, internalDeformableCollisionFilter->mData[1]))
@@ -638,7 +703,7 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableCollisionFilter(usdparser::At
         return kInvalidObjectId;
     }
 
-    mapToPhysxFilterIndices(groupElemCounts1, groupElemIndices1, internalDeformableCollisionFilter->mData[1], numCollMeshElems1);
+    mapToPhysxFilterIndices(attachedStage, groupElemCounts1, groupElemIndices1, internalDeformableCollisionFilter->mData[1], numCollMeshElems1);
 
     internalDeformableCollisionFilter->mData[1].groupElementCounts.assign(groupElemCounts1.begin(), groupElemCounts1.end());
     internalDeformableCollisionFilter->mData[1].groupElementIndices.assign(groupElemIndices1.begin(), groupElemIndices1.end());
@@ -651,8 +716,8 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableCollisionFilter(usdparser::At
         internalDeformableCollisionFilter->setCreateCollisionFilterEvent();
     }
 
-    const ObjectId objId = OmniPhysX::getInstance().getInternalPhysXDatabase().addRecord(ePTDeformableCollisionFilter, nullptr, internalDeformableCollisionFilter, attachedStage.keyFor(path));
-    attachedStage.registerObjectId(path, ObjectType::eDeformableCollisionFilter, objId);
+    const ObjectId objId = attachedStage.getInternalPhysXDatabase().addRecord(ePTDeformableCollisionFilter, nullptr, internalDeformableCollisionFilter, collisionFilterKey);
+    attachedStage.registerObjectId(collisionFilterKey, ObjectType::eDeformableCollisionFilter, objId);
 
     internalDeformableCollisionFilter->mObjectId = objId;
 
@@ -664,7 +729,7 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableCollisionFilter(usdparser::At
         DeformableCollisionFilterHistoryMap::const_iterator itEnd = history.end();
         while (it != itEnd)
         {
-            if (it->second == path)
+            if (it->second == collisionFilterKey)
             {
                 it = history.erase(it);
             }
@@ -678,14 +743,14 @@ ObjectId PhysXUsdPhysicsInterface::createDeformableCollisionFilter(usdparser::At
     return objId;
 }
 
-void PhysXUsdPhysicsInterface::processDeformableAttachmentShapeEvents()
+void PhysXUsdPhysicsInterface::processDeformableAttachmentShapeEvents(const usdparser::AttachedStage& attachedStage)
 {
     const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
 
     std::vector<internal::InternalDeformableAttachment*> attachmentsToRemove;
 
-    const PhysXScenesMap& physxScenes = omniPhysX.getPhysXSetup().getPhysXScenes();
-    for (PhysXScenesMap::const_reference ref : physxScenes)
+    const usdparser::AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
+    for (usdparser::AttachedStage::SceneMap::const_reference ref : physxScenes)
     {
         PhysXScene* sc = ref.second;
 
@@ -708,14 +773,14 @@ void PhysXUsdPhysicsInterface::processDeformableAttachmentShapeEvents()
     }
 }
 
-void PhysXUsdPhysicsInterface::processDeformableCollisionFilterShapeEvents()
+void PhysXUsdPhysicsInterface::processDeformableCollisionFilterShapeEvents(const usdparser::AttachedStage& attachedStage)
 {
     const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
 
     std::vector<internal::InternalDeformableCollisionFilter*> collisionFiltersToRemove;
 
-    const PhysXScenesMap& physxScenes = omniPhysX.getPhysXSetup().getPhysXScenes();
-    for (PhysXScenesMap::const_reference ref : physxScenes)
+    const usdparser::AttachedStage::SceneMap& physxScenes = attachedStage.getPhysXScenes();
+    for (usdparser::AttachedStage::SceneMap::const_reference ref : physxScenes)
     {
         PhysXScene* sc = ref.second;
 

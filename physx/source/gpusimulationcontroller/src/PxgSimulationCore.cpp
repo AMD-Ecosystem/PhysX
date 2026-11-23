@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PxgSimulationCore.h"
 #include "PxDirectGPUAPI.h"
@@ -40,6 +17,7 @@
 #include "PxgParticleSystemBuffer.h"
 #include "PxgSoftBodyBuffer.h"
 #include "PxgFEMClothBuffer.h"
+#include "PxgDeformableFilterManager.h"
 #include "PxgSimulationCoreKernelIndices.h"
 #include "PxgBodySim.h"
 #include "PxsCachedTransform.h"
@@ -277,7 +255,9 @@ PxgSoftBodyBuffer::PxgSoftBodyBuffer(PxgAllocatorDesc& allocDesc) :
 	orderedMaterialIndices(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	materialIndices(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	packedNodeBounds(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
-	filterPairs(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY)
+	rigidVolumeFilterPairs(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
+	volumeVolumeFilterPairs(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
+	volumeSurfaceFilterPairs(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY)
 {
 }
 
@@ -290,7 +270,7 @@ PxgFEMClothBuffer::PxgFEMClothBuffer(PxgAllocatorDesc& allocDesc) :
 	prevPositionInRestOffset(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	materialIndices(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	dynamicfrictions(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
-	trianglesWithActiveEdges(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
+	trianglesWithOwnedEdges(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	triangleVertexIndices(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	orderedNonSharedTriangleVertexIndices_triIndex(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	orderedSharedTriangleLambdas(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
@@ -313,7 +293,9 @@ PxgFEMClothBuffer::PxgFEMClothBuffer(PxgAllocatorDesc& allocDesc) :
 	sharedTriPairAccumulatedPartitionsCP(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	nonSharedTriPairAccumulatedPartitionsCP(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	packedNodeBounds(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
-	numPenetratedTets(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH)
+	numPenetratedTets(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
+	rigidSurfaceFilterPairs(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
+	surfaceSurfaceFilterPairs(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH)
 {
 }
 
@@ -341,7 +323,8 @@ PxgSimulationCore::PxgSimulationCore(PxgCudaKernelWranglerManager* gpuKernelWran
 	mUpdatedBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION),
 	mActivateBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION),
 	mDeactivateBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION),
-	mUpdatedDirectBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION),
+	mDirectGPUUpdateFlagsBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION),
+	mNbDirectGPUUpdateFlags(0),
 	mBodySimCudaBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION),
 	mBodySimPreviousVelocitiesCudaBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION),
 	mBodySimAccelerationsCudaBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION),
@@ -364,6 +347,7 @@ PxgSimulationCore::PxgSimulationCore(PxgCudaKernelWranglerManager* gpuKernelWran
 	mArticulationFixedTendonBatchBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_ARTICULATION),
 	mArticulationFixedTendonConstraintsBatchBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_ARTICULATION),
 	mArticulationTendonJointBatchBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_ARTICULATION),
+	mRemovedArticulationSlots(allocDesc.hostMappedAlloc, PxsHeapStats::eSIMULATION_ARTICULATION, Cm::PinnableAllocatorFallback::eDISABLED),
 	mSoftBodyBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mActiveSoftBodyBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mActiveSelfCollisionSoftBodyBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
@@ -418,29 +402,27 @@ PxgSimulationCore::PxgSimulationCore(PxgCudaKernelWranglerManager* gpuKernelWran
 	mBoundsBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION),
 	mChangedAABBMgrHandlesBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION),
 	mSoftBodyRigidAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
-	mSoftBodyRigidFilterPairs(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mSoftBodyRigidAttachmentBlocks(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mActiveSoftBodyRigidConstraints(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mNumSoftBodyRigidAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
+	mSoftBodyRigidAttachmentRigidRefCounts(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mSoftBodyRigidAttachmentIds(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mSoftBodySoftBodyAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mSoftBodySoftBodyAttachmentBlocks(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mActiveSoftBodySoftBodyConstraints(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mNumSoftBodySoftBodyAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mSoftBodyClothAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
-	mSoftBodyClothFilterPairs(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mSoftBodyClothAttachmentBlocks(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mActiveSoftBodyClothConstraints(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mNumSoftBodyClothAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_SOFTBODY),
 	mClothRigidAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	mActiveClothRigidAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
-	mClothRigidFilterPairs(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	mClothRigidAttachmentBlocks(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	mNumClothRigidAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
+	mClothRigidAttachmentRigidRefCounts(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	mClothRigidAttachmentIds(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	mClothClothAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	mActiveClothClothAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
-	mClothClothVertTriFilterPairs(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	mClothClothAttachmentBlocks(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	mNumClothClothAttachments(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION_FEMCLOTH),
 	mNbTotalBodySim(0), mNbTotalArticulations(0),
@@ -453,7 +435,7 @@ PxgSimulationCore::PxgSimulationCore(PxgCudaKernelWranglerManager* gpuKernelWran
 	mGMMaxJacobiVertices(0), 
 	mMaxNbClothVerts(0),
 	mMaxNbClothTriangles(0),
-	mMaxNbClothTrianglesWithActiveEdges(0),
+	mMaxNbClothTrianglesWithOwnedEdges(0),
 	mMaxNbNonSharedTriangles(0),
 	mMaxNbNonSharedTriPartitions(0),
 	mMaxNbNonSharedTrianglesPerPartition(0),
@@ -472,12 +454,17 @@ PxgSimulationCore::PxgSimulationCore(PxgCudaKernelWranglerManager* gpuKernelWran
 	mUsePartitionAveraging(false),
 	mHasActiveBendingPairs(false),
 	mEvent(NULL),
-	mDmaEvent(NULL)
+	mDmaEvent(NULL),
+	mRemovedArticulationSlotsEvent(NULL),
+	mKinematicTargetCopyManager(allocDesc.hostMappedAlloc),
+	mKinematicTargets(allocDesc.hostMappedAlloc, PxsHeapStats::eSIMULATION, Cm::PinnableAllocatorFallback::eDISABLED)
 #if PX_SUPPORT_OMNI_PVD
 	,mOvdDataBuffer(allocDesc.hostAlloc, PxsHeapStats::eOTHER)
 	,mOvdIndexBuffer(allocDesc.hostAlloc, PxsHeapStats::eOTHER)
+	,mOvdReadbackDataBuffer(allocDesc.deviceAlloc, PxsHeapStats::eOTHER)
 	,mOvdSnapshotIndexBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION)
 	,mOvdSnapshotDataBuffer(allocDesc.deviceAlloc, PxsHeapStats::eSIMULATION)
+	,mOvdSnapshotValidIndices(allocDesc.hostAlloc, PxsHeapStats::eOTHER)
 	,mOvdSnapshotForce(allocDesc.hostAlloc, PxsHeapStats::eOTHER)
 	,mOvdSnapshotTorque(allocDesc.hostAlloc, PxsHeapStats::eOTHER)
 #endif
@@ -486,18 +473,14 @@ PxgSimulationCore::PxgSimulationCore(PxgCudaKernelWranglerManager* gpuKernelWran
 	mCudaContextManager->acquireContext();
 
 	mNbRigidSoftBodyAttachments = 0;
-	mNbRigidSoftBodyFilters = 0;
 
 	mNbSoftBodySoftBodyAttachments = 0;
 
 	mNbClothSoftBodyAttachments = 0;
-	mNbClothSoftBodyFilters = 0;
 
 	mNbRigidClothAttachments = 0;
-	mNbRigidClothFilters = 0;
 
 	mNbClothClothAttachments = 0;
-	mNbClothClothVertTriFilters = 0;
 
 	mUpdatedCacheAndBoundsDescBuffer.allocate(sizeof(PxgSimulationCoreDesc), PX_FL);
 	mBodiesDescBuffer.allocate(sizeof(PxgNewBodiesDesc), PX_FL);
@@ -556,11 +539,16 @@ PxgSimulationCore::~PxgSimulationCore()
 		particleCore->releaseParticleSystemDataBuffer();
 	}
 
+	// Steps without solver work do not wait for the stream, so the last marking can still be reading mRemovedArticulationSlots.
+	mCudaContext->eventSynchronize(mRemovedArticulationSlotsEvent);
+
 	releaseGpuStreamsAndEvents();
 
 #if PX_SUPPORT_OMNI_PVD		
 	mOvdDataBuffer.reset();
 	mOvdIndexBuffer.reset();
+	mOvdSnapshotValidIndices.reset();
+	mOvdReadbackDataBuffer.deallocate();
 #endif
 	
 	mCudaContextManager->releaseContext();
@@ -576,6 +564,10 @@ void PxgSimulationCore::createGpuStreamsAndEvents()
 
 	//create event
 	mCudaContext->eventCreate(&mDmaEvent, CU_EVENT_DISABLE_TIMING);
+
+	mCudaContext->eventCreate(&mRemovedArticulationSlotsEvent, CU_EVENT_DISABLE_TIMING);
+
+	mKinematicTargetCopyManager.createFinishedEvent(mCudaContext);
 
 	mEventMapped = PX_PINNED_MEMORY_ALLOC_FLAGS(PxU32, *mCudaContextManager, 1, CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP);
 	if(!mEventMapped)
@@ -598,6 +590,11 @@ void PxgSimulationCore::releaseGpuStreamsAndEvents()
 	//destroy event
 	mCudaContext->eventDestroy(mDmaEvent);
 	mDmaEvent = NULL;
+
+	mCudaContext->eventDestroy(mRemovedArticulationSlotsEvent);
+	mRemovedArticulationSlotsEvent = NULL;
+
+	mKinematicTargetCopyManager.destroyFinishedEvent(mCudaContext);
 
 	PX_PINNED_MEMORY_FREE(*mCudaContextManager, mEventMapped);
 }
@@ -1122,6 +1119,23 @@ void PxgSimulationCore::gpuMemDmaUpBodySim(Cm::PinnableArray<PxgBodySimVelocityU
 	mArticulationTendonJointBatchBuffer.allocate(nbArticulationBatches * sizeof(PxgArticulationBlockTendonJointData) *  maxFixedTendons * maxTendonJoints, PX_FL);
 }
 
+// Uploads the filter pairs of one deformable and returns the location and count.
+static void uploadDeformableFilterPairs(PxCudaContext& cudaContext, CUstream stream, PxgDeformableFilterPairs& filters,
+	PxgTypedCudaBuffer<PxgDeformablePairInfo>& buffer, PxgDeformablePairInfo*& devicePairs, PxU32& nbDevicePairs)
+{
+	const Cm::PinnableArray<PxgDeformablePairInfo>& filterPairs = filters.mPairs;
+	const PxU32 nbFilterPairs = filterPairs.size();
+
+	buffer.allocate(sizeof(PxgDeformablePairInfo) * nbFilterPairs, PX_FL);
+	cudaContext.memcpyHtoDAsync(buffer.getDevicePtr(), filterPairs.begin(), nbFilterPairs * sizeof(PxgDeformablePairInfo), stream);
+
+	devicePairs = reinterpret_cast<PxgDeformablePairInfo*>(buffer.getDevicePtr());
+	nbDevicePairs = nbFilterPairs;
+
+	filters.mDirty = false;
+	filters.mInDirtyList = false;
+}
+
 void PxgSimulationCore::gpuMemDmaUpSoftBodies(Cm::PinnableArray<PxgSoftBody>& newSoftBodyPool,
 	PxU32* newTetMeshByteSizePool,
 	PxArray<PxgSoftBodyData>& newSoftBodyDataPool,
@@ -1132,8 +1146,12 @@ void PxgSimulationCore::gpuMemDmaUpSoftBodies(Cm::PinnableArray<PxgSoftBody>& ne
 	Cm::PinnableArray<PxU32>& softBodyElementIndexPool,
 	PxArray<PxU32>& softBodyNodeIndexPool,
 	PxgBodySimManager& bodySimManager,
-	SoftBodyAttachmentAndFilterData& data
-	)
+	PxgAttachmentManager& rigidAttachments,
+	PxgAttachmentManager& softBodyAttachments,
+	PxgAttachmentManager& clothAttachments,
+	const PxgDeformableFilterManager& rigidVolumeFilters,
+	const PxgDeformableFilterManager& volumeVolumeFilters,
+	const PxgDeformableFilterManager& volumeSurfaceFilters)
 {
 	PX_PROFILE_ZONE("GpuSimulationController.gpuMemDmaUpSoftBodies", 0);
 
@@ -1391,10 +1409,18 @@ void PxgSimulationCore::gpuMemDmaUpSoftBodies(Cm::PinnableArray<PxgSoftBody>& ne
 		softBody.mNumTetsGM = numTetsGM;
 		softBody.mNumPartitionsGM = numPartitionsGM;
 		softBody.mNumTetsPerElement = newSoftBody.mNumTetsPerElement;
-		softBody.mRestDistance = newSoftBody.mRestDistance;
+		softBody.mRestOffset = newSoftBody.mRestOffset;
 		softBody.mOriginalContactOffset = newSoftBody.mOriginalContactOffset;
 		softBody.mJacobiScale = newSoftBody.mJacobiScale;
 		softBody.mNumJacobiVertices = newSoftBody.mNumJacobiVertices;
+
+		// Filter pairs are set by the dirty loops further down.
+		softBody.mRigidVolumeFilterPairs = NULL;
+		softBody.mVolumeVolumeFilterPairs = NULL;
+		softBody.mVolumeSurfaceFilterPairs = NULL;
+		softBody.mNumRigidVolumeFilterPairs = 0;
+		softBody.mNumVolumeVolumeFilterPairs = 0;
+		softBody.mNumVolumeSurfaceFilterPairs = 0;
 
 		softBodyData.mRemapOutputSizeGM = newSoftBodyData.mRemapOutputSizeGM;
 		softBodyData.mMaxTetsPerPartitionsGM = newSoftBodyData.mMaxTetsPerPartitionsGM;
@@ -1423,43 +1449,54 @@ void PxgSimulationCore::gpuMemDmaUpSoftBodies(Cm::PinnableArray<PxgSoftBody>& ne
 		mSBWakeCounts[gpuRemapIndex] = dySoftbodyCore.wakeCounter;
 	}
 		
-	PxArray<Dy::DeformableVolume*>& dirtyDeformableVolumeForFilterPairs = *data.dirtyDeformableVolumeForFilterPairs;
+	const bool filterPairsDirty = rigidVolumeFilters.isDirty() || volumeVolumeFilters.isDirty() || volumeSurfaceFilters.isDirty();
 
-	const PxU32 nbDirtyFilterPairs = dirtyDeformableVolumeForFilterPairs.size();
-	for (PxU32 i = 0; i < nbDirtyFilterPairs; ++i)
 	{
-		Dy::DeformableVolume* deformableVolume = dirtyDeformableVolumeForFilterPairs[i];
-		if (deformableVolume)
+		const PxArray<PxU32>& dirtyIds = rigidVolumeFilters.getDirtyIds();
+		for (PxU32 i = 0; i < dirtyIds.size(); ++i)
 		{
-			PX_COMPILE_TIME_ASSERT(sizeof(Dy::VolumeVolumeFilter) == sizeof(PxgNonRigidFilterPair));
-			Cm::PinnableArray<PxgNonRigidFilterPair>& filterPairs = reinterpret_cast<Cm::PinnableArray<PxgNonRigidFilterPair>&>(*deformableVolume->mVolumeVolumeFilterPairs);
-
-			const PxU32 gpuRemapIndex = deformableVolume->getGpuRemapId();
-
-			PxgSoftBodyBuffer* buffer = mSoftBodyDataBuffer[gpuRemapIndex];
-
-			const PxU32 nbFilterPairs = filterPairs.size();
-			buffer->filterPairs.allocate(sizeof(PxgNonRigidFilterPair) * nbFilterPairs, PX_FL);
-
-			mCudaContext->memcpyHtoDAsync(buffer->filterPairs.getDevicePtr(), filterPairs.begin(), nbFilterPairs * sizeof(PxgNonRigidFilterPair), bpStream);
-
+			const PxU32 gpuRemapIndex = dirtyIds[i];
 			PxgSoftBody& gpuSoftBody = softBodyPool[gpuRemapIndex];
-			gpuSoftBody.mFilteringPairs = reinterpret_cast<PxgNonRigidFilterPair*>(buffer->filterPairs.getDevicePtr());
-			gpuSoftBody.mNumFilterPairs = nbFilterPairs;
 
-			deformableVolume->mFilterDirty = false;
-			deformableVolume->mFilterInDirtyList = false;
+			uploadDeformableFilterPairs(*mCudaContext, bpStream, *rigidVolumeFilters.getPerActorPairs()[gpuRemapIndex],
+				mSoftBodyDataBuffer[gpuRemapIndex]->rigidVolumeFilterPairs,
+				gpuSoftBody.mRigidVolumeFilterPairs, gpuSoftBody.mNumRigidVolumeFilterPairs);
 		}
 	}
 
-	if (data.dirtyRigidAttachments)
 	{
-		Cm::PinnableArray<PxgFEMRigidAttachment>& rigidAttachments = *data.rigidAttachments;
-		const PxU32 numDirtyAttachments = rigidAttachments.size();
+		const PxArray<PxU32>& dirtyIds = volumeVolumeFilters.getDirtyIds();
+		for (PxU32 i = 0; i < dirtyIds.size(); ++i)
+		{
+			const PxU32 gpuRemapIndex = dirtyIds[i];
+			PxgSoftBody& gpuSoftBody = softBodyPool[gpuRemapIndex];
+
+			uploadDeformableFilterPairs(*mCudaContext, bpStream, *volumeVolumeFilters.getPerActorPairs()[gpuRemapIndex],
+				mSoftBodyDataBuffer[gpuRemapIndex]->volumeVolumeFilterPairs,
+				gpuSoftBody.mVolumeVolumeFilterPairs, gpuSoftBody.mNumVolumeVolumeFilterPairs);
+		}
+	}
+
+	{
+		const PxArray<PxU32>& dirtyIds = volumeSurfaceFilters.getDirtyIds();
+		for (PxU32 i = 0; i < dirtyIds.size(); ++i)
+		{
+			const PxU32 gpuRemapIndex = dirtyIds[i];
+			PxgSoftBody& gpuSoftBody = softBodyPool[gpuRemapIndex];
+
+			uploadDeformableFilterPairs(*mCudaContext, bpStream, *volumeSurfaceFilters.getPerActorPairs()[gpuRemapIndex],
+				mSoftBodyDataBuffer[gpuRemapIndex]->volumeSurfaceFilterPairs,
+				gpuSoftBody.mVolumeSurfaceFilterPairs, gpuSoftBody.mNumVolumeSurfaceFilterPairs);
+		}
+	}
+
+	if (rigidAttachments.mAttachmentsDirty)
+	{
+		const PxU32 numDirtyAttachments = rigidAttachments.mAttachments.size();
 		if (numDirtyAttachments > 0)
 		{
-			mSoftBodyRigidAttachments.allocate(sizeof(PxgFEMRigidAttachment)* numDirtyAttachments, PX_FL);
-			mCudaContext->memcpyHtoDAsync(mSoftBodyRigidAttachments.getDevicePtr(), rigidAttachments.begin(), numDirtyAttachments * sizeof(PxgFEMRigidAttachment), bpStream);
+			mSoftBodyRigidAttachments.allocate(sizeof(PxgDeformableAttachment)* numDirtyAttachments, PX_FL);
+			mCudaContext->memcpyHtoDAsync(mSoftBodyRigidAttachments.getDevicePtr(), rigidAttachments.mAttachments.begin(), numDirtyAttachments * sizeof(PxgDeformableAttachment), bpStream);
 
 			mSoftBodyRigidAttachmentBlocks.allocateElements((numDirtyAttachments + 31) / 32, PX_FL);
 
@@ -1469,93 +1506,76 @@ void PxgSimulationCore::gpuMemDmaUpSoftBodies(Cm::PinnableArray<PxgSoftBody>& ne
 		}
 	}
 
-	if (data.dirtyRigidFilterPairs)
+	if (rigidAttachments.mActiveAttachmentsDirty)
 	{
-		Cm::PinnableArray<PxgRigidFilterPair>& rigidFilterPairs = *data.rigidFilterPairs;
-		const PxU32 numDirtyPairs = rigidFilterPairs.size();
-
-		mSoftBodyRigidFilterPairs.allocate(sizeof(PxgRigidFilterPair)* numDirtyPairs, PX_FL);
-		mCudaContext->memcpyHtoDAsync(mSoftBodyRigidFilterPairs.getDevicePtr(), rigidFilterPairs.begin(), numDirtyPairs * sizeof(PxgRigidFilterPair), bpStream);
-
-		mNbRigidSoftBodyFilters = numDirtyPairs;
-	}
-
-	if (data.dirtyActiveRigidAttachments)
-	{
-		Cm::PinnableArray<PxU32>& activeRigidAttachments = *data.activeRigidAttachments;
-		const PxU32 nbActiveAttachments = activeRigidAttachments.size();
+		const PxU32 nbActiveAttachments = rigidAttachments.mActiveAttachments.size();
 		if (nbActiveAttachments > 0)
 		{
 			mActiveSoftBodyRigidConstraints.allocate(sizeof(PxU32)*nbActiveAttachments, PX_FL);
 
-			mCudaContext->memcpyHtoDAsync(mActiveSoftBodyRigidConstraints.getDevicePtr(), activeRigidAttachments.begin(), nbActiveAttachments * sizeof(PxU32), bpStream);
+			mCudaContext->memcpyHtoDAsync(mActiveSoftBodyRigidConstraints.getDevicePtr(), rigidAttachments.mActiveAttachments.begin(), nbActiveAttachments * sizeof(PxU32), bpStream);
 		}
 
 		mCudaContext->memsetD32Async(mNumSoftBodyRigidAttachments.getDevicePtr(), nbActiveAttachments, 1, bpStream);
 		mNbRigidSoftBodyAttachments = nbActiveAttachments;
 	}
 
-	if (data.dirtySoftBodyAttachments)
+	if (rigidAttachments.mActiveRigidRefCountsDirty)
 	{
-		Cm::PinnableArray<PxgFEMFEMAttachment>& softBodyAttachments = *data.softBodyAttachments;
-		const PxU32 numDirtyAttachments = softBodyAttachments.size();
+		const PxU32 nbRefCounts = rigidAttachments.mActiveRigidRefCounts.size();
+		if (nbRefCounts > 0)
+		{
+			mSoftBodyRigidAttachmentRigidRefCounts.allocate(sizeof(PxU32)*nbRefCounts, PX_FL);
+			mCudaContext->memcpyHtoDAsync(mSoftBodyRigidAttachmentRigidRefCounts.getDevicePtr(), rigidAttachments.mActiveRigidRefCounts.begin(), nbRefCounts * sizeof(PxU32), bpStream);
+		}
+	}
+
+	if (softBodyAttachments.mAttachmentsDirty)
+	{
+		const PxU32 numDirtyAttachments = softBodyAttachments.mAttachments.size();
 		if (numDirtyAttachments > 0)
 		{
-			mSoftBodySoftBodyAttachments.allocate(sizeof(PxgFEMFEMAttachment)* numDirtyAttachments, PX_FL);
-			mCudaContext->memcpyHtoDAsync(mSoftBodySoftBodyAttachments.getDevicePtr(), softBodyAttachments.begin(), numDirtyAttachments * sizeof(PxgFEMFEMAttachment), bpStream);
+			mSoftBodySoftBodyAttachments.allocate(sizeof(PxgDeformableAttachment)* numDirtyAttachments, PX_FL);
+			mCudaContext->memcpyHtoDAsync(mSoftBodySoftBodyAttachments.getDevicePtr(), softBodyAttachments.mAttachments.begin(), numDirtyAttachments * sizeof(PxgDeformableAttachment), bpStream);
 
 			mSoftBodySoftBodyAttachmentBlocks.allocateElements((numDirtyAttachments + 31) / 32, PX_FL);
 		}
 	}
 
-	if (data.dirtyActiveSoftBodyAttachments)
+	if (softBodyAttachments.mActiveAttachmentsDirty)
 	{
-		Cm::PinnableArray<PxU32>& activeSoftBodyAttachments = *data.activeSoftBodyAttachments;
-		const PxU32 nbActiveAttachments = activeSoftBodyAttachments.size();
+		const PxU32 nbActiveAttachments = softBodyAttachments.mActiveAttachments.size();
 		if (nbActiveAttachments > 0)
 		{
 			mActiveSoftBodySoftBodyConstraints.allocate(sizeof(PxU32)*nbActiveAttachments, PX_FL);
 
-			mCudaContext->memcpyHtoDAsync(mActiveSoftBodySoftBodyConstraints.getDevicePtr(), activeSoftBodyAttachments.begin(), nbActiveAttachments * sizeof(PxU32), bpStream);
+			mCudaContext->memcpyHtoDAsync(mActiveSoftBodySoftBodyConstraints.getDevicePtr(), softBodyAttachments.mActiveAttachments.begin(), nbActiveAttachments * sizeof(PxU32), bpStream);
 		}
 
 		mCudaContext->memsetD32Async(mNumSoftBodySoftBodyAttachments.getDevicePtr(), nbActiveAttachments, 1, bpStream);
 		mNbSoftBodySoftBodyAttachments = nbActiveAttachments;
 	}
 
-	if (data.dirtyClothAttachments)
+	if (clothAttachments.mAttachmentsDirty)
 	{
-		Cm::PinnableArray<PxgFEMFEMAttachment>& clothAttachments = *data.clothAttachments;
-		const PxU32 numDirtyAttachments = clothAttachments.size();
+		const PxU32 numDirtyAttachments = clothAttachments.mAttachments.size();
 		if (numDirtyAttachments > 0)
 		{
-			mSoftBodyClothAttachments.allocate(sizeof(PxgFEMFEMAttachment)* numDirtyAttachments, PX_FL);
-			mCudaContext->memcpyHtoDAsync(mSoftBodyClothAttachments.getDevicePtr(), clothAttachments.begin(), numDirtyAttachments * sizeof(PxgFEMFEMAttachment), bpStream);
+			mSoftBodyClothAttachments.allocate(sizeof(PxgDeformableAttachment)* numDirtyAttachments, PX_FL);
+			mCudaContext->memcpyHtoDAsync(mSoftBodyClothAttachments.getDevicePtr(), clothAttachments.mAttachments.begin(), numDirtyAttachments * sizeof(PxgDeformableAttachment), bpStream);
 
 			mSoftBodyClothAttachmentBlocks.allocateElements((numDirtyAttachments + 31) / 32, PX_FL);
 		}
 	}
 
-	if (data.dirtyClothFilterPairs)
+	if (clothAttachments.mActiveAttachmentsDirty)
 	{
-		Cm::PinnableArray<PxgNonRigidFilterPair>& clothFilterPairs = *data.clothFilterPairs;
-		const PxU32 numDirtyPairs = clothFilterPairs.size();
-
-		mSoftBodyClothFilterPairs.allocate(sizeof(PxgNonRigidFilterPair)* numDirtyPairs, PX_FL);
-		mCudaContext->memcpyHtoDAsync(mSoftBodyClothFilterPairs.getDevicePtr(), clothFilterPairs.begin(), numDirtyPairs * sizeof(PxgNonRigidFilterPair), bpStream);
-
-		mNbClothSoftBodyFilters = numDirtyPairs;
-	}
-
-	if (data.dirtyActiveClothAttachments)
-	{
-		Cm::PinnableArray<PxU32>& activeClothAttachments = *data.activeClothAttachments;
-		const PxU32 nbActiveAttachments = activeClothAttachments.size();
+		const PxU32 nbActiveAttachments = clothAttachments.mActiveAttachments.size();
 		if (nbActiveAttachments > 0)
 		{
 			mActiveSoftBodyClothConstraints.allocate(sizeof(PxU32)*nbActiveAttachments, PX_FL);
 
-			mCudaContext->memcpyHtoDAsync(mActiveSoftBodyClothConstraints.getDevicePtr(), activeClothAttachments.begin(), nbActiveAttachments * sizeof(PxU32), bpStream);
+			mCudaContext->memcpyHtoDAsync(mActiveSoftBodyClothConstraints.getDevicePtr(), clothAttachments.mActiveAttachments.begin(), nbActiveAttachments * sizeof(PxU32), bpStream);
 		}
 
 		mCudaContext->memsetD32Async(mNumSoftBodyClothAttachments.getDevicePtr(), nbActiveAttachments, 1, bpStream);
@@ -1602,7 +1622,7 @@ void PxgSimulationCore::gpuMemDmaUpSoftBodies(Cm::PinnableArray<PxgSoftBody>& ne
 
 	bool anyDirty = mGpuContext->mGpuSoftBodyCore->updateUserData(softBodyPool, softBodyNodeIndexPool, 
 		bodySimManager.mActiveSoftbodies.begin(), nbActiveSoftBodies,
-		bodySimsLL) || nbDirtyFilterPairs > 0;
+		bodySimsLL) || filterPairsDirty;
 		
 	if (anyDirty)
 	{
@@ -1622,19 +1642,11 @@ void PxgSimulationCore::gpuMemDmaUpFEMCloths(Cm::PinnableArray<PxgFEMCloth>& new
 	Cm::PinnableArray<PxU32>& femClothElementIndexPool,
 	PxArray<PxU32>& femClothNodeIndexPool,
 	PxgBodySimManager& bodySimManager,
-	Cm::PinnableArray<PxgFEMRigidAttachment>& rigidAttachments,
-	Cm::PinnableArray<PxgRigidFilterPair>& rigidAttachmentIds,
-	bool dirtyRigidAttachments,
-	bool dirtyRigidFilterPairs,
-	Cm::PinnableArray<PxU32>& activeRigidAttachments,
-	bool dirtyActiveRigidAttachments,
-	Cm::PinnableArray<PxgFEMFEMAttachment>& clothAttachments,
-	Cm::PinnableArray<PxgNonRigidFilterPair>& clothVertTriFilterIds,
-	bool dirtyClothAttachments,
-	bool dirtyClothFilterPairs,
-	Cm::PinnableArray<PxU32>& activeClothAttachments,
-	bool dirtyActiveClothAttachments
-)
+	PxgAttachmentManager& rigidAttachments,
+	PxgAttachmentManager& clothAttachments,
+	const PxgDeformableFilterManager& rigidSurfaceFilters,
+	const PxgDeformableFilterManager& surfaceSurfaceFilters,
+	const PxArray<PxgDeformableSurfaceTopology*>& surfaceTopologies)
 {
 	PX_PROFILE_ZONE("GpuSimulationController.gpuMemDmaUpFEMCloths", 0);
 
@@ -1758,7 +1770,7 @@ void PxgSimulationCore::gpuMemDmaUpFEMCloths(Cm::PinnableArray<PxgFEMCloth>& new
 		buffer->prevPositionInRestOffset.allocateElements(numVerts, PX_FL);
 
 		buffer->triangleMeshData.allocate(triangleMeshByteSize, PX_FL);
-		buffer->trianglesWithActiveEdges.allocateElements(newFEMCloth.mNbTrianglesWithActiveEdges, PX_FL);
+		buffer->trianglesWithOwnedEdges.allocateElements(newFEMCloth.mNbTrianglesWithOwnedEdges, PX_FL);
 		buffer->triangleVertexIndices.allocateElements(numTriangles, PX_FL);
 
 		PxU32 remapOutputSize = PxMax(newFEMClothData.mSharedTriPairRemapOutputSize, newFEMClothData.mNonSharedTriPairRemapOutputSize);
@@ -1812,8 +1824,8 @@ void PxgSimulationCore::gpuMemDmaUpFEMCloths(Cm::PinnableArray<PxgFEMCloth>& new
 		}
 
 		mCudaContext->memcpyHtoDAsync(buffer->triangleMeshData.getDevicePtr(), newFEMCloth.mTriMeshData, triangleMeshByteSize, bpStream);
-		mCudaContext->memcpyHtoDAsync(buffer->trianglesWithActiveEdges.getDevicePtr(), newFEMCloth.mTrianglesWithActiveEdges, newFEMCloth.mNbTrianglesWithActiveEdges * sizeof(PxU32), bpStream);
-		mCudaContext->memcpyHtoDAsync(buffer->triangleVertexIndices.getDevicePtr(), newFEMCloth.mTriangleVertexIndices, numTriangles * sizeof(uint4), bpStream);
+		mCudaContext->memcpyHtoDAsync(buffer->trianglesWithOwnedEdges.getDevicePtr(), newFEMCloth.mTrianglesWithOwnedEdges, newFEMCloth.mNbTrianglesWithOwnedEdges * sizeof(PxU32), bpStream);
+		mCudaContext->memcpyHtoDAsync(buffer->triangleVertexIndices.getDevicePtr(), newFEMCloth.mTriangleVertexIndices_ownedEdges, numTriangles * sizeof(uint4), bpStream);
 
 		mCudaContext->memcpyHtoDAsync(buffer->materialIndices.getDevicePtr(), newFEMCloth.mMaterialIndices, numTriangles * sizeof(PxU16), bpStream);
 		mCudaContext->memcpyHtoDAsync(buffer->dynamicfrictions.getDevicePtr(), newFEMCloth.mDynamicFrictions, numVerts * sizeof(float), bpStream);
@@ -1828,8 +1840,12 @@ void PxgSimulationCore::gpuMemDmaUpFEMCloths(Cm::PinnableArray<PxgFEMCloth>& new
 		femCloth.mPrevPositionInContactOffset = buffer->prevPositionInContactOffset.getTypedPtr();
 		femCloth.mPrevPositionInRestOffset = buffer->prevPositionInRestOffset.getTypedPtr();
 
-		femCloth.mTrianglesWithActiveEdges = buffer->trianglesWithActiveEdges.getTypedPtr();
-		femCloth.mTriangleVertexIndices = buffer->triangleVertexIndices.getTypedPtr();
+		femCloth.mTrianglesWithOwnedEdges = buffer->trianglesWithOwnedEdges.getTypedPtr();
+		femCloth.mTriangleVertexIndices_ownedEdges = buffer->triangleVertexIndices.getTypedPtr();
+
+		// The topology has been uploaded. Its edge ownership stays, since the element filters need it for
+		// as long as the surface is in the scene.
+		surfaceTopologies[gpuRemapIndex]->releaseUploadData();
 
 		if (numNonSharedTriangles)
 		{
@@ -1876,6 +1892,12 @@ void PxgSimulationCore::gpuMemDmaUpFEMCloths(Cm::PinnableArray<PxgFEMCloth>& new
 
 		femCloth.mPackedNodeBounds = buffer->packedNodeBounds.getTypedPtr();
 
+		// Filter pairs are set by the dirty loop further down.
+		femCloth.mRigidSurfaceFilterPairs = NULL;
+		femCloth.mSurfaceSurfaceFilterPairs = NULL;
+		femCloth.mNumRigidSurfaceFilterPairs = 0;
+		femCloth.mNumSurfaceSurfaceFilterPairs = 0;
+
 		femCloth.mMaterialIndices = buffer->materialIndices.getTypedPtr();
 		femCloth.mDynamicFrictions = buffer->dynamicfrictions.getTypedPtr();
 
@@ -1891,12 +1913,12 @@ void PxgSimulationCore::gpuMemDmaUpFEMCloths(Cm::PinnableArray<PxgFEMCloth>& new
 		femCloth.mNbVerts = newFEMCloth.mNbVerts;
 		femCloth.mNbTriangles = newFEMCloth.mNbTriangles;
 		femCloth.mNbNonSharedTriangles = newFEMCloth.mNbNonSharedTriangles;
-		femCloth.mNbTrianglesWithActiveEdges = newFEMCloth.mNbTrianglesWithActiveEdges;
+		femCloth.mNbTrianglesWithOwnedEdges = newFEMCloth.mNbTrianglesWithOwnedEdges;
 
 		femCloth.mNbTrianglePairs = newFEMCloth.mNbTrianglePairs;
 		femCloth.mNbSharedTrianglePairs = newFEMCloth.mNbSharedTrianglePairs;
 		femCloth.mNbNonSharedTrianglePairs = newFEMCloth.mNbNonSharedTrianglePairs;
-		femCloth.mRestDistance = newFEMCloth.mRestDistance;
+		femCloth.mRestOffset = newFEMCloth.mRestOffset;
 		femCloth.mOriginalContactOffset = newFEMCloth.mOriginalContactOffset;
 
 		femCloth.mElementIndex = newFEMCloth.mElementIndex;
@@ -1932,7 +1954,7 @@ void PxgSimulationCore::gpuMemDmaUpFEMCloths(Cm::PinnableArray<PxgFEMCloth>& new
 
 		mMaxNbClothVerts = PxMax(numVerts, mMaxNbClothVerts);
 		mMaxNbClothTriangles = PxMax(numTriangles, mMaxNbClothTriangles);
-		mMaxNbClothTrianglesWithActiveEdges = PxMax(newFEMCloth.mNbTrianglesWithActiveEdges, mMaxNbClothTrianglesWithActiveEdges);
+		mMaxNbClothTrianglesWithOwnedEdges = PxMax(newFEMCloth.mNbTrianglesWithOwnedEdges, mMaxNbClothTrianglesWithOwnedEdges);
 
 		mMaxNbNonSharedTriPartitions = PxMax(newFEMCloth.mNbNonSharedTriPartitions, mMaxNbNonSharedTriPartitions);
 
@@ -1973,72 +1995,92 @@ void PxgSimulationCore::gpuMemDmaUpFEMCloths(Cm::PinnableArray<PxgFEMCloth>& new
 		mFEMClothWakeCounts[gpuRemapIndex] = dyDeformableSurfaceCore.wakeCounter;
 	}
 
-	if (dirtyRigidAttachments)
+	if (rigidAttachments.mAttachmentsDirty)
 	{
-		const PxU32 numDirtyAttachments = rigidAttachments.size();
+		const PxU32 numDirtyAttachments = rigidAttachments.mAttachments.size();
 		if (numDirtyAttachments > 0)
 		{
-			mClothRigidAttachments.allocate(sizeof(PxgFEMRigidAttachment)*rigidAttachments.size(), PX_FL);
-			mCudaContext->memcpyHtoDAsync(mClothRigidAttachments.getDevicePtr(), rigidAttachments.begin(), rigidAttachments.size() * sizeof(PxgFEMRigidAttachment), bpStream);
+			mClothRigidAttachments.allocate(sizeof(PxgDeformableAttachment)*numDirtyAttachments, PX_FL);
+			mCudaContext->memcpyHtoDAsync(mClothRigidAttachments.getDevicePtr(), rigidAttachments.mAttachments.begin(), numDirtyAttachments * sizeof(PxgDeformableAttachment), bpStream);
 
-			mClothRigidAttachmentBlocks.allocateElements((rigidAttachments.size() + 31) / 32, PX_FL);
+			mClothRigidAttachmentBlocks.allocateElements((numDirtyAttachments + 31) / 32, PX_FL);
 
-			mClothRigidAttachmentIds.allocate(sizeof(PxNodeIndex)*rigidAttachments.size(), PX_FL);
+			mClothRigidAttachmentIds.allocate(sizeof(PxNodeIndex)*numDirtyAttachments, PX_FL);
 
 			mGpuContext->getGpuFEMClothCore()->reserveRigidDeltaVelBuf(numDirtyAttachments);
 		}
 	}
 
-	if (dirtyRigidFilterPairs)
 	{
-		mClothRigidFilterPairs.allocate(sizeof(PxgRigidFilterPair)*rigidAttachmentIds.size(), PX_FL);
-		mCudaContext->memcpyHtoDAsync(mClothRigidFilterPairs.getDevicePtr(), rigidAttachmentIds.begin(), rigidAttachmentIds.size() * sizeof(PxgRigidFilterPair), bpStream);
+		const PxArray<PxU32>& dirtyIds = rigidSurfaceFilters.getDirtyIds();
+		for (PxU32 i = 0; i < dirtyIds.size(); ++i)
+		{
+			const PxU32 gpuRemapIndex = dirtyIds[i];
+			PxgFEMCloth& gpuFEMCloth = femClothPool[gpuRemapIndex];
 
-		mNbRigidClothFilters = rigidAttachmentIds.size();
+			uploadDeformableFilterPairs(*mCudaContext, bpStream, *rigidSurfaceFilters.getPerActorPairs()[gpuRemapIndex],
+				mFEMClothDataBuffer[gpuRemapIndex]->rigidSurfaceFilterPairs,
+				gpuFEMCloth.mRigidSurfaceFilterPairs, gpuFEMCloth.mNumRigidSurfaceFilterPairs);
+		}
 	}
 
-	if (dirtyActiveRigidAttachments)
 	{
-		const PxU32 nbActiveAttachments = activeRigidAttachments.size();
+		const PxArray<PxU32>& dirtyIds = surfaceSurfaceFilters.getDirtyIds();
+		for (PxU32 i = 0; i < dirtyIds.size(); ++i)
+		{
+			const PxU32 gpuRemapIndex = dirtyIds[i];
+			PxgFEMCloth& gpuFEMCloth = femClothPool[gpuRemapIndex];
+
+			uploadDeformableFilterPairs(*mCudaContext, bpStream, *surfaceSurfaceFilters.getPerActorPairs()[gpuRemapIndex],
+				mFEMClothDataBuffer[gpuRemapIndex]->surfaceSurfaceFilterPairs,
+				gpuFEMCloth.mSurfaceSurfaceFilterPairs, gpuFEMCloth.mNumSurfaceSurfaceFilterPairs);
+		}
+	}
+
+	if (rigidAttachments.mActiveAttachmentsDirty)
+	{
+		const PxU32 nbActiveAttachments = rigidAttachments.mActiveAttachments.size();
 
 		if (nbActiveAttachments > 0)
 		{
 			mActiveClothRigidAttachments.allocate(sizeof(PxU32)*nbActiveAttachments, PX_FL);
-			mCudaContext->memcpyHtoDAsync(mActiveClothRigidAttachments.getDevicePtr(), activeRigidAttachments.begin(), nbActiveAttachments * sizeof(PxU32), bpStream);
+			mCudaContext->memcpyHtoDAsync(mActiveClothRigidAttachments.getDevicePtr(), rigidAttachments.mActiveAttachments.begin(), nbActiveAttachments * sizeof(PxU32), bpStream);
 		}
 		mCudaContext->memsetD32Async(mNumClothRigidAttachments.getDevicePtr(), nbActiveAttachments, 1, bpStream);
 		mNbRigidClothAttachments = nbActiveAttachments;
 	}
 
-	//cloth vs cloth attachments
-	if (dirtyClothAttachments)
+	if (rigidAttachments.mActiveRigidRefCountsDirty)
 	{
-		const PxU32 numDirtyAttachments = clothAttachments.size();
-		if (numDirtyAttachments > 0)
+		const PxU32 nbRefCounts = rigidAttachments.mActiveRigidRefCounts.size();
+		if (nbRefCounts > 0)
 		{
-			mClothClothAttachments.allocate(sizeof(PxgFEMFEMAttachment)*clothAttachments.size(), PX_FL);
-			mCudaContext->memcpyHtoDAsync(mClothClothAttachments.getDevicePtr(), clothAttachments.begin(), clothAttachments.size() * sizeof(PxgFEMFEMAttachment), bpStream);
-
-			mClothClothAttachmentBlocks.allocateElements((clothAttachments.size() + 31) / 32, PX_FL);
+			mClothRigidAttachmentRigidRefCounts.allocate(sizeof(PxU32)*nbRefCounts, PX_FL);
+			mCudaContext->memcpyHtoDAsync(mClothRigidAttachmentRigidRefCounts.getDevicePtr(), rigidAttachments.mActiveRigidRefCounts.begin(), nbRefCounts * sizeof(PxU32), bpStream);
 		}
 	}
 
-	if (dirtyClothFilterPairs)
+	//cloth vs cloth attachments
+	if (clothAttachments.mAttachmentsDirty)
 	{
-		mClothClothVertTriFilterPairs.allocate(sizeof(PxgNonRigidFilterPair)*clothVertTriFilterIds.size(), PX_FL);
-		mCudaContext->memcpyHtoDAsync(mClothClothVertTriFilterPairs.getDevicePtr(), clothVertTriFilterIds.begin(), clothVertTriFilterIds.size() * sizeof(PxgNonRigidFilterPair), bpStream);
+		const PxU32 numDirtyAttachments = clothAttachments.mAttachments.size();
+		if (numDirtyAttachments > 0)
+		{
+			mClothClothAttachments.allocate(sizeof(PxgDeformableAttachment)*numDirtyAttachments, PX_FL);
+			mCudaContext->memcpyHtoDAsync(mClothClothAttachments.getDevicePtr(), clothAttachments.mAttachments.begin(), numDirtyAttachments * sizeof(PxgDeformableAttachment), bpStream);
 
-		mNbClothClothVertTriFilters = clothVertTriFilterIds.size();
+			mClothClothAttachmentBlocks.allocateElements((numDirtyAttachments + 31) / 32, PX_FL);
+		}
 	}
 
-	if (dirtyActiveClothAttachments)
+	if (clothAttachments.mActiveAttachmentsDirty)
 	{
-		const PxU32 nbActiveAttachments = activeClothAttachments.size();
+		const PxU32 nbActiveAttachments = clothAttachments.mActiveAttachments.size();
 
 		if (nbActiveAttachments > 0)
 		{
 			mActiveClothClothAttachments.allocate(sizeof(PxU32)*nbActiveAttachments, PX_FL);
-			mCudaContext->memcpyHtoDAsync(mActiveClothClothAttachments.getDevicePtr(), activeClothAttachments.begin(), nbActiveAttachments * sizeof(PxU32), bpStream);
+			mCudaContext->memcpyHtoDAsync(mActiveClothClothAttachments.getDevicePtr(), clothAttachments.mActiveAttachments.begin(), nbActiveAttachments * sizeof(PxU32), bpStream);
 		}
 		mCudaContext->memsetD32Async(mNumClothClothAttachments.getDevicePtr(), nbActiveAttachments, 1, bpStream);
 		mNbClothClothAttachments = nbActiveAttachments;
@@ -2066,7 +2108,7 @@ void PxgSimulationCore::gpuMemDmaUpFEMCloths(Cm::PinnableArray<PxgFEMCloth>& new
 	PxU32* activeFEMCloths = bodySimManager.mActiveFEMCloths.begin();
 
 	bool anyDirty = mGpuContext->mGpuFEMClothCore->updateUserData(femClothPool, femClothNodeIndexPool, activeFEMCloths, nbActiveFEMCloths,
-		bodySimsLL);
+		bodySimsLL) || rigidSurfaceFilters.isDirty() || surfaceSurfaceFilters.isDirty();
 
 	if (anyDirty)
 	{
@@ -2093,19 +2135,43 @@ void PxgSimulationCore::gpuMemDmaUpParticleSystem(PxgBodySimManager& bodySimMana
 	}
 }
 
-//This is called before Bp - only runs if direct-GPU API is on.
+// Called in the broadphase first pass, after the upload of the changed-handle map and before the broadphase update. Only runs
+// if the direct GPU API is on.
 void PxgSimulationCore::mergeChangedAABBMgHandle()
 {
-	// AD: the scary thing here is that we initialized this during the previous sim step, so the pointers could all be wrong?
-	
-	CUstream stream = mGpuContext->getGpuBroadPhase()->getBpStream();
+	PxgCudaBroadPhaseSap* broadPhase = mGpuContext->getGpuBroadPhase();
+	PxgAABBManager* aabbManager = broadPhase->getAABBManager();
 
-	CUdeviceptr updatedActorDescd = mUpdatedActorDescBuffer.getDevicePtr();
+	// The broadphase upload of the changed-handle map can reallocate its device copy, so its address and word count are read
+	// here, after that upload. The merge needs only the words of the host map, which covers all element IDs of the last step
+	// and therefore all update flags.
+	const CUdeviceptr changedHandlesd = aabbManager->getChangedAABBMgrHandles();
+	const PxU32 nbChangedHandleWords = PxMin(aabbManager->getChangedAABBMgrHandlesWordCount(), aabbManager->getChangedAABBMgrHandlesDeviceWordCount());
+	const PxU32 nbUpdated = mNbDirectGPUUpdateFlags;
+
+	if (!changedHandlesd || !nbChangedHandleWords || !nbUpdated)
+	{
+		return;
+	}
+
+	CUstream stream = broadPhase->getBpStream();
+
+	const CUdeviceptr updatedd = mDirectGPUUpdateFlagsBuffer.getDevicePtr();
+
+	const PxgTypedCudaBuffer<PxU32>& groups = broadPhase->getGroupsBuffer();
+	const CUdeviceptr groupsd = groups.getDevicePtr();
+	const PxU32 nbGroups = PxU32(groups.getSize() / sizeof(PxU32));
+
 	CUfunction kernelFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::MERGE_AABBMGR_HANDLES);
 
 	PxCudaKernelParam kernelParams[] =
 	{
-		PX_CUDA_KERNEL_PARAM(updatedActorDescd)
+		PX_CUDA_KERNEL_PARAM(updatedd),
+		PX_CUDA_KERNEL_PARAM(nbUpdated),
+		PX_CUDA_KERNEL_PARAM(groupsd),
+		PX_CUDA_KERNEL_PARAM(nbGroups),
+		PX_CUDA_KERNEL_PARAM(changedHandlesd),
+		PX_CUDA_KERNEL_PARAM(nbChangedHandleWords)
 	};
 
 	CUresult result = mCudaContext->launchKernel(kernelFunction, PxgSimulationCoreKernelGridDim::UPDATE_AABBMGR_HANDLES, 1, 1, PxgSimulationCoreKernelBlockDim::UPDATE_AABBMGR_HANDLES, 1, 1, 0, stream, kernelParams, sizeof(kernelParams), 0, PX_FL);
@@ -2192,8 +2258,8 @@ void PxgSimulationCore::gpuMemDmaBack(Cm::PinnableArray<PxU32>& frozenArray,
 	mCudaContext->memcpyDtoHAsync(activateArray.begin(), mActivateBuffer.getDevicePtr(), sizeof(PxU32)*numActiveBodies, mStream);
 	mCudaContext->memcpyDtoHAsync(deactiveArray.begin(), mDeactivateBuffer.getDevicePtr(), sizeof(PxU32)*numActiveBodies, mStream);
 
-	// DMA accelerations back to CPU (kernel was launched in update())
-	if (hasAccelerationBuffers())
+	// CPU getters use this DMA copy; DirectGPU/OmniPVD gather from mBodySimAccelerationsCudaBuffer.
+	if (hasAccelerationBuffers() && !mGpuContext->getEnableDirectGPUAPI())
 	{
 		const PxU32 nbBodies = mNbTotalBodySim;
 		mCudaContext->memcpyDtoHAsync(mBodySimAccelerationsPinned.begin(), mBodySimAccelerationsCudaBuffer.getDevicePtr(), sizeof(PxgRigidBodyAcceleration) * nbBodies, mStream);
@@ -2433,6 +2499,62 @@ void PxgSimulationCore::updateArticulations(const PxU32 nbNewArticulations, PxgA
 	}
 }
 
+// A removed articulation leaves its record in its slot until another articulation is uploaded to that slot. Its island node
+// can be taken over by an articulation in another slot, so the kinematic update without an index list must skip the record.
+void PxgSimulationCore::markRemovedArticulationSlotsEmpty(const PxgBodySimManager& bodySimManager)
+{
+	const PxU32 nbRemoved = bodySimManager.mDeferredFreeNodeIDs.size();
+	if (nbRemoved == 0)
+	{
+		return;
+	}
+
+	// Steps without solver work do not wait for the stream, so the last launch can still be reading mRemovedArticulationSlots.
+	mCudaContext->eventSynchronize(mRemovedArticulationSlotsEvent);
+
+	if (!mRemovedArticulationSlots.resize(nbRemoved))
+	{
+		PxGetFoundation().error(PxErrorCode::eOUT_OF_MEMORY, PX_FL,
+			"PxgSimulationCore::markRemovedArticulationSlotsEmpty: failed to allocate pinned host buffer for removed articulations");
+		mCudaContext->setAbortMode(true);
+		return;
+	}
+
+	PxU32 nbSlots = 0;
+	for (PxU32 i = 0; i < nbRemoved; ++i)
+	{
+		const PxHashMap<PxU32, PxU32>::Entry* entry = bodySimManager.mNodeToRemapMap.find(bodySimManager.mDeferredFreeNodeIDs[i]);
+		if (entry && entry->second < mNbTotalArticulations)
+		{
+			mRemovedArticulationSlots[nbSlots++] = entry->second;
+		}
+	}
+
+	if (nbSlots == 0)
+	{
+		return;
+	}
+
+	CUdeviceptr articulations = mArticulationBuffer.getDevicePtr();
+	const void* slots = getMappedDeviceConstPtr(mCudaContext, mRemovedArticulationSlots.begin());
+	PxCudaKernelParam kernelParams[] =
+	{
+		PX_CUDA_KERNEL_PARAM(articulations),
+		PX_CUDA_KERNEL_PARAM(slots),
+		PX_CUDA_KERNEL_PARAM(nbSlots)
+	};
+
+	CUfunction kernelFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::MARK_ARTICULATION_SLOTS_EMPTY);
+
+	const PxU32 numThreadsPerBlock = PxgSimulationCoreKernelBlockDim::MARK_ARTICULATION_SLOTS_EMPTY;
+	const PxU32 numBlocks = (nbSlots + numThreadsPerBlock - 1) / numThreadsPerBlock;
+
+	const CUresult result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, numThreadsPerBlock, 1, 1, 0, mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
+	PX_UNUSED(result);
+
+	mCudaContext->eventRecord(mRemovedArticulationSlotsEvent, mStream);
+}
+
 template<typename T>
 static PX_FORCE_INLINE void resizeAndCopyToDeviceBuffer(const Cm::PinnableArray<T>& hostBuffer, 
 	PxgTypedCudaBuffer<T>& deviceBuffer,
@@ -2637,6 +2759,13 @@ void PxgSimulationCore::update(bool enableDirectGPUAPI)
 	CUstream stream = mGpuContext->mGpuSolverCore->getStream();
 
 	synchronizeStreams(mCudaContext, stream, mStream, mEvent);
+
+	// After the solver, the kinematic targets of the direct GPU API are written to the body sims, so that
+	// updateTransformCacheAndBoundArrayLaunch computes the shapes of the kinematics at their targets.
+	if(mGpuContext->getEnableDirectGPUAPI())
+	{
+		applyKinematicTargets();
+	}
 		
 	CUfunction kernelFunction = mGpuKernelWranglerManager->getCuFunction(PxgKernelIds::UPDATE_TRANSFORMCACHE_AND_BOUNDARRAY);
 
@@ -2884,52 +3013,114 @@ PxU64 PxgSimulationCore::getRigidBodyDataTypeElementSize(PxRigidDynamicGPUAPIWri
 void PxgSimulationCore::ovdRigidBodyCallback(const void* PX_RESTRICT data, const PxRigidDynamicGPUIndex* PX_RESTRICT gpuIndices, PxRigidDynamicGPUAPIWriteType::Enum dataType, PxU32 nbElements)
 {
 	PxgSimulationController* controller = mGpuContext->getSimulationController();
-	if (controller->getEnableOVDReadback() && controller->getOVDCallbacks())
+	PxsSimulationControllerOVDCallbacks* callback = controller->getOVDCallbacks();
+	if (nbElements && controller->getOVDReadbackMode() != PxsOVDReadbackMode::eDISABLED && callback && callback->isRigidDynamicWriteEnabled(dataType))
 	{
-		PxU32 dataBufferBytes = PxU32(getRigidBodyDataTypeElementSize(dataType)) * PxU32(nbElements);
-		mOvdDataBuffer.resizeUninitialized(dataBufferBytes);
-
-		PxU32 indexBufferBytes = sizeof(PxRigidDynamicGPUIndex) * PxU32(nbElements);
-		mOvdIndexBuffer.resizeUninitialized(indexBufferBytes);
-
-		if (mOvdDataBuffer.begin() && mOvdIndexBuffer.begin())
+		const PxU32 elementSize = PxU32(getRigidBodyDataTypeElementSize(dataType));
+		if (!elementSize || nbElements > PX_MAX_U32 / elementSize || nbElements > PX_MAX_U32 / sizeof(PxRigidDynamicGPUIndex))
+		{ callback->reportReadbackFailure(); return; }
+		// setRigidDynamicData() made only mStream wait for startEvent. The copies below run on the
+		// legacy default stream, which does not wait for non-blocking streams.
+		if (mCudaContext->streamSynchronize(mStream))
+		{ callback->reportReadbackFailure(); return; }
+		mOvdIndexBuffer.resizeUninitialized(sizeof(PxRigidDynamicGPUIndex) * nbElements);
+		if (!mOvdIndexBuffer.begin()
+			|| mCudaContext->memcpyDtoH(mOvdIndexBuffer.begin(), CUdeviceptr(gpuIndices), sizeof(PxRigidDynamicGPUIndex) * nbElements))
+		{ callback->reportReadbackFailure(); return; }
+		PxRigidDynamicGPUIndex* indices = reinterpret_cast<PxRigidDynamicGPUIndex*>(mOvdIndexBuffer.begin());
+		PxgBodySimManager& manager = controller->getBodySimManager();
+		mOvdBatchPositions.clear();
+		for (PxU32 i = 0; i < nbElements; ++i)
 		{
-			////////////////////////////////////////////////////////////////////////////////
-			// Copy the forces and gpuIndices from GPU -> CPU
-			////////////////////////////////////////////////////////////////////////////////
-			PxCUresult resultData = mCudaContext->memcpyDtoH(mOvdDataBuffer.begin(), CUdeviceptr(data), dataBufferBytes);
-			PxCUresult resultIndices = mCudaContext->memcpyDtoH(mOvdIndexBuffer.begin(), CUdeviceptr(gpuIndices), indexBufferBytes);
-			if (!resultData && !resultIndices)
-			{
-				////////////////////////////////////////////////////////////////////////////////
-				// Call NpDirectGPUAPI layer callback
-				////////////////////////////////////////////////////////////////////////////////
-				controller->getOVDCallbacks()->processRigidDynamicSet(reinterpret_cast<PxsRigidBody **>(controller->getBodySimManager().mBodies.begin()),
-					mOvdDataBuffer.begin(), reinterpret_cast<PxRigidDynamicGPUIndex*>(mOvdIndexBuffer.begin()), dataType, nbElements);
-			}
+			const PxU32 index = indices[i];
+			if (index >= manager.mBodies.size() || !manager.mBodies[index])
+			{ callback->reportReadbackFailure(); return; }
+			if (!callback->isRigidDynamicCaptured(*static_cast<PxsRigidBody*>(manager.mBodies[index]))) continue;
+			indices[mOvdBatchPositions.size()] = index;
+			mOvdBatchPositions.pushBack(i);
 		}
+		const PxU32 count = mOvdBatchPositions.size();
+		if (!count) return;
+		mOvdDataBuffer.resizeUninitialized(elementSize * count);
+		if (!mOvdDataBuffer.begin()) { callback->reportReadbackFailure(); return; }
+		// Merge consecutive positions in the caller's batch, preserving its order and duplicates.
+		for (PxU32 first = 0; first < count;)
+		{
+			PxU32 end = first + 1;
+			while (end < count && mOvdBatchPositions[end] == mOvdBatchPositions[end - 1] + 1) ++end;
+			const PxU32 bytes = (end - first) * elementSize;
+			if (mCudaContext->memcpyDtoH(mOvdDataBuffer.begin() + first * elementSize,
+				CUdeviceptr(data) + mOvdBatchPositions[first] * elementSize, bytes))
+			{ callback->reportReadbackFailure(); return; }
+			controller->recordOmniPvdReadbackCopy(bytes);
+			first = end;
+		}
+		callback->processRigidDynamicSet(reinterpret_cast<PxsRigidBody**>(manager.mBodies.begin()),
+			mOvdDataBuffer.begin(), indices, dataType, count);
 	}
+}
+
+bool PxgSimulationCore::ovdReadbackRigidDynamicData(const PxRigidDynamicGPUIndex* gpuIndices, PxU32 nbElements,
+	PxRigidDynamicGPUAPIReadType::Enum dataType)
+{
+	PxgSimulationController* controller = mGpuContext->getSimulationController();
+	PxsSimulationControllerOVDCallbacks* callback = controller->getOVDCallbacks();
+	if (!nbElements || controller->getOVDReadbackMode() == PxsOVDReadbackMode::eDISABLED || !callback || !callback->isRigidDynamicReadEnabled(dataType)) return true;
+	const PxU32 elementSize = dataType == PxRigidDynamicGPUAPIReadType::eGLOBAL_POSE ? sizeof(PxTransform) : sizeof(PxVec3);
+	if (!gpuIndices || nbElements > PX_MAX_U32 / elementSize) return false;
+	PxgBodySimManager& manager = controller->getBodySimManager();
+	mOvdSnapshotValidIndices.clear();
+	for (PxU32 i = 0; i < nbElements; ++i)
+	{
+		const PxU32 index = gpuIndices[i];
+		if (index < mNbTotalBodySim && index < manager.mBodies.size() && manager.mBodies[index]
+			&& !(static_cast<PxsRigidBody*>(manager.mBodies[index])->mInternalFlags & PxsRigidBody::eFIRST_BODY_COPY_GPU)
+			&& callback->isRigidDynamicStateRequired(*static_cast<PxsRigidBody*>(manager.mBodies[index]), dataType)) mOvdSnapshotValidIndices.pushBack(index);
+	}
+	const PxU32 count = mOvdSnapshotValidIndices.size();
+	if (!count) return true;
+	const PxU32 bytes = count * elementSize;
+	{
+		PxScopedCudaLock lock(*mCudaContextManager);
+		mOvdSnapshotIndexBuffer.allocateElements(count, PX_FL);
+		mOvdReadbackDataBuffer.allocateElements(bytes, PX_FL);
+		mOvdDataBuffer.resizeUninitialized(bytes);
+		if (!mOvdSnapshotIndexBuffer.getDevicePtr() || !mOvdReadbackDataBuffer.getDevicePtr() || !mOvdDataBuffer.begin()
+			|| mCudaContext->memcpyHtoDAsync(mOvdSnapshotIndexBuffer.getDevicePtr(), mOvdSnapshotValidIndices.begin(), sizeof(PxRigidDynamicGPUIndex) * count, mStream)) return false;
+	}
+	if (!getRigidDynamicData(reinterpret_cast<void*>(mOvdReadbackDataBuffer.getDevicePtr()),
+		reinterpret_cast<const PxRigidDynamicGPUIndex*>(mOvdSnapshotIndexBuffer.getDevicePtr()), dataType, count, NULL, NULL)) return false;
+	{
+		PxScopedCudaLock lock(*mCudaContextManager);
+		if (mCudaContext->memcpyDtoH(mOvdDataBuffer.begin(), mOvdReadbackDataBuffer.getDevicePtr(), bytes)) return false;
+	}
+	controller->recordOmniPvdReadbackCopy(bytes);
+	callback->processRigidDynamicRead(reinterpret_cast<PxsRigidBody**>(manager.mBodies.begin()), mOvdDataBuffer.begin(),
+		mOvdSnapshotValidIndices.begin(), dataType, count);
+	return true;
 }
 
 void PxgSimulationCore::ovdSnapshotRigidDynamicForces(const PxRigidDynamicGPUIndex* gpuIndices, PxU32 nbElements)
 {
 	PxgSimulationController* controller = mGpuContext->getSimulationController();
-	if (nbElements == 0 || !controller->getEnableOVDReadback() || !controller->getOVDCallbacks())
+	if (nbElements == 0 || controller->getOVDReadbackMode() == PxsOVDReadbackMode::eDISABLED || !controller->getOVDCallbacks()
+		|| !controller->getOVDCallbacks()->isRigidDynamicWriteEnabled(PxRigidDynamicGPUAPIWriteType::eFORCE))
 		return;
 
 	PxScopedCudaLock _lock(*mCudaContextManager);
 
-	// Keep only indices that address a resident body in the device pool. A body can have a valid island
-	// node index yet not be in the GPU pool yet (added but not simulated since), and indexing past the
-	// pool would read out of bounds. Use the live body count, not the buffer capacity: the device buffer
-	// is grown with slack and its tail memset to 0xFFFFFFFF, so a capacity bound would let a tail slot
-	// through and read garbage. The count sizes to the body count once the scene has simulated.
+	// Keep only uploaded bodies below the device pool's high-water count. A new body can reuse a
+	// retired body's index while the device slot still contains the retired body's state. The first-copy
+	// flag prevents reading that slot until the new body is uploaded. The count excludes unused capacity.
 	const PxU32 nbResidentBodies = mNbTotalBodySim;
 	mOvdSnapshotValidIndices.forceSize_Unsafe(0);
 	mOvdSnapshotValidIndices.reserve(nbElements);
 	for (PxU32 i = 0; i < nbElements; ++i)
 	{
-		if (gpuIndices[i] < nbResidentBodies)
+		const PxgBodySimManager& manager = controller->getBodySimManager();
+		if (gpuIndices[i] < nbResidentBodies && gpuIndices[i] < manager.mBodies.size() && manager.mBodies[gpuIndices[i]]
+			&& !(static_cast<PxsRigidBody*>(manager.mBodies[gpuIndices[i]])->mInternalFlags & PxsRigidBody::eFIRST_BODY_COPY_GPU)
+			&& controller->getOVDCallbacks()->isRigidDynamicCaptured(*static_cast<PxsRigidBody*>(manager.mBodies[gpuIndices[i]])))
 			mOvdSnapshotValidIndices.pushBack(gpuIndices[i]);
 	}
 	const PxU32 nbValid = mOvdSnapshotValidIndices.size();
@@ -2939,15 +3130,19 @@ void PxgSimulationCore::ovdSnapshotRigidDynamicForces(const PxRigidDynamicGPUInd
 	// Upload the gathered node indices and size a matching output buffer.
 	mOvdSnapshotIndexBuffer.allocateElements(nbValid, PX_FL);
 	mOvdSnapshotDataBuffer.allocateElements(nbValid, PX_FL);
-	if (mCudaContext->memcpyHtoD(mOvdSnapshotIndexBuffer.getDevicePtr(), mOvdSnapshotValidIndices.begin(), sizeof(PxRigidDynamicGPUIndex) * nbValid))
-		return;
-
+	if (!mOvdSnapshotIndexBuffer.getDevicePtr() || !mOvdSnapshotDataBuffer.getDevicePtr())
+	{ controller->getOVDCallbacks()->reportReadbackFailure(); return; }
 	const CUdeviceptr bodySimBufferDevicePtr = getBodySimBufferDevicePtr();
 	const CUdeviceptr indicesDevicePtr = mOvdSnapshotIndexBuffer.getDevicePtr();
 	const CUdeviceptr dataDevicePtr = mOvdSnapshotDataBuffer.getDevicePtr();
 
 	mOvdSnapshotForce.resizeUninitialized(nbValid);
 	mOvdSnapshotTorque.resizeUninitialized(nbValid);
+	if (!mOvdSnapshotForce.begin() || !mOvdSnapshotTorque.begin())
+	{ controller->getOVDCallbacks()->reportReadbackFailure(); return; }
+	// Upload indices on the nonblocking stream that consumes them, before any gather kernel.
+	if (mCudaContext->memcpyHtoDAsync(mOvdSnapshotIndexBuffer.getDevicePtr(), mOvdSnapshotValidIndices.begin(), sizeof(PxRigidDynamicGPUIndex) * nbValid, mStream))
+	{ controller->getOVDCallbacks()->reportReadbackFailure(); return; }
 
 	// Two passes through the same output buffer: read force, copy it out, then read torque.
 	const PxU16 kernelIds[2] = { PxgKernelIds::RIGID_DYNAMIC_GET_FORCE, PxgKernelIds::RIGID_DYNAMIC_GET_TORQUE };
@@ -2967,15 +3162,18 @@ void PxgSimulationCore::ovdSnapshotRigidDynamicForces(const PxRigidDynamicGPUInd
 		const PxU32 numBlocks = (nbValid + blockDims[pass] - 1) / blockDims[pass];
 		CUresult result = mCudaContext->launchKernel(kernelFunction, numBlocks, 1, 1, blockDims[pass], 1, 1, 0,
 		                                             mStream, kernelParams, sizeof(kernelParams), 0, PX_FL);
-		if (result == CUDA_SUCCESS)
-			result = mCudaContext->streamSynchronize(mStream);
+		// Drain the index upload even if kernel launch fails, before the pinned array is reused.
+		const CUresult syncResult = mCudaContext->streamSynchronize(mStream);
+		if (result == CUDA_SUCCESS) result = syncResult;
 		if (result != CUDA_SUCCESS)
 		{
 			PxGetFoundation().error(PxErrorCode::eINTERNAL_ERROR, PX_FL, "ovdSnapshotRigidDynamicForces: CUDA error, code %u\n", result);
+			controller->getOVDCallbacks()->reportReadbackFailure();
 			return;
 		}
 		if (mCudaContext->memcpyDtoH(hostOut[pass], dataDevicePtr, sizeof(PxVec3) * nbValid))
-			return;
+		{ controller->getOVDCallbacks()->reportReadbackFailure(); return; }
+		controller->recordOmniPvdReadbackCopy(sizeof(PxVec3) * nbValid);
 	}
 
 	// Emit only the bodies that actually carry a retained force/torque, matching what the live
@@ -3212,11 +3410,7 @@ void PxgSimulationCore::gpuDmaUpdateData()
 	desc.mBodySimBufferDeviceData = getBodySimBufferDeviceData().getPointer();
 	desc.mBounds = reinterpret_cast<PxBounds3*>(mGpuContext->mGpuBp->getBoundsBuffer().getDevicePtr());
 
-	desc.mUpdated = reinterpret_cast<PxU32*>(mUpdatedDirectBuffer.getDevicePtr());
-	
-	PxgAABBManager* aabbManager = mGpuContext->mGpuBp->getAABBManager();
-	desc.mChangedAABBMgrHandles = reinterpret_cast<PxU32*>(aabbManager->getChangedAABBMgrHandles());
-	desc.mBitMapWordCounts = aabbManager->getChangedAABBMgrHandlesWordCount();
+	desc.mUpdated = reinterpret_cast<PxU32*>(mDirectGPUUpdateFlagsBuffer.getDevicePtr());
 
 	PxgShapeManager& shapeManager = mGpuContext->mGpuNpCore->getGpuShapeManager();
 	desc.mRigidNodeIndices = reinterpret_cast<PxNodeIndex*>(shapeManager.mGpuRigidIndiceBuffer.getDevicePtr());
@@ -3227,14 +3421,61 @@ void PxgSimulationCore::gpuDmaUpdateData()
 	mCudaContext->memcpyHtoDAsync(mUpdatedActorDescBuffer.getDevicePtr(), &desc, sizeof(PxgUpdateActorDataDesc), mStream);
 }
 
+void PxgSimulationCore::stageKinematicTarget(PxU32 nodeIndex, const PxTransform& body2World)
+{
+	// The copies of the previous step read the staged targets, so they are waited for before the first target of this step.
+	if(mKinematicTargetNodes.empty())
+	{
+		PxScopedCudaLock _lock(*mCudaContextManager);
+		mKinematicTargetCopyManager.waitAndReset(mCudaContext);
+		mKinematicTargets.forceSize_Unsafe(0);
+	}
+
+	const PxAlignedTransform target(body2World.p.x, body2World.p.y, body2World.p.z,
+		PxAlignedQuat(body2World.q.x, body2World.q.y, body2World.q.z, body2World.q.w));
+	if(!mKinematicTargets.pushBack(target))
+	{
+		PxGetFoundation().error(PxErrorCode::eOUT_OF_MEMORY, PX_FL, "PxgSimulationCore: failed to allocate pinned host buffer for kinematic targets");
+		mCudaContext->setAbortMode(true);
+		return;
+	}
+	mKinematicTargetNodes.pushBack(nodeIndex);
+}
+
+void PxgSimulationCore::applyKinematicTargets()
+{
+	const PxU32 nbTargets = mKinematicTargetNodes.size();
+	if(!nbTargets)
+	{
+		return;
+	}
+
+	// The addresses are taken now, because the upload of this step can grow the body sims.
+	const CUdeviceptr bodySimsd = mBodySimCudaBuffer.getDevicePtr();
+	const PxAlignedTransform* targetsd = reinterpret_cast<const PxAlignedTransform*>(getMappedDeviceConstPtr(mCudaContext, mKinematicTargets.begin()));
+	for(PxU32 i = 0; i < nbTargets; i++)
+	{
+		PxgCopyDesc desc;
+		desc.dest = size_t(bodySimsd + mKinematicTargetNodes[i] * sizeof(PxgBodySim) + PX_OFFSET_OF(PxgBodySim, body2World));
+		desc.source = size_t(targetsd + i);
+		desc.bytes = sizeof(PxAlignedTransform);
+		mKinematicTargetCopyManager.pushDeferredHtoD(desc);
+	}
+	mKinematicTargetCopyManager.dispatchCopy(mStream, mCudaContextManager, mGpuKernelWranglerManager);
+
+	// The targets stay until the copies have run. The first stageKinematicTarget() of the next step waits for them and resets
+	// the targets.
+	mKinematicTargetNodes.clear();
+}
+
 void PxgSimulationCore::initDirectGPUAPIDescriptor()
 {
-	PxgAABBManager* aabbManager = mGpuContext->mGpuBp->getAABBManager();
-	const PxU32 bitMapWordCounts = aabbManager->getChangedAABBMgrHandlesWordCount();
-	const PxU32 roundElement = bitMapWordCounts * 32;
+	// One update flag per shape element ID, rounded up to a multiple of 32. The merge combines each group of 32 flags into one
+	// word of the changed-handle map.
+	mNbDirectGPUUpdateFlags = (getNumTotalShapes() + 31) & ~31u;
 
-	mUpdatedDirectBuffer.allocate(roundElement * sizeof(PxU32), PX_FL);
-	mCudaContext->memsetD32Async(mUpdatedDirectBuffer.getDevicePtr(), 0, roundElement, mStream);
+	mDirectGPUUpdateFlagsBuffer.allocate(mNbDirectGPUUpdateFlags * sizeof(PxU32), PX_FL);
+	mCudaContext->memsetD32Async(mDirectGPUUpdateFlagsBuffer.getDevicePtr(), 0, mNbDirectGPUUpdateFlags, mStream);
 
 	gpuDmaUpdateData();
 }

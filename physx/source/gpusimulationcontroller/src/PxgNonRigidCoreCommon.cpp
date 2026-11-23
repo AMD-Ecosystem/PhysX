@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
-// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PxgNonRigidCoreCommon.h"
 #include "cudamanager/PxCudaContext.h"
@@ -59,17 +36,16 @@ PxgNonRigidCore::PxgNonRigidCore(PxgCudaKernelWranglerManager* gpuKernelWrangler
 	mRSDesc(allocDesc.hostAlloc, statType),
 	mRadixSortDescBuf(allocDesc.deviceAlloc, statType),
 	mRadixCountTotalBuf(allocDesc.deviceAlloc, statType),
-	mContactByRigidBuf(allocDesc.deviceAlloc, statType),
-	mContactSortedByRigidBuf(allocDesc.deviceAlloc, statType),
-	mTempContactByRigidBitBuf(allocDesc.deviceAlloc, statType),
-	mContactRemapSortedByRigidBuf(allocDesc.deviceAlloc, statType),
-	mContactSortedByParticleBuf(allocDesc.deviceAlloc, statType),
-	mTempContactByParticleBitBuf(allocDesc.deviceAlloc, statType),
-	mContactRemapSortedByParticleBuf(allocDesc.deviceAlloc, statType),
-	mTempContactBuf(allocDesc.deviceAlloc, statType),
-	mTempContactRemapBuf(allocDesc.deviceAlloc, statType),
-	mTempContactBuf2(allocDesc.deviceAlloc, statType),
-	mTempContactRemapBuf2(allocDesc.deviceAlloc, statType),
+	mContactByRigidBuffer(allocDesc.deviceAlloc, statType),
+	mTempContactByRigidBitBuffer(allocDesc.deviceAlloc, statType),
+	mContactRemapSortedByRigidBuffer(allocDesc.deviceAlloc, statType),
+	mContactByParticleBuffer(allocDesc.deviceAlloc, statType),
+	mTempContactByParticleBitBuffer(allocDesc.deviceAlloc, statType),
+	mContactRemapSortedByParticleBuffer(allocDesc.deviceAlloc, statType),
+	mTempContactBuffer(allocDesc.deviceAlloc, statType),
+	mTempContactRemapBuffer(allocDesc.deviceAlloc, statType),
+	mTempContactBuffer2(allocDesc.deviceAlloc, statType),
+	mTempContactRemapBuffer2(allocDesc.deviceAlloc, statType),
 #if PX_ENABLE_SIM_STATS
 	mCollisionStackSizeBytesStats(0)
 #else
@@ -83,19 +59,18 @@ PxgNonRigidCore::PxgNonRigidCore(PxgCudaKernelWranglerManager* gpuKernelWrangler
 
 	const PxU32 maxContactsRoundedUp4 = (mMaxContacts + 3) & ~(4 - 1);
 
-	mContactByRigidBuf.allocateElements(mMaxContacts, PX_FL);							// PxNodeIndex, no radix sort.
-	mContactSortedByRigidBuf.allocateElements(mMaxContacts, PX_FL);						// PxNodeIndex, no radix sort.
-	mTempContactByRigidBitBuf.allocateElements(maxContactsRoundedUp4, PX_FL);			// PxU32, used in radix sort
-	mContactRemapSortedByRigidBuf.allocateElements(maxContactsRoundedUp4, PX_FL);		// PxU32, used in radix sort
+	mContactByRigidBuffer.allocateElements(mMaxContacts, PX_FL);							// PxNodeIndex, no radix sort.
+	mTempContactByRigidBitBuffer.allocateElements(maxContactsRoundedUp4, PX_FL);			// PxU32, used in radix sort
+	mContactRemapSortedByRigidBuffer.allocateElements(maxContactsRoundedUp4, PX_FL);		// PxU32, used in radix sort
 
-	mContactSortedByParticleBuf.allocateElements((mMaxContacts + 1) & ~(2 - 1), PX_FL);
-	mTempContactByParticleBitBuf.allocateElements(maxContactsRoundedUp4, PX_FL);		// PxU32, used in radix sort
-	mContactRemapSortedByParticleBuf.allocateElements(maxContactsRoundedUp4, PX_FL);	// PxU32, used in radix sort
+	mContactByParticleBuffer.allocateElements((mMaxContacts + 1) & ~(2 - 1), PX_FL);
+	mTempContactByParticleBitBuffer.allocateElements(maxContactsRoundedUp4, PX_FL);		// PxU32, used in radix sort
+	mContactRemapSortedByParticleBuffer.allocateElements(maxContactsRoundedUp4, PX_FL);	// PxU32, used in radix sort
 		
-	mTempContactBuf.allocateElements(maxContactsRoundedUp4, PX_FL);			// PxU32, used in radix sort
-	mTempContactRemapBuf.allocateElements(maxContactsRoundedUp4, PX_FL);	// PxU32, used in radix sort
-	mTempContactBuf2.allocateElements(maxContactsRoundedUp4, PX_FL);		// PxU32, used in radix sort
-	mTempContactRemapBuf2.allocateElements(maxContactsRoundedUp4, PX_FL); 	// PxU32, used in radix sort
+	mTempContactBuffer.allocateElements(maxContactsRoundedUp4, PX_FL);			// PxU32, used in radix sort
+	mTempContactRemapBuffer.allocateElements(maxContactsRoundedUp4, PX_FL);	// PxU32, used in radix sort
+	mTempContactBuffer2.allocateElements(maxContactsRoundedUp4, PX_FL);		// PxU32, used in radix sort
+	mTempContactRemapBuffer2.allocateElements(maxContactsRoundedUp4, PX_FL); 	// PxU32, used in radix sort
 }
 
 PxgNonRigidCore::~PxgNonRigidCore()

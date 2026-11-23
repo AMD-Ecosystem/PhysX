@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-#include "UsdPCH.h"
+// @implements REQ-ATTACH-RESOLVE-001
+// @covers AC-3
+
+/**
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-27
+ */
 
 #include "InternalDeformableAttachment.h"
 #include "InternalDeformable.h"
@@ -20,28 +26,21 @@ using namespace omni::physx::internal;
 using namespace omni::physx::usdparser;
 using namespace ::physx;
 
-extern ObjectId getObjectId(const PXR_NS::SdfPath& path, PhysXType type);
+static ObjectId getObjectId(const AttachedStage& attachedStage, omni::physics::parse::ObjectKey key, PhysXType type)
+{
+    return getObjectDataOrID<ObjectDataQueryType::eOBJECT_ID>(
+        key, type, attachedStage.getInternalPhysXDatabase(), attachedStage);
+}
 
 using omni::physics::parse::ObjectKey;
 
 namespace
 {
-// Resolve a stored ObjectKey back to its SdfPath via the active stage (empty
-// path when no stage is attached). Attachments store source-agnostic keys, not
-// USD handles — see InternalDeformableAttachment.h.
-PXR_NS::SdfPath pathOf(ObjectKey key)
+// Diagnostic text for an endpoint key -- never null, empty string on miss (see
+// AttachedStage::textFor's doc comment).
+std::string textOf(const AttachedStage& attachedStage, ObjectKey key)
 {
-    AttachedStage* as = UsdLoad::getUsdLoad()->getActiveAttachedStage();
-    return as ? as->pathFor(key) : PXR_NS::SdfPath();
-}
-
-// Intern an SdfPath to its ObjectKey via the active stage (invalid key when no
-// stage is attached). Single-threaded on the attachment-create/load path,
-// matching the existing keyFor mint in createXformActor.
-ObjectKey keyOf(const PXR_NS::SdfPath& path)
-{
-    AttachedStage* as = UsdLoad::getUsdLoad()->getActiveAttachedStage();
-    return as ? as->keyFor(path) : ObjectKey{};
+    return attachedStage.textFor(key);
 }
 } // namespace
 
@@ -62,13 +61,13 @@ bool checkScenes(const PxActor* actor0, const PxActor* actor1)
     return s0 == s1;
 }
 
-bool matchingRigidBody(PXR_NS::SdfPath path, const PxActor* deformableActor, PxRigidActor*& rigidActor)
+bool matchingRigidBody(const AttachedStage& attachedStage, ObjectKey key, const PxActor* deformableActor, PxRigidActor*& rigidActor)
 {
     PhysXType internalType = ePTRemoved;
     PxRigidActor* actor = nullptr;
 
     {
-        PxArticulationLink* ptr = omni::physx::getPtr<PxArticulationLink>(ePTLink, getObjectId(path, ePTLink));
+        PxArticulationLink* ptr = omni::physx::getPtr<PxArticulationLink>(attachedStage.getInternalPhysXDatabase(), ePTLink, getObjectId(attachedStage, key, ePTLink));
         if (ptr)
         {
             internalType = ePTLink;
@@ -77,7 +76,7 @@ bool matchingRigidBody(PXR_NS::SdfPath path, const PxActor* deformableActor, PxR
     }
 
     {
-        InternalActor* internalPtr = omni::physx::getInternalPtr<InternalActor>(ePTActor, getObjectId(path, ePTActor));
+        InternalActor* internalPtr = omni::physx::getInternalPtr<InternalActor>(attachedStage.getInternalPhysXDatabase(), ePTActor, getObjectId(attachedStage, key, ePTActor));
         if (internalPtr)
         {
             internalType = ePTActor;
@@ -86,7 +85,7 @@ bool matchingRigidBody(PXR_NS::SdfPath path, const PxActor* deformableActor, PxR
     }
 
     {
-        PxShape* ptr = omni::physx::getPtr<PxShape>(ePTShape, getObjectId(path, ePTShape));
+        PxShape* ptr = omni::physx::getPtr<PxShape>(attachedStage.getInternalPhysXDatabase(), ePTShape, getObjectId(attachedStage, key, ePTShape));
         if (ptr)
         {
             internalType = ePTShape;
@@ -104,7 +103,7 @@ bool matchingRigidBody(PXR_NS::SdfPath path, const PxActor* deformableActor, PxR
         else
         {
             const OmniPhysX& omniPhysX = OmniPhysX::getInstance();
-            const omni::physx::internal::InternalPhysXDatabase& db = omniPhysX.getInternalPhysXDatabase();
+            const omni::physx::internal::InternalPhysXDatabase& db = attachedStage.getInternalPhysXDatabase();
             const InternalDatabase::Record* objectRecord = db.getFullRecord(internalType, (ObjectId)actor->userData);
 
             InternalActor* intActor = (InternalActor*)objectRecord->mInternalPtr;
@@ -123,10 +122,10 @@ bool matchingRigidBody(PXR_NS::SdfPath path, const PxActor* deformableActor, PxR
     return false;
 }
 
-PxActor* getPhysxActorFromPath(PXR_NS::SdfPath path, PhysXType& type)
+PxActor* getPhysxActorFromPath(const AttachedStage& attachedStage, ObjectKey key, PhysXType& type)
 {
     {
-        InternalVolumeDeformableBody* internalPtr = omni::physx::getInternalPtr<InternalVolumeDeformableBody>(ePTDeformableVolume, getObjectId(path, ePTDeformableVolume));
+        InternalVolumeDeformableBody* internalPtr = omni::physx::getInternalPtr<InternalVolumeDeformableBody>(attachedStage.getInternalPhysXDatabase(), ePTDeformableVolume, getObjectId(attachedStage, key, ePTDeformableVolume));
         if (internalPtr)
         {
             type = ePTDeformableVolume;
@@ -135,7 +134,7 @@ PxActor* getPhysxActorFromPath(PXR_NS::SdfPath path, PhysXType& type)
     }
 
     {
-        InternalSurfaceDeformableBody* internalPtr = omni::physx::getInternalPtr<InternalSurfaceDeformableBody>(ePTDeformableSurface, getObjectId(path, ePTDeformableSurface));
+        InternalSurfaceDeformableBody* internalPtr = omni::physx::getInternalPtr<InternalSurfaceDeformableBody>(attachedStage.getInternalPhysXDatabase(), ePTDeformableSurface, getObjectId(attachedStage, key, ePTDeformableSurface));
         if (internalPtr)
         {
             type = ePTDeformableSurface;
@@ -144,7 +143,7 @@ PxActor* getPhysxActorFromPath(PXR_NS::SdfPath path, PhysXType& type)
     }
 
     {
-        if (getObjectId(path, ePTXformActor) != kInvalidObjectId)
+        if (getObjectId(attachedStage, key, ePTXformActor) != kInvalidObjectId)
         {
             type = ePTXformActor;
             return nullptr;
@@ -152,9 +151,28 @@ PxActor* getPhysxActorFromPath(PXR_NS::SdfPath path, PhysXType& type)
     }
 
     {
-        PXR_NS::UsdGeomXformable xformable = PXR_NS::UsdGeomXformable::Get(UsdLoad::getUsdLoad()->getActiveStage(), path);
+        // Source-routed "is this endpoint an Xformable?" test. This used to be
+        // UsdGeomXformable::Get(getActiveStage(), path), which needs a live UsdStage:
+        // with none it posts a TF_CODING_ERROR ("Invalid stage") and hands back an
+        // invalid schema object, so every xform-anchored endpoint fell through to
+        // ePTRemoved and the attachment / element collision filter silently resolved
+        // to kInvalidObjectId. This is the whole deformable<->rigid surface, not an
+        // edge case: a UsdGeomCube carrying PhysicsRigidBodyAPI is an Xformable, so a
+        // plain rigid body is classified here too and setupXformAttachment then walks
+        // up to the real actor.
+        //
+        // isA() asks the same question of the parse source and is answered identically
+        // by both backends (measured: Xform/Cube/Mesh -> true; UsdPhysicsScene,
+        // Material, attachment prim and typeless prim -> false, on UsdSource and on
+        // OvstageSource with no backing stage). IPhysicsSource::exists() is NOT a
+        // substitute -- it is true for every live object, including the ones above.
+        // "Xformable" is the registered USD schema-type name for UsdGeomXformable
+        // (isA(key, internToken("Xformable")) is the same pxr-free pattern
+        // OvstageWalker::isXformable uses for this exact check), so this needs no
+        // pxr type at all -- schemaTypeToken<T>'s compile-time template is unnecessary here.
+        const omni::physics::parse::IPhysicsSource* src = attachedStage.getSource();
 
-        if (xformable)
+        if (src && src->isA(key, src->internToken("Xformable")))
         {
             type = ePTXformActor;
             return nullptr;
@@ -165,24 +183,19 @@ PxActor* getPhysxActorFromPath(PXR_NS::SdfPath path, PhysXType& type)
     return nullptr;
 }
 
-ObjectId InternalDeformableAttachment::createXformActor(PXR_NS::SdfPath path)
+ObjectId InternalDeformableAttachment::createXformActor(ObjectKey key)
 {
     PhysXType physxType;
 
-    getPhysxActorFromPath(path, physxType);
-    ObjectId objId = getObjectId(path, physxType);
+    getPhysxActorFromPath(mAttachedStage, key, physxType);
+    ObjectId objId = getObjectId(mAttachedStage, key, physxType);
 
     if (!(physxType == ePTXformActor && objId != kInvalidObjectId))
     {
-        // No attached stage means there are no records to register against, so skip the add.
-        AttachedStage* attachedStage = UsdLoad::getUsdLoad()->getActiveAttachedStage();
-        if (attachedStage)
-        {
-            objId = OmniPhysX::getInstance().getInternalPhysXDatabase().addRecord(
-                ePTXformActor, nullptr, nullptr, attachedStage->keyFor(path));
-
-            attachedStage->getObjectDatabase()->findOrCreateEntry(path, eXformActor, objId);
-        }
+        objId = mAttachedStage.getInternalPhysXDatabase().addRecord(
+            ePTXformActor, nullptr, nullptr, key);
+        mAttachedStage.getObjectDatabase()->findOrCreateEntry(
+            key, mAttachedStage.textFor(key), eXformActor, objId);
     }
 
     return objId;
@@ -190,104 +203,103 @@ ObjectId InternalDeformableAttachment::createXformActor(PXR_NS::SdfPath path)
 
 void InternalDeformableAttachment::setupXformAttachment()
 {
-    const PXR_NS::SdfPath src1Path = pathOf(mData[1].key);
-    PXR_NS::GfMatrix4d xformToWorld;
-    xformToWorld.SetIdentity();
-    if (AttachedStage* as = UsdLoad::getUsdLoad()->getActiveAttachedStage())
-        xformToWorld = getWorldTransform(*as, mData[1].key, PXR_NS::UsdTimeCode::Default());
+    const omni::physics::parse::IPhysicsSource* src = mAttachedStage.getSource();
+    const PxMat44d xformToWorld =
+        getWorldTransform(mAttachedStage, mData[1].key, omni::physics::parse::ReadTime::defaultTime());
 
-    const PXR_NS::GfTransform tr(xformToWorld);
-    mLocalTransform = toPhysX(tr);
-    mScale = toPhysX(tr.GetScale());
+    decomposeMatrix(mLocalTransform, mScale, xformToWorld);
 
-    mData[1].objId = createXformActor(src1Path);
+    mData[1].objId = createXformActor(mData[1].key);
 
-    PXR_NS::UsdStageWeakPtr stage = UsdLoad::getUsdLoad()->getActiveStage();
-    PXR_NS::UsdPrim usdPrim = stage->GetPrimAtPath(src1Path);
+    // Check if the xform is a child of a rigid body.
+    //
+    // Walks the ancestor chain by ObjectKey via IPhysicsSource::getParent (ADR-0019 decision 2:
+    // hierarchy arithmetic routes through the source abstraction that already provides it), not
+    // by SdfPath/UsdPrim. Checks the endpoint itself first, then each ancestor up to and
+    // including the source's synthetic root -- getParent(key) returns that root for any
+    // top-level object and the invalid sentinel once past it, so the walk terminates the same
+    // way the old `== AbsoluteRootPath()` SdfPath walk did: the root is checked exactly once,
+    // then the loop stops. No live UsdStage/UsdPrim involved.
+    ObjectKey walkKey = mData[1].key;
 
-    // Check if the xform is a child of a rigid body
-    while (usdPrim)
+    while (src && walkKey.valid())
     {
-        PXR_NS::SdfPath path = usdPrim.GetPath();
-
         {
-            PxArticulationLink* ptr = omni::physx::getPtr<PxArticulationLink>(ePTLink, getObjectId(path, ePTLink));
+            PxArticulationLink* ptr = omni::physx::getPtr<PxArticulationLink>(mAttachedStage.getInternalPhysXDatabase(), ePTLink, getObjectId(mAttachedStage, walkKey, ePTLink));
             if (ptr)
             {
                 mData[1].actor = ptr;
-                mData[1].rootKey = keyOf(path);
+                mData[1].rootKey = walkKey;
                 mData[1].rootObjId = (ObjectId)mData[1].actor->userData;
                 break;
             }
         }
 
         {
-            InternalActor* internalPtr = omni::physx::getInternalPtr<InternalActor>(ePTActor, getObjectId(path, ePTActor));
+            InternalActor* internalPtr = omni::physx::getInternalPtr<InternalActor>(mAttachedStage.getInternalPhysXDatabase(), ePTActor, getObjectId(mAttachedStage, walkKey, ePTActor));
             if (internalPtr)
             {
                 mData[1].actor = internalPtr->mActor;
-                mData[1].rootKey = keyOf(path);
+                mData[1].rootKey = walkKey;
                 mData[1].rootObjId = (ObjectId)mData[1].actor->userData;
                 break;
             }
         }
 
-        usdPrim = usdPrim.GetParent();
+        walkKey = src->getParent(walkKey);
     }
 
     if (mData[1].actor)
     {
         // Find matching rigid actor or mirrored actor
         PxRigidActor* rigidActor = nullptr;
-        if (matchingRigidBody(usdPrim.GetPath(), mData[0].actor, rigidActor))
+        if (matchingRigidBody(mAttachedStage, mData[1].rootKey, mData[0].actor, rigidActor))
         {
             setRigidActor(rigidActor);
 
             // Find the child to parent transform
-            PXR_NS::GfMatrix4d rigidToWorld;
-            rigidToWorld.SetIdentity();
-            if (AttachedStage* as = UsdLoad::getUsdLoad()->getActiveAttachedStage())
-                rigidToWorld = getWorldTransform(*as, mData[1].rootKey, PXR_NS::UsdTimeCode::Default());
+            const PxMat44d rigidToWorld =
+                getWorldTransform(mAttachedStage, mData[1].rootKey, omni::physics::parse::ReadTime::defaultTime());
 
-            const PXR_NS::GfTransform temp(rigidToWorld);
-            PxVec3 scale = toPhysX(temp.GetScale());
+            const PxVec3 scale = getScale(rigidToWorld);
 
-            PXR_NS::GfMatrix4d xformToRigid = xformToWorld * rigidToWorld.GetInverse();
-            const PXR_NS::GfTransform tr(xformToRigid);
-            mLocalTransform = toPhysX(tr);
+            // Gf wrote this as `xformToWorld * rigidToWorld.GetInverse()`. Gf's
+            // row-vector convention applies the left operand first, so that is
+            // "xform-local -> world -> rigid-local". PhysX is column-vector, so the
+            // same composition is written with the operands reversed; the matrices
+            // themselves are the identical sixteen doubles and are NOT transposed.
+            const PxMat44d xformToRigid = affineInverse(rigidToWorld) * xformToWorld;
+            mLocalTransform = toTransform(xformToRigid);
             mLocalTransform.p = mLocalTransform.p.multiply(scale);
         }
     }
 }
 
-InternalDeformableAttachment::InternalDeformableAttachment(PXR_NS::SdfPath path, const PhysxDeformableAttachmentDesc& desc)
+InternalDeformableAttachment::InternalDeformableAttachment(AttachedStage& attachedStage, ObjectKey key, const PhysxDeformableAttachmentDesc& desc)
+    : mAttachedStage(attachedStage)
 {
     mType = desc.type;
-    mKey = keyOf(path);
+    mKey = key;
 
-    // desc.src0/src1 are SdfPaths (resolved from parse-lib keys at parse time);
-    // intern them to source-agnostic keys for storage and use the local paths
-    // for the USD-side resolution below.
-    const PXR_NS::SdfPath srcPaths[2] = { desc.src0, desc.src1 };
-    mData[0].key = keyOf(srcPaths[0]);
-    mData[1].key = keyOf(srcPaths[1]);
+    mData[0].key = desc.src0;
+    mData[1].key = desc.src1;
 
     for (uint32_t i = 0; i < 2; i++)
     {
-        mData[i].actor = getPhysxActorFromPath(srcPaths[i], mData[i].physxType);
-        mData[i].objId = getObjectId(srcPaths[i], mData[i].physxType);
+        mData[i].actor = getPhysxActorFromPath(mAttachedStage, mData[i].key, mData[i].physxType);
+        mData[i].objId = getObjectId(mAttachedStage, mData[i].key, mData[i].physxType);
     }
 
     if (mData[0].actor == nullptr)
     {
         if (mData[1].actor == nullptr)
         {
-            std::string errorStr = "Physics Deformable Attachment " + path.GetString() + " cannot have 2 invalid actors.";
+            std::string errorStr = "Physics Deformable Attachment " + textOf(mAttachedStage, key) + " cannot have 2 invalid actors.";
             PhysXUsdPhysicsInterface::reportLoadError(usdparser::ErrorCode::eError, errorStr.c_str());
         }
         else
         {
-            std::string errorStr = "Physics Deformable Attachment " + path.GetString() + " cannot have an invalid deformable actor.";
+            std::string errorStr = "Physics Deformable Attachment " + textOf(mAttachedStage, key) + " cannot have an invalid deformable actor.";
             PhysXUsdPhysicsInterface::reportLoadError(usdparser::ErrorCode::eError, errorStr.c_str());
         }
 
@@ -301,8 +313,8 @@ InternalDeformableAttachment::InternalDeformableAttachment(PXR_NS::SdfPath path,
 
     if (mData[1].actor == nullptr)
     {
-        const std::string errorStr = "Physics Deformable Attachment " + path.GetString() +
-            ": no rigid actor at or above " + srcPaths[1].GetString() + ".";
+        const std::string errorStr = "Physics Deformable Attachment " + textOf(mAttachedStage, key) +
+            ": no rigid actor at or above " + textOf(mAttachedStage, desc.src1) + ".";
         PhysXUsdPhysicsInterface::reportLoadError(usdparser::ErrorCode::eWarning, errorStr.c_str());
     }
 
@@ -322,30 +334,30 @@ InternalDeformableAttachment::InternalDeformableAttachment(PXR_NS::SdfPath path,
     // PxArticulationLink::getArticulation().getScene(), then to the
     // omni.physx-side InternalLink/InternalActor mPhysXScene, which is valid
     // throughout load.
-    auto resolveInternalScene = [](PxActor* actor, const PXR_NS::SdfPath& path) -> InternalScene* {
+    auto resolveInternalScene = [this](PxActor* actor, ObjectKey key) -> InternalScene* {
         if (actor)
         {
             if (PxScene* s = actor->getScene())
-                return getInternalPtr<InternalScene>(ePTScene, omni::physx::usdparser::ObjectId(s->userData));
+                return getInternalPtr<InternalScene>(mAttachedStage.getInternalPhysXDatabase(), ePTScene, omni::physx::usdparser::ObjectId(s->userData));
             if (actor->getConcreteType() == PxConcreteType::eARTICULATION_LINK)
             {
                 PxArticulationLink* link = static_cast<PxArticulationLink*>(actor);
                 if (PxScene* s = link->getArticulation().getScene())
-                    return getInternalPtr<InternalScene>(ePTScene, omni::physx::usdparser::ObjectId(s->userData));
+                    return getInternalPtr<InternalScene>(mAttachedStage.getInternalPhysXDatabase(), ePTScene, omni::physx::usdparser::ObjectId(s->userData));
             }
         }
-        if (InternalLink* link = getInternalPtr<InternalLink>(ePTLink, getObjectId(path, ePTLink)))
+        if (InternalLink* link = getInternalPtr<InternalLink>(mAttachedStage.getInternalPhysXDatabase(), ePTLink, getObjectId(mAttachedStage, key, ePTLink)))
             if (link->mPhysXScene)
                 return link->mPhysXScene->getInternalScene();
-        if (InternalActor* a = getInternalPtr<InternalActor>(ePTActor, getObjectId(path, ePTActor)))
+        if (InternalActor* a = getInternalPtr<InternalActor>(mAttachedStage.getInternalPhysXDatabase(), ePTActor, getObjectId(mAttachedStage, key, ePTActor)))
             if (a->mPhysXScene)
                 return a->mPhysXScene->getInternalScene();
         return nullptr;
     };
 
-    mInternalScene = resolveInternalScene(mData[0].actor, srcPaths[0]);
+    mInternalScene = resolveInternalScene(mData[0].actor, mData[0].key);
     if (!mInternalScene)
-        mInternalScene = resolveInternalScene(mData[1].actor, srcPaths[1]);
+        mInternalScene = resolveInternalScene(mData[1].actor, mData[1].key);
 }
 
 InternalDeformableAttachment::~InternalDeformableAttachment()
@@ -459,7 +471,7 @@ void InternalDeformableAttachment::create()
 
     if (mDeformableAttachment == nullptr)
     {
-        std::string errorStr = "Failed to create Physics Deformable Attachment " + pathOf(mKey).GetString();
+        const std::string errorStr = "Failed to create Physics Deformable Attachment " + textOf(mAttachedStage, mKey);
         PhysXUsdPhysicsInterface::reportLoadError(usdparser::ErrorCode::eError, errorStr.c_str());
     }
     else
@@ -504,31 +516,25 @@ void InternalDeformableAttachment::update()
         {
             if (mData[1].actor)
             {
-                PXR_NS::GfMatrix4d xformToWorld;
-                xformToWorld.SetIdentity();
-                PXR_NS::GfMatrix4d rigidToWorld;
-                rigidToWorld.SetIdentity();
-                if (AttachedStage* as = UsdLoad::getUsdLoad()->getActiveAttachedStage())
-                {
-                    xformToWorld = getWorldTransform(*as, mData[1].key, PXR_NS::UsdTimeCode::Default());
-                    rigidToWorld = getWorldTransform(*as, mData[1].rootKey, PXR_NS::UsdTimeCode::Default());
-                }
+                const PxMat44d xformToWorld =
+                    getWorldTransform(mAttachedStage, mData[1].key, omni::physics::parse::ReadTime::defaultTime());
+                const PxMat44d rigidToWorld =
+                    getWorldTransform(mAttachedStage, mData[1].rootKey, omni::physics::parse::ReadTime::defaultTime());
 
-                const PXR_NS::GfTransform temp(rigidToWorld);
-                PxVec3 scale = toPhysX(temp.GetScale());
+                const PxVec3 scale = getScale(rigidToWorld);
 
-                PXR_NS::GfMatrix4d xformToRigid = xformToWorld * rigidToWorld.GetInverse();
-                const PXR_NS::GfTransform tr(xformToRigid);
-                mLocalTransform = toPhysX(tr);
+                // Operands reversed relative to the old Gf `xformToWorld *
+                // rigidToWorld.GetInverse()`: same composition order under PhysX's
+                // column-vector convention, no transpose. See setupXformAttachment.
+                const PxMat44d xformToRigid = affineInverse(rigidToWorld) * xformToWorld;
+                mLocalTransform = toTransform(xformToRigid);
                 mLocalTransform.p = mLocalTransform.p.multiply(scale);
             }
             else
             {
-                PXR_NS::GfMatrix4d localToWorld;
-                localToWorld.SetIdentity();
-                if (AttachedStage* as = UsdLoad::getUsdLoad()->getActiveAttachedStage())
-                    localToWorld = getWorldTransform(*as, mData[1].key, PXR_NS::UsdTimeCode::Default());
-                mLocalTransform = toPhysX(PXR_NS::GfTransform(localToWorld));
+                const PxMat44d localToWorld =
+                    getWorldTransform(mAttachedStage, mData[1].key, omni::physics::parse::ReadTime::defaultTime());
+                mLocalTransform = toTransform(localToWorld);
             }
 
             mDeformableAttachment->updatePose(mLocalTransform);
@@ -582,30 +588,29 @@ void InternalDeformableAttachment::setUpdateXformEvent(usdparser::ObjectId objId
     }
 }
 
-InternalDeformableCollisionFilter::InternalDeformableCollisionFilter(PXR_NS::SdfPath path, const PhysxDeformableCollisionFilterDesc& desc)
+InternalDeformableCollisionFilter::InternalDeformableCollisionFilter(AttachedStage& attachedStage, ObjectKey key, const PhysxDeformableCollisionFilterDesc& desc)
+    : mAttachedStage(attachedStage)
 {
-    mKey = keyOf(path);
+    mKey = key;
 
-    // desc.src0/src1 are SdfPaths; intern to source-agnostic keys for storage,
-    // keep the local paths for the USD-side resolution below.
-    const PXR_NS::SdfPath srcPaths[2] = { desc.src0, desc.src1 };
-    mData[0].key = keyOf(srcPaths[0]);
-    mData[1].key = keyOf(srcPaths[1]);
+    const ObjectKey srcKeys[2] = { desc.src0, desc.src1 };
+    mData[0].key = desc.src0;
+    mData[1].key = desc.src1;
 
     for (uint32_t i = 0; i < 2; i++)
     {
         mActorIndex[i] = i;
 
-        mData[i].actor = getPhysxActorFromPath(srcPaths[i], mData[i].physxType);
+        mData[i].actor = getPhysxActorFromPath(mAttachedStage, mData[i].key, mData[i].physxType);
 
         if (mData[i].physxType == ePTRemoved)
         {
-            std::string errorStr = "Physics Element Collision Filter " + path.GetString() + " has an invalid actor " + srcPaths[i].GetString();
+            std::string errorStr = "Physics Element Collision Filter " + textOf(mAttachedStage, key) + " has an invalid actor " + textOf(mAttachedStage, srcKeys[i]);
             PhysXUsdPhysicsInterface::reportLoadError(usdparser::ErrorCode::eError, errorStr.c_str());
             return;
         }
 
-        mData[i].objId = getObjectId(srcPaths[i], mData[i].physxType);
+        mData[i].objId = getObjectId(mAttachedStage, mData[i].key, mData[i].physxType);
     }
 
     // For ease of management, actor 0 is always a deformable
@@ -618,14 +623,14 @@ InternalDeformableCollisionFilter::InternalDeformableCollisionFilter(PXR_NS::Sdf
     {
         // Find matching rigid actor or mirrored actor
         PxRigidActor* rigidActor = nullptr;
-        if (matchingRigidBody(srcPaths[mActorIndex[1]], mData[mActorIndex[0]].actor, rigidActor))
+        if (matchingRigidBody(mAttachedStage, mData[mActorIndex[1]].key, mData[mActorIndex[0]].actor, rigidActor))
         {
             setRigidActor(rigidActor);
         }
         else
         {
             // Actor cannot be null for collision filtering
-            std::string errorStr = "Physics Element Collision Filter " + path.GetString() + " has an invalid actor " + srcPaths[mActorIndex[1]].GetString();
+            std::string errorStr = "Physics Element Collision Filter " + textOf(mAttachedStage, key) + " has an invalid actor " + textOf(mAttachedStage, srcKeys[mActorIndex[1]]);
             PhysXUsdPhysicsInterface::reportLoadError(usdparser::ErrorCode::eError, errorStr.c_str());
             return;
         }
@@ -642,7 +647,7 @@ InternalDeformableCollisionFilter::InternalDeformableCollisionFilter(PXR_NS::Sdf
 
     if (mData[mActorIndex[0]].actor->getScene() == mData[mActorIndex[1]].actor->getScene())
     {
-        mInternalScene = getInternalPtr<InternalScene>(ePTScene, omni::physx::usdparser::ObjectId(mData[mActorIndex[0]].actor->getScene()->userData));
+        mInternalScene = getInternalPtr<InternalScene>(mAttachedStage.getInternalPhysXDatabase(), ePTScene, omni::physx::usdparser::ObjectId(mData[mActorIndex[0]].actor->getScene()->userData));
     }
 }
 
@@ -698,7 +703,7 @@ void InternalDeformableCollisionFilter::create()
 
     if (mDeformableElementFilter == nullptr)
     {
-        std::string errorStr = "Failed to create Physics Element Collision Filter " + pathOf(mKey).GetString();
+        const std::string errorStr = "Failed to create Physics Element Collision Filter " + textOf(mAttachedStage, mKey);
         PhysXUsdPhysicsInterface::reportLoadError(usdparser::ErrorCode::eError, errorStr.c_str());
     }
 }

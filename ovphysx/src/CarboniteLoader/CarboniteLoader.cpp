@@ -1,12 +1,50 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
+
+/**
+ * @implements REQ-CAPI-LOG-001
+ * @covers AC-7
+ *
+ * @implements REQ-CAPI-CACHE-001
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5
+ *
+ * @implements REQ-CAPI-HOST-EXIT-001
+ * @covers AC-1 AC-2
+ *
+ * @implements REQ-PACKAGING-USDFREE-001
+ * @covers AC-6
+ *
+ * @implements REQ-PACKAGING-OMNICLIENT-001
+ * @covers AC-2
+ *
+ * @implements REQ-PACKAGING-CLOSURE-001
+ * @covers AC-2
+ *
+ * @implements REQ-CAPI-THREADING-001
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5
+ *
+ * @implements REQ-CAPI-PROFILER-002
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5 AC-6 AC-7 AC-8 AC-9 AC-10 AC-11
+ *
+ * @implements REQ-CAPI-CONFIG-001
+ * @covers AC-9
+ *
+ * @implements REQ-CAPI-DIRECTGPU-DIAG-001
+ * @covers AC-2
+ *
+ * @implements REQ-CAPI-COMPILED-CACHE-001
+ * @covers AC-4
+ */
 
 #include "CarboniteLoader/CarboniteLoader.hpp"
-#include "cuda_shim/CudaShim.h"
+#include "internal/GlobalState.hpp"
 #include "ovphysx/ovphysx_types.h"
 #include "LogManager.hpp"
+#include "internal/sdk/ovphysxSDKSidecarLoader.hpp"
 #include <omni/physx/PhysXRuntime.h>
 
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -14,15 +52,12 @@
 #include <string>
 #include <climits>
 #include <filesystem>
-#include <fstream>
 #include <atomic>
+#include <system_error>
 #include <unordered_set>
 #include <vector>
 
-#include "internal/sdk/LibraryPathUtils.hpp"
-#include "internal/sdk/NamespacedUsdLibraryUtils.hpp"
 #include "UsdSchemaPaths/UsdSchemaPaths.h"
-#include "UsdVersionCheck/UsdVersionCheck.h"
 
 #ifdef _WIN32
     #ifndef NOMINMAX
@@ -31,7 +66,6 @@
     #include <windows.h>
     #define PATH_MAX MAX_PATH
 #else
-    #include <dlfcn.h>
     #include <fcntl.h>
     #include <sys/stat.h>
     #include <unistd.h>
@@ -43,8 +77,12 @@
 #include <carb/filesystem/IFileSystem.h>
 #include <carb/logging/Log.h>
 #include <carb/logging/Logger.h>
+#include <carb/profiler/Profile.h>
 #include <carb/settings/ISettings.h>
+
+#include "internal/Profiling.h"
 #include <carb/tasking/ITasking.h>
+#include <carb/thread/Util.h>
 #include <carb/tokens/ITokens.h>
 #include <omni/core/Omni.h>
 #include <omni/ext/IExt.h>
@@ -53,12 +91,10 @@
 #include <omni/physx/IPhysxSimulation.h>
 #include <omni/physx/IPhysxSettings.h>
 
-// Static Carbonite plugins do not self-register just because their archives are
-// linked into ovphysx. Each generated registerPlugin symbol must be referenced
-// and called explicitly so the linker pulls in the archive object and the
-// interfaces become visible to this carb::Framework instance. This mirrors
-// the static-carb Physics wiring and the ovrtx static-carb setup; keep
-// the explicit list until Carbonite provides an aggregate registration helper.
+// Static Carbonite plugins do not self-register when their archives are linked
+// into ovphysx. Each generated registerPlugin symbol has to be referenced and
+// called explicitly so the linker keeps the archive object and the interfaces
+// become visible to this carb::Framework instance.
 extern "C" bool carb_assets_plugin_registerPlugin(carb::Framework*);
 extern "C" bool carb_datasource_file_plugin_registerPlugin(carb::Framework*);
 extern "C" bool carb_dictionary_plugin_registerPlugin(carb::Framework*);
@@ -71,6 +107,18 @@ extern "C" bool carb_tasking_plugin_registerPlugin(carb::Framework*);
 extern "C" bool carb_tokens_plugin_registerPlugin(carb::Framework*);
 extern "C" bool carb_variant_plugin_registerPlugin(carb::Framework*);
 
+// Set by the build to whether carb.profiler-nvtx.static was found (see CMakeLists.txt).
+// A carb package without it builds without the sink rather than failing to configure.
+#ifndef OVPHYSX_CARB_NVTX_BACKEND
+    #define OVPHYSX_CARB_NVTX_BACKEND 0
+#endif
+
+#if OVPHYSX_CARB_NVTX_BACKEND
+// Carbonite's own NVTX profiler backend. Deliberately not in the list above: those
+// plugins are required, this one is registered only when NVTX profiling is asked for.
+extern "C" bool carb_profiler_nvtx_plugin_registerPlugin(carb::Framework*);
+#endif
+
 CARB_STATIC_BINARY_GLOBALS("omni_physx_sdk")
 
 bool isProcessGpuDisabled();
@@ -80,56 +128,32 @@ namespace ovphysx
 
 namespace
 {
-    static std::mutex g_bootstrapMutex;
-    static bool g_bootstrapDone = false;
-    static bool g_usdPreloadDone = false;
-    // Live CarboniteLoaders holding the process-wide framework. Guards teardown of the
-    // process-private cooked-collider cache (see releaseProcessCacheDir).
-    static std::atomic<int> g_activeLoaders{ 0 };
-    // Borrowed when reusing a co-tenant's already-loaded OmniClient, otherwise
-    // loaded from ovphysx's package path. Intentionally kept resident for the
-    // process lifetime. ovphysx is a shared library, not the whole program, so
-    // it cannot safely pick a time to call omniClientShutdown().
-    static void* g_omniClientLibraryHandle = nullptr;
-
-    // Internal Carbonite GPU-plugin bootstrap sentinel. Current ovphysx callers
-    // always pass -2 before initialize() so optional Carbonite GPU plugins are
-    // skipped; PhysX manages its own CUDA context without those plugins.
-    // This does not select the PhysX CUDA ordinal. Explicit active_cuda_gpus
-    // selection is applied immediately before scene attachment. Values other
-    // than -2 are currently unused by ovphysx; that branch is retained to
-    // preserve existing internal CarboniteLoader behavior.
-    //
+#if CARB_PLATFORM_WINDOWS
+    void releaseProcessCacheAfterFrameworkShutdown(void*, void*);
+#endif
     // Note: /physics/suppressReadback (DirectGPU-API mode) is NOT managed here.
-    // It is opt-in by the host: callers who want DirectGPU set the Carbonite
-    // setting before any ovphysx call. ovphysx never writes this setting
-    // because DirectGPU is incompatible with contact modification (used by
-    // surface velocity, custom contact callbacks). See create_args doc-comment
-    // in ovphysx_types.h for the full trade-off.
-    static std::atomic<int32_t> g_startupCudaDevice{-2};
-
-    // After-load interface probe: each entry pairs a plugin name (used only
-    // for the error message) with a tryAcquireInterface lambda that returns
-    // true iff ovphysx-side compile-time-expected version of that plugin's
-    // primary interface is acquirable.
+    // It is opt-in by the host, which sets the Carbonite setting before any
+    // ovphysx call. ovphysx never writes it because DirectGPU is incompatible
+    // with contact modification (surface velocity, custom contact callbacks).
+    // See the create_args doc comment in ovphysx_types.h for the trade-off.
+    // After-load interface probe. Each entry pairs a plugin name (used only for
+    // the error message) with a check that the interface version ovphysx was
+    // compiled against is acquirable.
     //
-    // Why this catches more than just "did the .so load":
-    //   carb's tryAcquireInterface<T>() does (name, major, minor) version
-    //   matching against what the loaded plugin advertises.  If a foreign
-    //   host loaded a same-named plugin first at a different major (or older
-    //   minor), our probe sees null at exactly the moment we'd otherwise
-    //   cascade later into "Dependency: <iface> failed to be resolved" or a
-    //   null pointer dereference inside ovphysx.  Same probe also fires when
-    //   the .so simply didn't load (file missing, dlopen failed) -- from
-    //   ovphysx's perspective those are the same problem.
+    // tryAcquireInterface<T>() matches (name, major, minor) against what the
+    // loaded plugin advertises, so the probe also fails when a foreign host
+    // loaded a same-named plugin at a different major or an older minor. That
+    // skew would otherwise surface later as "Dependency: <iface> failed to be
+    // resolved" or a null pointer dereference inside ovphysx. A plugin that
+    // did not load at all fails the probe the same way.
     struct PluginProbe
     {
         const char* plugin;
         bool (*acquired)(carb::Framework*);
     };
     // tryAcquireInterface is non-owning for the singleton plugin interfaces
-    // probed below; the returned pointer does not need release.  We discard it
-    // intentionally -- this is a presence/version check, not an acquisition.
+    // probed below, so the returned pointer needs no release and is discarded.
+    // This is a presence and version check, not an acquisition.
 #define OVPHYSX_PROBE(plugin_name, IFACE)                                      \
     {                                                                          \
         plugin_name,                                                           \
@@ -138,19 +162,34 @@ namespace
         }                                                                      \
     }
 
-    static const PluginProbe kFoundationProbes[] = {
+    static const PluginProbe kBootstrapProbes[] = {
         OVPHYSX_PROBE("carb.dictionary.plugin", carb::dictionary::IDictionary),
         OVPHYSX_PROBE("carb.settings.plugin",   carb::settings::ISettings),
+    };
+
+    static const PluginProbe kTaskingProbes[] = {
+        OVPHYSX_PROBE("carb.tasking.plugin", carb::tasking::ITasking),
+    };
+
+    static const PluginProbe kPostTaskingProbes[] = {
         OVPHYSX_PROBE("carb.tokens.plugin",     carb::tokens::ITokens),
-        OVPHYSX_PROBE("carb.tasking.plugin",    carb::tasking::ITasking),
         OVPHYSX_PROBE("carb.filesystem.plugin", carb::filesystem::IFileSystem),
     };
 
 #undef OVPHYSX_PROBE
 
-    // Probe each plugin's primary interface and report any null returns.
-    // Returns true if all interfaces resolved, false otherwise.  On false the
-    // caller should treat this as a fatal load-time error: ovphysx cannot
+    static constexpr char kTaskingThreadCountPath[] = "/plugins/carb.tasking.plugin/threadCount";
+    static constexpr char kTbbThreadCountPath[] = "/plugins/omni.tbb.globalcontrol/maxThreadCount";
+
+    // omni.tbb.globalcontrol exposes a marker interface whose acquisition runs
+    // plugin startup and constructs the process-wide tbb::global_control.
+    struct TbbGlobalControl
+    {
+        CARB_PLUGIN_INTERFACE("omni::tbb::IGlobalControl", 1, 0)
+    };
+
+    // Probes each plugin's primary interface and logs the ones that did not
+    // resolve. A false return is a fatal load-time error: ovphysx cannot
     // continue without these interfaces.
     static bool verifyLoadedInterfaces(carb::Framework* framework,
                                        const PluginProbe* probes,
@@ -191,9 +230,9 @@ namespace
         return false;
     }
 
-    // Force the settings ovphysx needs before PhysX plugins load.
-    // These are not user preferences; they define the SDK runtime shape:
-    // USD writeback off, and no renderer/NGX side systems.
+    // Force the settings ovphysx needs before PhysX plugins load. These are not
+    // user preferences. They define the SDK runtime shape: USD writeback off,
+    // no renderer or NGX side systems.
     static void enforceRequiredSettings(carb::Framework* framework)
     {
         auto* settings = framework ? framework->tryAcquireInterface<carb::settings::ISettings>() : nullptr;
@@ -222,188 +261,6 @@ namespace
         }
     }
 
-    // Log level is managed globally by LogManager (ovphysx_set_log_level / ovphysx_get_log_level).
-    // Consolidated Carbonite GPU-plugin loading check with optional reason string.
-    // Optional Carbonite GPU plugins are skipped if any of these hold:
-    //   1. OVPHYSX_DISABLE_GPU env var is set
-    //   2. ovphysx passed its -2 bootstrap sentinel
-    //   3. No CUDA driver/device detected at runtime (via the internal CUDA shim)
-    //
-    // We short-circuit on (1) and (2) to avoid an unnecessary driver probe.
-    //
-    // NOTE: Device resolution for AUTO is handled via the same runtime CUDA shim
-    // used by PhysX foundation. It never links against libcuda/nvcuda and lets
-    // ovphysx decide whether GPU-only plugins are safe before PhysX starts.
-    // NOTE on thread-safety: std::getenv is not thread-safe with concurrent
-    // setenv/putenv on some platforms. These functions are only called during
-    // initialization which is serialised by g_bootstrapMutex, and env vars
-    // must not be mutated by other threads after initialization begins.
-    static bool isGpuDisabledByStartupRequest(const char** outReason = nullptr)
-    {
-        if (outReason)
-            *outReason = nullptr;
-
-        if (std::getenv("OVPHYSX_DISABLE_GPU") != nullptr)
-        {
-            if (outReason)
-                *outReason = "OVPHYSX_DISABLE_GPU env var set";
-            return true;
-        }
-
-        const int32_t cudaDevice = g_startupCudaDevice.load(std::memory_order_acquire);
-        if (cudaDevice == -2)
-        {
-            if (outReason)
-                *outReason = "Carbonite GPU plugins skipped by ovphysx";
-            return true;
-        }
-
-        return false;
-    }
-
-    static bool isGpuDisabled(const char** outReason = nullptr)
-    {
-        if (outReason)
-            *outReason = "unknown";
-
-        if (isGpuDisabledByStartupRequest(outReason))
-            return true;
-
-        if (!omni::physx::cudaShim::isCudaAvailable())
-        {
-            if (outReason)
-                *outReason = "no CUDA driver/device available";
-            return true;
-        }
-
-        // GPU available -- outReason is only meaningful when returning true (disabled).
-        if (outReason)
-            *outReason = nullptr;
-        return false;
-    }
-    
-    bool isTruthySetting(const char* value)
-    {
-        if (!value || value[0] == '\0')
-            return false;
-        return (strcmp(value, "1") == 0) ||
-               (strcmp(value, "true") == 0) ||
-               (strcmp(value, "True") == 0) ||
-               (strcmp(value, "TRUE") == 0);
-    }
-
-    bool shouldSkipUsdPreload()
-    {
-        auto* framework = carb::getFramework();
-        auto* settings = framework ? framework->tryAcquireInterface<carb::settings::ISettings>() : nullptr;
-        if (!settings)
-            return false;
-
-        const char* key = "/ovphysx/skipUsdLibPreload";
-        auto itemType = settings->getItemType(key);
-        if (itemType == carb::dictionary::ItemType::eBool)
-        {
-            return settings->getAsBool(key);
-        }
-        if (itemType == carb::dictionary::ItemType::eString)
-        {
-            return isTruthySetting(settings->getStringBuffer(key));
-        }
-        return false;
-    }
-
-    bool verifyOmniClientProvider(const std::string& pluginsDir)
-    {
-        const std::filesystem::path versionPath = std::filesystem::path(pluginsDir) / "ovstage-omniclient.version";
-        std::ifstream versionFile(versionPath);
-        std::string expectedVersion;
-        if (!versionFile || !std::getline(versionFile, expectedVersion) || expectedVersion.empty())
-        {
-            CARB_LOG_ERROR(
-                "[CarboniteLoader] Missing OVStage OmniClient provenance file: %s", versionPath.string().c_str());
-            return false;
-        }
-        if (!expectedVersion.empty() && expectedVersion.back() == '\r')
-            expectedVersion.pop_back();
-        if (expectedVersion.empty())
-        {
-            CARB_LOG_ERROR(
-                "[CarboniteLoader] Empty OVStage OmniClient provenance file: %s", versionPath.string().c_str());
-            return false;
-        }
-
-        using GetVersionStringFn = const char* (*)();
-#ifdef _WIN32
-        GetVersionStringFn getVersion = reinterpret_cast<GetVersionStringFn>(
-            GetProcAddress(static_cast<HMODULE>(g_omniClientLibraryHandle), "omniClientGetVersionString"));
-#else
-        GetVersionStringFn getVersion =
-            reinterpret_cast<GetVersionStringFn>(dlsym(g_omniClientLibraryHandle, "omniClientGetVersionString"));
-#endif
-        const char* actualVersion = getVersion ? getVersion() : nullptr;
-        if (!actualVersion || expectedVersion != actualVersion)
-        {
-            CARB_LOG_ERROR(
-                "[CarboniteLoader] Refusing OmniClient outside the matched OVStage runtime "
-                "(expected '%s', loaded '%s')",
-                expectedVersion.c_str(), actualVersion ? actualVersion : "<version unavailable>");
-            return false;
-        }
-        return true;
-    }
-
-    // The OVStage-provided resolver does not depend on libcarb, but it still
-    // links against OVStage's matched OmniClient. Standalone ovphysx does not load
-    // carb.omniclient.plugin, so load the packaged OmniClient library directly
-    // and pin it for the process lifetime. ovrtx can use the Carbonite
-    // OmniClient plugin wrapper route; ovphysx only has the packaged
-    // OmniClient C library, whose shutdown API is a whole-program operation.
-    bool loadStaticLinkedOmniClient(const std::string& pluginsDir)
-    {
-        if (g_omniClientLibraryHandle)
-            return verifyOmniClientProvider(pluginsDir);
-
-#    ifdef _WIN32
-        HMODULE existing = nullptr;
-        if (GetModuleHandleExA(0, "omniclient.dll", &existing) && existing)
-        {
-            CARB_LOG_INFO("[CarboniteLoader] Reusing already-loaded OmniClient: omniclient.dll");
-            g_omniClientLibraryHandle = existing;
-            return verifyOmniClientProvider(pluginsDir);
-        }
-
-        std::filesystem::path clientPath = std::filesystem::path(pluginsDir) / "omniclient.dll";
-        g_omniClientLibraryHandle = LoadLibraryW(clientPath.wstring().c_str());
-        if (!g_omniClientLibraryHandle)
-        {
-            CARB_LOG_ERROR("[CarboniteLoader] Failed to load static-linked OmniClient: %ls",
-                           clientPath.wstring().c_str());
-            return false;
-        }
-#    else
-        // A co-tenant library may already have loaded OmniClient. Reuse and
-        // promote that handle instead of loading a second copy from ovphysx's
-        // package path. RTLD_NOLOAD bumps the refcount; we intentionally keep
-        // that reference for the process lifetime.
-        g_omniClientLibraryHandle = dlopen("libomniclient.so", RTLD_NOW | RTLD_NOLOAD | RTLD_GLOBAL);
-        if (g_omniClientLibraryHandle)
-        {
-            CARB_LOG_INFO("[CarboniteLoader] Reusing already-loaded OmniClient: libomniclient.so");
-            return verifyOmniClientProvider(pluginsDir);
-        }
-
-        std::filesystem::path clientPath = std::filesystem::path(pluginsDir) / "libomniclient.so";
-        g_omniClientLibraryHandle = dlopen(clientPath.string().c_str(), RTLD_NOW | RTLD_GLOBAL);
-        if (!g_omniClientLibraryHandle)
-        {
-            CARB_LOG_ERROR("[CarboniteLoader] Failed to load static-linked OmniClient: %s", dlerror());
-            return false;
-        }
-#    endif
-
-        return verifyOmniClientProvider(pluginsDir);
-    }
-
 #ifdef _WIN32
     bool addToPath(const std::string& dir)
     {
@@ -420,16 +277,10 @@ namespace
 #endif
 }
 
-void CarboniteLoader::setStartupCudaDevice(int32_t cudaDevice)
-{
-    g_startupCudaDevice.store(cudaDevice, std::memory_order_release);
-}
-
 struct CarboniteLoader::Impl
 {
     bool frameworkAcquired = false;
     std::string pluginsDir;  // Path to _install/plugins/
-    std::string usdLibDir;   // Preferred USD library directory
     std::string lastError;
     omni::physx::IPhysxSimulation* physxSim = nullptr;
 };
@@ -454,42 +305,25 @@ const std::string& CarboniteLoader::getLastError() const
 
 // First half of ovphysx startup.
 // This prepares Carbonite, core settings, app paths, logging, and base plugins.
-// It deliberately stops before loading USD-linked and PhysX plugins so callers
-// can preload/reuse namespaced USD first and apply user config before PhysX starts.
+// It deliberately stops before loading the PhysX plugins so callers can apply
+// user config before PhysX starts.
 bool CarboniteLoader::initialize()
 {
-    std::lock_guard<std::mutex> guard(g_bootstrapMutex);
+    CarboniteLoaderState& loaderState = globalState().carboniteLoader;
+    std::lock_guard<std::mutex> guard(loaderState.bootstrapMutex);
     if (m)
         m->lastError.clear();
     
-    if (g_bootstrapDone)
+    if (loaderState.bootstrapDone)
     {
         // Re-apply log level and register pending callbacks (level may change between instances)
         ovphysx::onCarboniteLoggingReady();
 
-        // Re-populate per-instance paths (pluginsDir/usdLibDir) for subsequent tests.
+        // Re-populate the per-instance plugins path for subsequent instances.
         m->frameworkAcquired = true;
-        g_activeLoaders.fetch_add(1, std::memory_order_relaxed);
-        m->pluginsDir = omni::sdk::usd_version::getPluginsDirectory();
-        if (!m->pluginsDir.empty())
-        {
-            m->usdLibDir = m->pluginsDir;
-            try
-            {
-                std::filesystem::path pluginsPath(m->pluginsDir);
-                std::filesystem::path libsPath = pluginsPath.parent_path().parent_path() / "ovphysx.libs";
-                if (std::filesystem::exists(libsPath))
-                {
-                    m->usdLibDir = libsPath.string();
-                }
-            }
-            catch (const std::exception&)
-            {
-                // Best-effort; fall back to plugins directory.
-                m->usdLibDir = m->pluginsDir;
-            }
-        }
-        else
+        loaderState.activeLoaders.fetch_add(1, std::memory_order_relaxed);
+        m->pluginsDir = omni::sdk::usd_schema_paths::getPluginsDirectory();
+        if (m->pluginsDir.empty())
         {
             CARB_LOG_ERROR("[CarboniteLoader] Failed to determine plugins directory (bootstrap re-init)");
             return false;
@@ -504,12 +338,12 @@ bool CarboniteLoader::initialize()
     }
     
     // Determine plugins directory (sibling to lib/), with Windows fallbacks.
-    m->pluginsDir = omni::sdk::usd_version::getPluginsDirectory();
+    m->pluginsDir = omni::sdk::usd_schema_paths::getPluginsDirectory();
 #ifdef _WIN32
     if (m->pluginsDir.empty() || !std::filesystem::exists(m->pluginsDir))
     {
         // Fall back to the directory where ovphysx.dll is loaded from.
-        std::string moduleDir = omni::sdk::usd_version::getLoadedLibraryPath("ovphysx.dll");
+        std::string moduleDir = omni::sdk::usd_schema_paths::getLoadedLibraryDirectory("ovphysx.dll");
         if (!moduleDir.empty())
         {
             std::filesystem::path candidate = std::filesystem::path(moduleDir) / "plugins";
@@ -534,59 +368,17 @@ bool CarboniteLoader::initialize()
         return false;
     }
     CARB_LOG_INFO("[CarboniteLoader] Loading plugins from: %s", m->pluginsDir.c_str());
-    
-    // Detect wheel-style USD lib directory (ovphysx.libs) and prefer it when present
-    m->usdLibDir = m->pluginsDir;
-    try
-    {
-        std::filesystem::path pluginsPath(m->pluginsDir);
-        std::filesystem::path libsPath = pluginsPath.parent_path().parent_path() / "ovphysx.libs";
-        if (std::filesystem::exists(libsPath))
-        {
-            m->usdLibDir = libsPath.string();
-            CARB_LOG_INFO("[CarboniteLoader] Using USD libs from: %s", m->usdLibDir.c_str());
-        }
-    }
-    catch (const std::exception& e)
-    {
-        CARB_LOG_WARN("[CarboniteLoader] Failed to probe ovphysx.libs: %s (falling back to plugins directory)", e.what());
-    }
 
-    // Set only the namespaced USD plugin discovery env var. Do not point a
-    // host's classic USD at namespaced schema plugins.
-    {
-        std::string error;
-        bool registered = false;
-        if (!omni::sdk::usd_schema_paths::registerSchemaPathsOnce(&error, &registered))
-        {
-            CARB_LOG_ERROR("[CarboniteLoader] %s", error.c_str());
-            return false;
-        }
-        if (registered)
-        {
-            CARB_LOG_INFO("[CarboniteLoader] Registered ovphysx USD schema paths in %s",
-                          omni::sdk::usd_schema_paths::kNamespacedUsdPluginPathEnvVar);
-        }
-    }
-    
 #ifdef _WIN32
     addToPath(m->pluginsDir);
-    if (m->usdLibDir != m->pluginsDir)
-        addToPath(m->usdLibDir);
-    std::string gpuPathDir = m->pluginsDir + "/gpu";
-    if (!isGpuDisabled() && std::filesystem::exists(gpuPathDir))
-        addToPath(gpuPathDir);
 #endif
 
-    // Acquire Carbonite framework.
-    //
-    // carb::getFramework() returns the module-local pointer.  When ovphysx is
-    // loaded as a regular shared library (via Python / ctypes) rather than as
-    // a Carbonite plugin, this pointer is initially null even if Kit already
-    // created the framework.  acquireFrameworkAndRegisterBuiltins() will find
-    // the existing process-wide framework and set our local pointer.
-    //
-    // We still track whether the framework existed already for diagnostics.
+    // carb::getFramework() returns the module-local pointer. When ovphysx is
+    // loaded as a regular shared library (via Python / ctypes) rather than as a
+    // Carbonite plugin, that pointer is null even if the process already has a
+    // framework. acquireFrameworkAndRegisterBuiltins() finds the existing
+    // process-wide framework and sets the local pointer. Whether the framework
+    // existed already is tracked for diagnostics.
     carb::Framework* framework = carb::getFramework();
     bool frameworkAlreadyExisted = (framework != nullptr);
     if (!framework)
@@ -606,35 +398,37 @@ bool CarboniteLoader::initialize()
             frameworkAlreadyExisted = true;
     }
     m->frameworkAcquired = true;
-    g_activeLoaders.fetch_add(1, std::memory_order_relaxed);
+    loaderState.activeLoaders.fetch_add(1, std::memory_order_relaxed);
 
-    // Set up logging -- apply the global level and register any pending user callbacks.
+    // The sidecar DSO survives Linux framework release. Rebind its borrowed
+    // globals and source registration once per bootstrap, before policy replay.
+    if (!refreshInternalSidecarRuntime())
+        return false;
+
+    // Apply the global log level and register any pending user callbacks.
     ovphysx::onCarboniteLoggingReady();
 
     std::unordered_set<std::string> preExistingPluginNames;
     if (frameworkAlreadyExisted)
     {
         // ====================================================================
-        // Carbonite framework pre-exists, with no direct PhysX runtime yet.
-        // Distinguish two sub-cases by looking at *where* the pre-existing
-        // plugins live:
-        //   (a) all plugins have null libPath or live under ovphysx's own
-        //       install tree → this is either static built-ins registered by
-        //       acquireFrameworkAndRegisterBuiltins(), or a re-entry within
-        //       our own process. Proceed with plugin loading.
-        //   (b) any plugin libPath points outside ovphysx's install tree →
-        //       another library (ovrtx, etc.) has bootstrapped Carbonite
-        //       and populated its Framework. Our plugin registrations would
-        //       land in a torn registry (either ovphysx's own Framework
-        //       instance, or the host's with "Ignoring plugin: same name
-        //       already loaded" for SONAME collisions), producing the silent
-        //       "Dependency: [omni::physics::schema::IUsdPhysics v1.1]
-        //       failed to be resolved" cascade downstream. Refuse fast with
-        //       a diagnosable error.
+        // The Carbonite framework pre-exists with no direct PhysX runtime yet.
+        // Where the pre-existing plugins live distinguishes two cases:
+        //   (a) every plugin has a null libPath or lives under ovphysx's own
+        //       install tree. These are static built-ins registered by
+        //       acquireFrameworkAndRegisterBuiltins() or a re-entry within
+        //       this process. Proceed with plugin loading.
+        //   (b) some plugin libPath points outside ovphysx's install tree.
+        //       Another library (ovrtx, etc.) has bootstrapped Carbonite and
+        //       populated its Framework. Registering into it can produce a
+        //       torn registry ("Ignoring plugin: same name already loaded" on
+        //       SONAME collisions) and the silent "Dependency:
+        //       [omni::physics::schema::IUsdPhysics v1.1] failed to be
+        //       resolved" cascade downstream.
         //
-        // Use the parent of pluginsDir (our _install/ root) as the "ours"
-        // boundary so plugins loaded from _install/lib/ or _install/plugins/
-        // are both recognized as ours.
+        // The parent of pluginsDir (the _install/ root) is the ownership
+        // boundary, so plugins loaded from _install/lib/ or _install/plugins/
+        // both count as ovphysx's own.
         // ====================================================================
         const size_t preExistingPluginCount = framework->getPluginCount();
         if (preExistingPluginCount > 0)
@@ -663,7 +457,7 @@ bool CarboniteLoader::initialize()
                           preExistingPluginCount, ourRootStr.c_str(), m->pluginsDir.c_str());
 
             auto isUnderOurRoot = [&ourRootStr](const std::string& absPath) {
-                if (ourRootStr.empty()) return true;  // unknown install root -- can't classify, assume ours
+                if (ourRootStr.empty()) return true;  // unknown install root, cannot classify, assume ours
                 if (absPath.empty()) return false;
                 if (absPath.compare(0, ourRootStr.size(), ourRootStr) != 0) return false;
                 // Require a path separator (or exact match) after the prefix so
@@ -686,7 +480,7 @@ bool CarboniteLoader::initialize()
 
                 if (!desc.libPath || desc.libPath[0] == '\0')
                 {
-                    // Static / built-in plugin -- no file on disk to attribute.
+                    // Static / built-in plugin with no file on disk to attribute.
                     ++builtinCount;
                     continue;
                 }
@@ -717,17 +511,13 @@ bool CarboniteLoader::initialize()
 
             if (foreignCount > 0)
             {
-                // Default: proceed with coexistence.  ABI alignment
-                // (ovphysx 0.4.1 + ovrtx 0.3.0+) makes this safe for the
-                // supported version pair, and the verifyLoadedInterfaces
-                // probes below produce a named-cause error if any expected
-                // interface fails to resolve at the version ovphysx was built
-                // against (covers both "plugin missing" and "plugin loaded at
-                // a wrong version" against a foreign host).
-                //
-                // OVPHYSX_COEXIST_REFUSE=1 restores the legacy fail-fast-at-
-                // load behavior for users who would rather not attempt
-                // coexistence.
+                loaderState.ownsFramework = false;
+                // Coexistence is the default. The verifyLoadedInterfaces probes
+                // below produce a named-cause error if any expected interface
+                // fails to resolve at the version ovphysx was built against,
+                // which covers both a missing plugin and one loaded at a wrong
+                // version by a foreign host. OVPHYSX_COEXIST_REFUSE=1 fails
+                // fast at load instead.
                 const char* refuseEnv = std::getenv("OVPHYSX_COEXIST_REFUSE");
                 const bool refuse = refuseEnv && refuseEnv[0] == '1';
                 if (refuse)
@@ -750,10 +540,7 @@ bool CarboniteLoader::initialize()
                     "version skew. Set OVPHYSX_COEXIST_REFUSE=1 to opt out.",
                     foreignCount, foreignExample.c_str());
 
-                // Co-tenant scenario: another library (e.g. ovrtx) bootstrapped
-                // Carbonite and registered plugins before we were loaded. Static
-                // ovphysx no longer releases the framework, so teardown remains
-                // process-exit owned.
+                // The foreign host owns this framework's teardown.
             }
             else
             {
@@ -770,36 +557,15 @@ bool CarboniteLoader::initialize()
         }
     }
 
-    // Log key paths now that logging is available (useful for debugging loading issues)
     CARB_LOG_INFO("[CarboniteLoader] Plugins directory: %s", m->pluginsDir.c_str());
-    CARB_LOG_INFO("[CarboniteLoader] USD library directory: %s", m->usdLibDir.c_str());
-    const char* pxrPluginPath = std::getenv("PXR_PLUGINPATH_NAME");
-    if (pxrPluginPath)
-        CARB_LOG_INFO("[CarboniteLoader] PXR_PLUGINPATH_NAME: %s", pxrPluginPath);
-    const char* ovPluginPath = std::getenv("OV_PXR_PLUGINPATH_2511");
-    if (ovPluginPath)
-        CARB_LOG_INFO("[CarboniteLoader] OV_PXR_PLUGINPATH_2511: %s", ovPluginPath);
-    
-    // ========================================================================
-    // Configure plugin search paths.
-    //
-    // We always search the main plugins directory.
-    //
-    // Note: "plugins/bin/deps" is a defensive legacy remnant from older install
-    // layouts (pre-flattening of the ovphysx SDK _install tree). Current ovphysx
-    // artifacts may not ship it, but if it exists we include it so older layouts
-    // continue to work.
-    // ========================================================================
-    auto [searchPathStrings, searchPaths] = buildSearchPaths();
-    const size_t searchPathCount = searchPaths.size();
-    
-    // Load core Carbonite plugins (preliminary - foundational) - must absolutely
-    // happen before GPU/monitoring.
-    // Static plugin registration is not idempotent: Carbonite requires plugin
-    // names to be unique and returns failure for duplicate registrations. Reuse
-    // the coexistence snapshot above for the normal pre-existing-plugin path:
-    // getPluginDesc() logs a warning for every expected miss, which made a clean
-    // standalone startup report one false warning per static plugin.
+
+    // Register the core Carbonite plugins. This has to happen before the GPU
+    // and monitoring plugins load.
+    // Static plugin registration is not idempotent: Carbonite requires unique
+    // plugin names and fails a duplicate registration. The coexistence snapshot
+    // above is consulted first because getPluginDesc() logs a warning for every
+    // miss, which would report one false warning per static plugin on a clean
+    // standalone startup.
     struct StaticPluginRegistration
     {
         const char* name;
@@ -824,8 +590,8 @@ bool CarboniteLoader::initialize()
     };
     for (const StaticPluginRegistration& plugin : staticPlugins)
     {
-        // The process-shared framework is mutable, so revalidate snapshot hits;
-        // getPluginDesc() is silent on a hit, and a co-tenant may have unregistered it.
+        // The process-shared framework is mutable, so snapshot hits are revalidated.
+        // getPluginDesc() is silent on a hit, and a co-tenant may have unregistered the plugin.
         if (preExistingPluginNames.count(plugin.name) != 0 && hasRegisteredPlugin(plugin.name))
         {
             CARB_LOG_INFO("[CarboniteLoader] Static Carbonite plugin already registered, skipping: %s", plugin.name);
@@ -845,18 +611,15 @@ bool CarboniteLoader::initialize()
         }
     }
     if (!verifyLoadedInterfaces(framework,
-                                kFoundationProbes,
-                                sizeof(kFoundationProbes) / sizeof(kFoundationProbes[0]),
-                                "Foundation"))
+                                kBootstrapProbes,
+                                sizeof(kBootstrapProbes) / sizeof(kBootstrapProbes[0]),
+                                "Bootstrap"))
     {
         return false;
     }
 
-    if (!loadStaticLinkedOmniClient(m->pluginsDir))
-        return false;
-
     // Static Carbonite builds do not use the app-directory path for ovphysx
-    // plugin discovery; runtime paths are derived from the loaded ovphysx module.
+    // plugin discovery. Runtime paths are derived from the loaded ovphysx module.
     CARB_LOG_INFO("[CarboniteLoader] Skipping app-directory configuration; ovphysx derives runtime paths from its module");
     
     enforceRequiredSettings(framework);
@@ -869,18 +632,7 @@ bool CarboniteLoader::initialize()
         // probe. Device ordinal selection is different: PhysX reads
         // /physics/cudaDevice lazily when the first GPU scene attaches, so the
         // public active_cuda_gpus path writes it immediately before attachment.
-        //
-        // /physics/suppressReadback (DirectGPU-API mode) is NOT applied here.
-        // It is opt-in by the host: callers who want DirectGPU set the
-        // Carbonite setting themselves before any ovphysx call. ovphysx never
-        // writes this setting because DirectGPU is incompatible with contact
-        // modification (used by surface velocity, custom contact callbacks).
-        //
-        // The current public caller passes the -2 bootstrap sentinel below and
-        // leaves /physics/cudaDevice untouched here. The cudaDevice != -2
-        // branch is currently unused by ovphysx and remains only to preserve
-        // existing internal CarboniteLoader behavior; it is not
-        // active_cuda_gpus handling.
+        // /physics/suppressReadback is host opt-in and never written here.
         // ====================================================================
         if (::isProcessGpuDisabled())
         {
@@ -888,53 +640,27 @@ bool CarboniteLoader::initialize()
             CARB_LOG_INFO("[CarboniteLoader] Startup /physics/forceCpuMode=true");
         }
 
-        const int32_t cudaDevice = g_startupCudaDevice.load(std::memory_order_acquire);
-        if (cudaDevice != -2)
-        {
-            const bool alreadySet = (settings->getItemType("/physics/cudaDevice") != carb::dictionary::ItemType::eCount);
-            if (alreadySet)
-            {
-                const int32_t currentValue = settings->getAsInt("/physics/cudaDevice");
-                if (currentValue != cudaDevice)
-                {
-                    m->lastError = "/physics/cudaDevice is already set to " + std::to_string(currentValue) +
-                                   ", but ovphysx requested " + std::to_string(cudaDevice) +
-                                   ". This process-global setting cannot be changed after PhysX startup begins.";
-                    CARB_LOG_ERROR("[CarboniteLoader] %s", m->lastError.c_str());
-                    return false;
-                }
-                else
-                {
-                    CARB_LOG_INFO("[CarboniteLoader] /physics/cudaDevice=%d (already set)", cudaDevice);
-                }
-            }
-            else
-            {
-                settings->setInt("/physics/cudaDevice", cudaDevice);
-                CARB_LOG_INFO("[CarboniteLoader] Startup /physics/cudaDevice=%d", cudaDevice);
-            }
-        }
-        else
-        {
-            // The public active_cuda_gpus path deliberately leaves this setting
-            // untouched during bootstrap and applies it immediately before scene
-            // attachment. Process-wide CPU-only mode is controlled separately via
-            // ovphysx_set_cpu_mode().
-            CARB_LOG_INFO("[CarboniteLoader] Startup: CUDA ordinal selection deferred to scene attachment");
-        }
+        // The public active_cuda_gpus path deliberately leaves this setting
+        // untouched during bootstrap and applies it immediately before scene
+        // attachment. Process-wide CPU-only mode is controlled separately via
+        // ovphysx_set_cpu_mode().
+        CARB_LOG_INFO("[CarboniteLoader] Startup: CUDA ordinal selection deferred to scene attachment");
 
-        // Surface the host-set suppressReadback value at INFO so misconfigurations
-        // (e.g. host expecting DirectGPU but didn't actually set it) are visible.
+        // Log the suppressReadback value seen at bootstrap, at INFO. This is a pre-override snapshot:
+        // the bootstrap runs once per process, before per-instance create-config overrides (the
+        // documented DirectGPU opt-in) are applied, so it must not read as a final verdict. The
+        // effective mode is logged per instance after config is applied (see ovphysx.cpp).
         {
             const bool alreadySet = (settings->getItemType("/physics/suppressReadback") != carb::dictionary::ItemType::eCount);
             if (alreadySet)
             {
                 const bool currentValue = settings->getAsBool("/physics/suppressReadback");
-                CARB_LOG_INFO("[CarboniteLoader] /physics/suppressReadback=%s (host-set)", currentValue ? "true" : "false");
+                CARB_LOG_INFO("[CarboniteLoader] /physics/suppressReadback=%s at bootstrap (host-set)", currentValue ? "true" : "false");
             }
             else
             {
-                CARB_LOG_INFO("[CarboniteLoader] /physics/suppressReadback unset — DirectGPU disabled (default).");
+                CARB_LOG_INFO("[CarboniteLoader] /physics/suppressReadback not set at bootstrap; DirectGPU off "
+                              "unless a create-config override enables it (effective mode logged per instance).");
             }
         }
     }
@@ -944,252 +670,30 @@ bool CarboniteLoader::initialize()
     // before omni.physx.plugin starts. That lets PhysXFoundation avoid CUDA
     // probes during plugin startup, before IPhysxFoundation can be acquired.
 
-    // ========================================================================
-    // Load monitoring/system plugins before GPU plugins.
-    // ========================================================================
-    static const char* kMonitoringPlugins[] = {
-        "omni.platforminfo.plugin",
-    };
+#if CARB_PLATFORM_WINDOWS
+    // Windows retains Carbonite's ExitProcess hook: OVStage/Fabric still depend
+    // on it for safe DLL teardown. A framework release hook runs after dependency
+    // plugins have stopped, so cache removal cannot race datastore write-back.
+    if (!framework->addReleaseHook(nullptr, &releaseProcessCacheAfterFrameworkShutdown, nullptr))
     {
-        carb::PluginLoadingDesc desc = carb::PluginLoadingDesc::getDefault();
-        desc.loadedFileWildcards = kMonitoringPlugins;
-        desc.loadedFileWildcardCount = sizeof(kMonitoringPlugins) / sizeof(kMonitoringPlugins[0]);
-        desc.searchPaths = searchPaths.data();
-        desc.searchPathCount = static_cast<uint32_t>(searchPathCount);
-        framework->loadPlugins(desc);
-    }
-    
-    // ========================================================================
-    // GPU and infrastructure plugins
-    //
-    // NOTE: GPU availability was decided through the runtime CUDA shim above,
-    // before any plugin that directly depends on the CUDA driver is loaded.
-    // ========================================================================
-    const char* disableReason = nullptr;
-    const bool disableGpu = isGpuDisabled(&disableReason);
-
-    {
-        std::vector<const char*> gpuPlugins;
-        // Static SDKs disable structured logging during Omni Core startup.
-        // Loading omni.structuredlog.plugin dynamically here re-enters TOML
-        // config parsing before the static framework is fully initialized.
-        // omni.tbb.globalcontrol must be loaded because omni.fabric.plugin
-        // declares omni::tbb::IGlobalControl as a CARB_PLUGIN_IMPL_DEPS
-        // dependency; without it Fabric refuses to load and downstream stage
-        // creation fails.
-        gpuPlugins.push_back("omni.tbb.globalcontrol.plugin");
-
-        if (!disableGpu)
-        {
-            CARB_LOG_INFO("[CarboniteLoader] GPU enabled - loading GPU plugins");
-            gpuPlugins.push_back("omni.gpucompute-cuda.plugin");
-        }
-        else
-        {
-            CARB_LOG_INFO("[CarboniteLoader] GPU disabled (%s)", disableReason ? disableReason : "unknown");
-        }
-        
-        // Recompute search paths using the finalized GPU availability decision.
-        // On Windows omni.gpucompute-cuda.plugin is isolated into plugins/gpu/,
-        // so this path must be present before loading the CUDA compute plugin.
-        // buildSearchPaths() still adds plugins/gpu/ only when GPU is enabled,
-        // so the no-GPU crash-safety isolation is preserved.
-        auto [gpuSearchPathStrings, gpuSearchPaths] = buildSearchPaths();
-
-        carb::PluginLoadingDesc desc = carb::PluginLoadingDesc::getDefault();
-        desc.loadedFileWildcards = gpuPlugins.data();
-        desc.loadedFileWildcardCount = static_cast<uint32_t>(gpuPlugins.size());
-        desc.searchPaths = gpuSearchPaths.data();
-        desc.searchPathCount = static_cast<uint32_t>(gpuSearchPaths.size());
-        framework->loadPlugins(desc);
-        CARB_LOG_INFO("[CarboniteLoader] GPU plugins loaded");
-
-        // Regression guard (NVBugs 6262606): when GPU is enabled the CUDA compute
-        // plugin must be discoverable here. If it is not, Fabric silently falls
-        // back to CPU-only (logs eRequireCuda) and GPU interop is lost. Surface
-        // that failure loudly at the loader instead of leaving only the downstream
-        // Fabric error. On no-GPU systems disableGpu is true so we skip the check
-        // (no lookup, no FAST_FAIL plugin load on driverless Windows).
-        if (!disableGpu)
-        {
-            const carb::PluginDesc& cudaDesc = framework->getPluginDesc("omni.gpucompute-cuda.plugin");
-            if (cudaDesc.libPath == nullptr)
-                CARB_LOG_WARN("[CarboniteLoader] GPU enabled but omni.gpucompute-cuda.plugin was not "
-                              "loaded -- Fabric CUDA will be unavailable. Verify plugins/gpu/ exists and "
-                              "is on the plugin search path.");
-            else
-                CARB_LOG_INFO("[CarboniteLoader] omni.gpucompute-cuda.plugin loaded: %s", cudaDesc.libPath);
-        }
-    }
-
-    g_bootstrapDone = true;
-    CARB_LOG_INFO("[CarboniteLoader] Initialization complete (base plugins)");
-    return true;
-}
-
-// Load the non-PhysX plugins that need USD (omni.usd and related runtime pieces).
-// ovphysx uses the ovstage data path; ovstage loads whatever runtime dependencies
-// it needs internally for population.
-bool CarboniteLoader::loadUsdDependentPlugins()
-{
-    if (!m || !m->frameworkAcquired || m->pluginsDir.empty())
-    {
-        CARB_LOG_ERROR("[CarboniteLoader] Cannot load USD-dependent plugins (framework or plugins dir missing)");
+        CARB_LOG_ERROR("[CarboniteLoader] Failed to register process-private cache cleanup");
         return false;
     }
-
-    auto* framework = carb::getFramework();
-    if (!framework)
-    {
-        CARB_LOG_ERROR("[CarboniteLoader] Carbonite framework unavailable");
-        return false;
-    }
-
-    // A full host (Kit / Isaac Sim) that already loaded the whole USD-dependent
-    // plugin stack cannot be detected by usdrt::population::IUtils presence
-    // alone: a *partial* host (e.g. ovrtx) can provide IUtils for rendering
-    // without providing omni.physicsschema.plugin / omni.usdphysics.plugin /
-    // etc. Skipping this block on IUtils presence would silently drop
-    // ovphysx's own physics schema plugin and fail PhysX runtime startup
-    // with no actionable log line, so we always load below regardless.
-    //
-    // IPhysxSimulation is no longer a Carbonite-acquired interface, so there is
-    // no full-host IPhysxSimulation acquire/version branch here. Standalone and
-    // partial hosts fall through to the normal plugin-load path below.
-    // IUtils presence is now informational only -- Carbonite's existing
-    // "Ignoring plugin: same name already loaded" handling skips any
-    // peer-owned plugins without incident.
-    auto [searchPathStrings, searchPaths] = buildSearchPaths();
-
-    const char* disableReason = nullptr;
-    const bool disableGpu = isGpuDisabled(&disableReason);
-
-    // NOTE: We keep USD loading functional on CPU-only systems by avoiding GPU foundation plugins
-    // when GPU is disabled/unavailable. This prevents driverless systems from failing just by
-    // calling ovphysx_create_instance() in CPU mode.
-    //
-    // The order here is intentional. We keep the USD core plugin first and (when GPU is enabled)
-    // load GPU foundation immediately after it, before other USD/graphics plugins.
-    static const char* kUsdPluginsTail[] = {
-        "carb.graphics-vulkan.plugin",
-        "carb.shadercompiler-slang.plugin",
-        "omni.streamingstatus.plugin",
-        "carb.glinterop.plugin",
-        // (`omni.usd*.plugin` is loaded below and covers the USD physics/schema plugins.)
-    };
-
-    std::vector<const char*> usdPlugins;
-    usdPlugins.push_back("omni.usd*.plugin");
-    if (!disableGpu)
-    {
-        usdPlugins.push_back("omni.gpu_foundation*.plugin");
-    }
-    else
-    {
-        CARB_LOG_INFO("[CarboniteLoader] Skipping GPU foundation plugins during USD load (GPU disabled)");
-    }
-    usdPlugins.insert(
-        usdPlugins.end(), kUsdPluginsTail, kUsdPluginsTail + (sizeof(kUsdPluginsTail) / sizeof(kUsdPluginsTail[0])));
-
-    CARB_LOG_INFO("[CarboniteLoader] Loading USD-dependent plugins");
-    carb::PluginLoadingDesc desc = carb::PluginLoadingDesc::getDefault();
-    desc.loadedFileWildcards = usdPlugins.data();
-    desc.loadedFileWildcardCount = static_cast<uint32_t>(usdPlugins.size());
-    desc.searchPaths = searchPaths.data();
-    desc.searchPathCount = static_cast<uint32_t>(searchPaths.size());
-
-
-    const size_t pluginCountBeforeUsdLoad = framework->getPluginCount();
-    framework->loadPlugins(desc);
-    const size_t pluginCountAfterUsdLoad = framework->getPluginCount();
-
-    // Diagnostic introspection (see env-var OVPHYSX_COEXIST_DIAGNOSTICS). Answers:
-    //   1. did our post-load registry gain plugins?
-    //   2. is omni.physicsschema.plugin registered, and at what libPath?
-    //   3. which interfaces does it advertise (and at what versions)?
-    //   4. can we acquireInterface<IUsdPhysics> right now?
-    {
-        const char* diagEnv = std::getenv("OVPHYSX_COEXIST_DIAGNOSTICS");
-        if (diagEnv && diagEnv[0] == '1')
-        {
-            std::fprintf(stderr,
-                         "[ovphysx-diagnostics] loadUsdDependentPlugins: framework=%p "
-                         "pluginCount %zu -> %zu (delta %lld)\n",
-                         static_cast<void*>(framework),
-                         pluginCountBeforeUsdLoad,
-                         pluginCountAfterUsdLoad,
-                         static_cast<long long>(pluginCountAfterUsdLoad) -
-                             static_cast<long long>(pluginCountBeforeUsdLoad));
-
-            const auto& schemaDesc = framework->getPluginDesc("omni.physicsschema.plugin");
-            if (schemaDesc.libPath == nullptr)
-            {
-                std::fprintf(stderr,
-                             "[ovphysx-diagnostics] omni.physicsschema.plugin: NOT REGISTERED in this framework\n");
-            }
-            else
-            {
-                std::fprintf(stderr,
-                             "[ovphysx-diagnostics] omni.physicsschema.plugin: REGISTERED libPath=%s "
-                             "interfaceCount=%zu\n",
-                             schemaDesc.libPath, schemaDesc.interfaceCount);
-                for (size_t i = 0; i < schemaDesc.interfaceCount; ++i)
-                {
-                    const auto& iface = schemaDesc.interfaces[i];
-                    std::fprintf(stderr,
-                                 "[ovphysx-diagnostics]   provides interface [%zu]: %s v%u.%u\n",
-                                 i,
-                                 iface.name ? iface.name : "<null>",
-                                 iface.version.major, iface.version.minor);
-                }
-            }
-
-            // Probe by-name via getPluginDesc above. We deliberately do NOT
-            // tryAcquireInterface<IUsdPhysics>() here because that would
-            // require pulling the ovruntime private header into ovphysx's
-            // include surface. The name/version tuple above answers the same
-            // schema-provider question without depending on PhysX plugin
-            // interface metadata.
-
-            // Dump the full plugin registry post-load. If omni.physicsschema
-            // is "NOT REGISTERED" above but happens to be listed below under
-            // a different name, we'll see it here. Also helpful to see which
-            // other ovphysx plugins made it versus didn't.
-            const size_t registryTotal = framework->getPluginCount();
-            std::vector<carb::PluginDesc> registry(registryTotal);
-            framework->getPlugins(registry.data());
-            std::fprintf(stderr,
-                         "[ovphysx-diagnostics] post-load full plugin registry (%zu entries):\n",
-                         registryTotal);
-            for (const auto& p : registry)
-            {
-                std::fprintf(stderr,
-                             "[ovphysx-diagnostics]   %-40s  libPath=%s\n",
-                             p.impl.name ? p.impl.name : "<null>",
-                             p.libPath ? p.libPath : "<null>");
-            }
-        }
-    }
-
+#endif
+    loaderState.bootstrapDone = true;
+    CARB_LOG_INFO(
+        "[CarboniteLoader] Initialization complete (base plugins; tasking deferred until create config is applied)");
     return true;
 }
 
 // Build the plugin search path list for Carbonite loadPlugins().
-// The string vector owns the memory; the pointer vector is only valid while the
+// The string vector owns the memory. The pointer vector is only valid while the
 // returned string vector stays alive in the caller.
 std::pair<std::vector<std::string>, std::vector<const char*>> CarboniteLoader::buildSearchPaths() const
 {
     std::vector<std::string> strs;
-    strs.reserve(3);
+    strs.reserve(2);
     strs.push_back(m->pluginsDir);
-
-    // GPU-only plugins (omni.cubric.plugin, omni.gpucompute-cuda.plugin) are isolated
-    // in plugins/gpu/. Only add this search path when GPU is enabled, preventing carb's
-    // lazy plugin discovery from loading them on nogpu systems (which crashes with
-    // 0xc0000409 / FAST_FAIL_INVALID_ARG when nvcuda64.dll has no device context).
-    const std::string gpuPluginDir = m->pluginsDir + "/gpu";
-    if (!isGpuDisabled() && std::filesystem::exists(gpuPluginDir))
-        strs.push_back(gpuPluginDir);
 
     const std::string binDepsDir = m->pluginsDir + "/bin/deps";
     if (std::filesystem::exists(binDepsDir))
@@ -1205,28 +709,19 @@ std::pair<std::vector<std::string>, std::vector<const char*>> CarboniteLoader::b
 namespace
 {
 
-// Wire UJITSO for LOCAL, in-process cooked-collider caching -- no Hub/Nucleus/GRPC.
-// Must run BEFORE carb.ujitso.default loads (it builds its datastore from
-// /UJITSO/datastore/* at plugin startup) and BEFORE omni.physx.cooking loads (its
-// service reads ujitsoCollisionCooking at construction).
+// Wire UJITSO for local, in-process cooked-collider caching with no Hub/Nucleus/GRPC. Must run
+// before carb.ujitso.default loads (it builds its datastore from /UJITSO/datastore/* at plugin
+// startup) and before omni.physx.cooking loads (its service reads ujitsoCollisionCooking at
+// construction).
 //
-// The cache directory is APP-PROVIDED: the app passes it via
-// PhysXConfig(cooked_collider_cache_dir=...) (C: OVPHYSX_CONFIG_COOKED_COLLIDER_CACHE_DIRECTORY),
-// which lands in /UJITSO/datastore/localCachePath before this runs. ovphysx is a library, so it
-// does not read the environment for a location and does not persist to one of its own choosing
-// (3746c9b20f). With nothing configured, cooking runs without cross-run persistence -- but it
-// still needs SOME writable path, because carb.ujitso.default otherwise defaults the datastore
-// to <carb app dir>/cache/DerivedDataCache, and carb's app dir is the resolved interpreter dir,
-// i.e. the non-writable /usr/bin for a Linux venv. carb.datastore then logs two [Error] lines on
-// every scene attach (NVBugs 6504275). So the fallback is a process-private temp dir, discarded
-// on shutdown: no environment lookup, nothing persisted, no errors.
-
-// The process-private cache dir, empty when unused. The datastore and this directory are
-// process-wide and outlive any single instance, so cleanup is refcounted: it happens when the
-// LAST loader shuts down, never on an arbitrary per-instance shutdown that would pull the
-// directory out from under another instance still cooking against it. atexit is a backstop for
-// callers that never shut down (the OS reclaims the temp tree in any case).
-std::filesystem::path g_processCacheDir;
+// The cache directory is app-provided through PhysXConfig(cooked_collider_cache_dir=...) (C:
+// OVPHYSX_CONFIG_COOKED_COLLIDER_CACHE_DIRECTORY), which lands in /UJITSO/datastore/localCachePath
+// before this runs. ovphysx is a library, so it neither reads the environment for a location nor
+// persists to a path of its own choosing. Some writable path is still needed, because
+// carb.ujitso.default otherwise defaults the datastore to <carb app dir>/cache/DerivedDataCache,
+// and carb's app dir is the resolved interpreter dir, which is the non-writable /usr/bin for a
+// Linux venv. carb.datastore then logs two [Error] lines on every scene attach (NVBugs 6504275).
+// The fallback is a process-private temp dir, discarded on shutdown.
 
 std::string uniqueToken()
 {
@@ -1234,16 +729,78 @@ std::string uniqueToken()
     return std::to_string(rd()) + "-" + std::to_string(rd());
 }
 
-// Best effort: on Windows the datastore may still hold files open. The path is kept on failure
-// so a later attempt can retry. Safe to call more than once.
-void releaseProcessCacheDir()
+// The caller holds bootstrapMutex and has stopped the datastore. Waiting for a cook alone
+// is insufficient: the datastore owns background write-back and open cache files.
+void releaseProcessCacheDirLocked()
 {
-    if (g_processCacheDir.empty())
+    CarboniteLoaderState& loaderState = globalState().carboniteLoader;
+    // The datastore has stopped, so nothing uses the directory even if removal fails.
+    loaderState.processCacheDirInUse.store(false, std::memory_order_release);
+    {
+        // Nor the directory a configured datastore was built from: the next one records its own.
+        std::lock_guard<std::mutex> directoryGuard(loaderState.datastoreDirectoryMutex);
+        loaderState.datastoreDirectory.clear();
+    }
+    if (loaderState.processCacheDir.empty())
         return;
     std::error_code ec;
-    std::filesystem::remove_all(g_processCacheDir, ec);
+    std::filesystem::remove_all(loaderState.processCacheDir, ec);
     if (!ec)
-        g_processCacheDir.clear();
+    {
+        loaderState.processCacheDir.clear();
+        return;
+    }
+    // Carbonite has already stopped; report filesystem failures through the host's stderr.
+    std::fprintf(stderr, "[Warning] [CarboniteLoader] Failed to remove process-private cache '%s': %s; "
+                  "it remains for the host's temp-directory cleanup.\n",
+                  loaderState.processCacheDir.string().c_str(), ec.message().c_str());
+}
+
+#if CARB_PLATFORM_WINDOWS
+void releaseProcessCacheAfterFrameworkShutdown(void*, void*)
+{
+    auto& loaderState = globalState().carboniteLoader;
+    std::lock_guard<std::mutex> guard(loaderState.bootstrapMutex);
+    releaseProcessCacheDirLocked();
+}
+#endif
+
+// Explicit shutdown runs this before host runtime finalization. The native exit registration
+// also covers C hosts that destroy their instances but omit ovphysx_shutdown().
+void releaseProcessCacheDirAtExit()
+{
+#if CARB_PLATFORM_WINDOWS
+    // Windows dependency shutdown belongs to Carbonite's ExitProcess hook.
+    // Releasing the framework here removes that hook and exposes OVStage/Fabric
+    // static-destructor crashes. The packaged exit path bypasses release hooks;
+    // private cache directories can remain for host temporary-directory cleanup.
+    return;
+#else
+    CarboniteLoaderState& loaderState = globalState().carboniteLoader;
+    std::lock_guard<std::mutex> guard(loaderState.bootstrapMutex);
+
+    // Active native handles still own runtime objects. Explicit SDK shutdown leaves these
+    // handles for the caller to destroy; do not invalidate them from an exit backstop.
+    if (loaderState.activeLoaders.load(std::memory_order_acquire) != 0)
+        return;
+    // An external host may still use these plugins and their datastore.
+    if (!loaderState.ownsFramework)
+        return;
+    if (!loaderState.bootstrapDone)
+    {
+        releaseProcessCacheDirLocked();
+        return;
+    }
+    if (carb::getFramework())
+    {
+        omni::physx::runtime::shutdown();
+        ovphysx::onCarboniteLoggingStopped();
+        carb::releaseFrameworkAndShutdown();
+    }
+    loaderState.bootstrapDone = false;
+    releaseProcessCacheDirLocked();
+    loaderState.nvtxPluginRegistered = false;
+#endif
 }
 
 // Create a file in `dir` to prove this process can write there, then remove it. Exclusive
@@ -1267,6 +824,76 @@ bool canWriteInto(const std::filesystem::path& dir)
     std::error_code ec;
     std::filesystem::remove(probe, ec);
     return true;
+#endif
+}
+
+#ifndef _WIN32
+// lstat of a directory named without trailing separators, which would make lstat follow a
+// symlink and parent_path() name the directory itself.
+bool lstatDirectory(std::string& path, struct stat& status)
+{
+    while (path.size() > 1 && path.back() == '/')
+        path.pop_back();
+    return ::lstat(path.c_str(), &status) == 0;
+}
+#endif
+
+// Whether no other user can change what the datastore reads from the directory. On POSIX:
+// the path names the directory itself, not a symlink, with the given device and inode; this
+// user owns it, and its group and others have no access at all, so nothing below it is within
+// their reach whatever modes the datastore gives its files; and every directory above it is
+// owned by this user or root and writable by no one else unless it is sticky, as /tmp is, so
+// no other user can put another directory in its place. Windows has no such check; the
+// documented rule applies there.
+bool isPrivateDirectory(std::string path, uint64_t device, uint64_t inode)
+{
+#ifndef _WIN32
+    const uid_t user = ::geteuid();
+    struct stat status;
+    if (!lstatDirectory(path, status) || !S_ISDIR(status.st_mode) || status.st_uid != user ||
+        (status.st_mode & (S_IRWXG | S_IRWXO)) != 0 || uint64_t(status.st_dev) != device ||
+        uint64_t(status.st_ino) != inode)
+        return false;
+    // Resolved, so that the walk checks the directories that actually hold it.
+    const std::filesystem::path parent = std::filesystem::path(path).parent_path();
+    char* resolved = ::realpath(parent.empty() ? "." : parent.c_str(), nullptr);
+    if (!resolved)
+        return false;
+    std::filesystem::path ancestor(resolved);
+    std::free(resolved);
+    for (;;)
+    {
+        if (::stat(ancestor.c_str(), &status) != 0 || (status.st_uid != user && status.st_uid != 0) ||
+            ((status.st_mode & (S_IWGRP | S_IWOTH)) != 0 && (status.st_mode & S_ISVTX) == 0))
+            return false;
+        if (ancestor == ancestor.parent_path())
+            return true;
+        ancestor = ancestor.parent_path();
+    }
+#else
+    (void)path;
+    (void)device;
+    (void)inode;
+    return true;
+#endif
+}
+
+// Creates the missing directories of the path, each closed to group and others whatever the
+// umask: AUTOMATIC trusts only a directory no other user can reach into or replace.
+void createPrivateDirectories(const std::filesystem::path& dir)
+{
+#ifndef _WIN32
+    std::filesystem::path partial;
+    for (const std::filesystem::path& part : dir)
+    {
+        partial /= part;
+        // The umask can only take bits away from 0700.
+        if (::mkdir(partial.c_str(), S_IRWXU) != 0 && errno != EEXIST)
+            return;
+    }
+#else
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
 #endif
 }
 
@@ -1305,41 +932,62 @@ void configureUjitsoLocalCache(carb::settings::ISettings* settings)
     if (!settings)
         return;
 
-    // Local-only datastore: local on; Hub/Nucleus/GRPC off. setDefault so an explicit
-    // app override (via PhysXConfig.carbonite_overrides) can still opt in, but our
-    // default flips carb's GRPC default (true)->false. ovphysx is kitless and in-process.
+    // Local-only datastore: local on, Hub/Nucleus/GRPC off. setDefault lets an explicit app
+    // override (via PhysXConfig.carbonite_overrides) still opt in, while flipping carb's GRPC
+    // default from true to false. ovphysx is kitless and in-process.
     settings->setDefaultBool("/UJITSO/datastore/allowLocalDataStore", true);
     settings->setDefaultBool("/UJITSO/datastore/allowHubDataStore", false);
     settings->setDefaultBool("/UJITSO/datastore/allowNucleusDataStore", false);
     settings->setDefaultBool("/UJITSO/datastore/allowGRPCDataStore", false);
 
-    // Pre-seed collision cooking ON so the cooking service reads `true` at construction
-    // (omni.physx.cooking loads before omni.physx seeds this default -- the seeding race).
+    // Pre-seed collision cooking on so the cooking service reads `true` at construction.
+    // omni.physx.cooking loads before omni.physx seeds this default.
     settings->setDefaultBool(omni::physx::kSettingUjitsoCollisionCooking, true);
 
-    // Nothing to cache to: the app opted out of the local datastore, or out of cooking.
-    if (!settings->getAsBool("/UJITSO/datastore/allowLocalDataStore") ||
-        !settings->getAsBool(omni::physx::kSettingUjitsoCollisionCooking))
+    // Nothing to cache to: the app opted out of the local datastore.
+    if (!settings->getAsBool("/UJITSO/datastore/allowLocalDataStore"))
         return;
 
+    // Nor to cook into: the app opted out of cooking, so no directory is set up. The
+    // datastore then serves only an explicitly enabled compiled stage cache, in the
+    // directory the app configured. Without one it would use carb's app-dir default,
+    // so local caching stays off and that cache reports itself unavailable. A host
+    // that owns the framework owns its datastore settings, which every UJITSO client
+    // in the process shares: leave them, and make only ovphysx's cache unavailable.
+    if (!settings->getAsBool(omni::physx::kSettingUjitsoCollisionCooking))
+    {
+        const char* configured = settings->getStringBuffer("/UJITSO/datastore/localCachePath");
+        if (!configured || !*configured)
+        {
+            CarboniteLoaderState& loaderState = globalState().carboniteLoader;
+            if (loaderState.ownsFramework)
+                settings->setBool("/UJITSO/datastore/allowLocalDataStore", false);
+            else
+                loaderState.compiledCacheUnavailable.store(true, std::memory_order_release);
+        }
+        return;
+    }
+
     // The app configured a dir: create it and confirm it is writable. If it is not, fall through
-    // to the process-private cache -- leaving the unusable path in place would just make
-    // carb.datastore retry it and log the very errors this avoids. WARN, never fail.
+    // to the process-private cache. Leaving the unusable path in place would make carb.datastore
+    // retry it and log the very errors this avoids. Warn, never fail.
     const char* configured = settings->getStringBuffer("/UJITSO/datastore/localCachePath");
     if (configured && *configured)
     {
-        // u8path: the app hands us UTF-8 (Python str), which is not the Windows narrow encoding.
+        // u8path: the app passes UTF-8 (Python str), which is not the Windows narrow encoding.
         const std::filesystem::path dir = std::filesystem::u8path(configured);
         std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
+        // The compiled stage cache trusts what it reads here.
+        createPrivateDirectories(dir);
         if (std::filesystem::is_directory(dir, ec) && canWriteInto(dir))
             return;
         CARB_LOG_WARN("[CarboniteLoader] Configured UJITSO cooked-collider cache dir '%s' is not "
                       "writable; cooking will not persist across runs.", configured);
     }
 
-    g_processCacheDir = createProcessCacheDir();
-    if (g_processCacheDir.empty())
+    CarboniteLoaderState& loaderState = globalState().carboniteLoader;
+    loaderState.processCacheDir = createProcessCacheDir();
+    if (loaderState.processCacheDir.empty())
     {
         // Nowhere writable at all. Suppress the local datastore rather than let
         // carb.ujitso.default fall back to its unwritable app-dir default.
@@ -1351,19 +999,569 @@ void configureUjitsoLocalCache(carb::settings::ISettings* settings)
 
     // u8string: Carbonite setting strings are UTF-8, while path::string() would convert through
     // the Windows narrow code page and mangle a non-ASCII temp path.
-    // atexit as well as CarboniteLoader::shutdown(): shutdown is not guaranteed to run (callers
-    // may leave the instance alive and let the OS reclaim at process exit).
-    static std::once_flag cleanupOnce;
-    std::call_once(cleanupOnce, [] { std::atexit(&releaseProcessCacheDir); });
-
-    const std::string dir = g_processCacheDir.u8string();
+    const std::string dir = loaderState.processCacheDir.u8string();
+    loaderState.processCacheDirInUse.store(true, std::memory_order_release);
     settings->setString("/UJITSO/datastore/localCachePath", dir.c_str());
     CARB_LOG_INFO("[CarboniteLoader] No cooked-collider cache directory configured "
                   "(PhysXConfig.cooked_collider_cache_dir); using the process-private cache '%s'. "
                   "Cooked colliders are discarded at shutdown.", dir.c_str());
 }
 
+// Records the directory carb.ujitso.default just built its datastore from, for
+// usesConfiguredCookedColliderCache(): an application-configured one while collision cooking
+// and the local datastore are on. Null settings record none.
+void recordDatastoreDirectory(carb::settings::ISettings* settings)
+{
+    CarboniteLoaderState& loaderState = globalState().carboniteLoader;
+    std::string directory;
+    uint64_t device = 0;
+    uint64_t inode = 0;
+    const char* configured = settings ? settings->getStringBuffer("/UJITSO/datastore/localCachePath") : nullptr;
+    if (configured && *configured && !loaderState.processCacheDirInUse.load(std::memory_order_acquire) &&
+        settings->getAsBool("/UJITSO/datastore/allowLocalDataStore") &&
+        settings->getAsBool(omni::physx::kSettingUjitsoCollisionCooking))
+    {
+        directory = configured;
+#ifndef _WIN32
+        std::string path = directory;
+        struct stat status;
+        if (lstatDirectory(path, status))
+        {
+            device = uint64_t(status.st_dev);
+            inode = uint64_t(status.st_ino);
+        }
+        else
+            directory.clear();
+#endif
+    }
+    std::lock_guard<std::mutex> guard(loaderState.datastoreDirectoryMutex);
+    loaderState.datastoreDirectory = std::move(directory);
+    loaderState.datastoreDirectoryDevice = device;
+    loaderState.datastoreDirectoryInode = inode;
+}
+
+// Whether a plugin is registered under the name. getPluginDesc would warn about a name it
+// does not know, which startup must not do for a plugin that is not loaded yet.
+bool pluginRegistered(carb::Framework* framework, const char* name)
+{
+    std::vector<carb::PluginDesc> plugins(framework->getPluginCount());
+    if (!plugins.empty())
+        framework->getPlugins(plugins.data());
+    for (const carb::PluginDesc& plugin : plugins)
+    {
+        if (plugin.impl.name && std::strcmp(plugin.impl.name, name) == 0)
+            return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// The profiler backend.
+//
+// Three emitters feed carb::profiler: the omni.physx runtime's CARB_PROFILE_* zones
+// over stage load, cooking and step orchestration; the ovphysx C API entry points;
+// and the PhysX SDK's non-detached zones, which the runtime bridges across. In a
+// kitless process none of them reach anybody -- no backend is ever loaded, so
+// g_carbProfiler stays null and every zone is a branch. Binding one backend here
+// publishes all three at once.
+//
+// Two are selectable. NVTX feeds an Nsight Systems capture and is linked statically.
+// The chrome-trace writer is carb.profiler-cpu, a shared plugin already in the
+// shipped plugin set, which writes its JSON when the profiler shuts down.
+//
+// One group of zones never arrives here at all: the PhysX SDK's detached
+// (cross-thread) zones, which IProfiler cannot express and the runtime therefore
+// drops. No capture has Basic.simulate or its sibling phases, whichever backend is
+// bound.
+//
+// Shared by live loaders: bound at most once per loader epoch, and released by
+// the last loader, which also writes the trace file. The datastore and its cache
+// instead remain until framework shutdown.
+// ---------------------------------------------------------------------------
+constexpr const char* kCarbNvtxPlugin = "carb.profiler-nvtx.plugin";
+constexpr const char* kCarbTracePlugin = "carb.profiler-cpu.plugin";
+
+// carb.profiler-cpu's own settings, read by the plugin when the profiler starts.
+constexpr const char* kTraceSaveProfile = "/plugins/carb.profiler-cpu.plugin/saveProfile";
+constexpr const char* kTraceCompressProfile = "/plugins/carb.profiler-cpu.plugin/compressProfile";
+constexpr const char* kTraceFilePath = "/plugins/carb.profiler-cpu.plugin/filePath";
+
+const char* profilerPluginName(int32_t backend)
+{
+    return backend == OVPHYSX_PROFILER_BACKEND_TRACE ? kCarbTracePlugin : kCarbNvtxPlugin;
+}
+
+// Messages emitted after profilerMutex is released. A log handler may call
+// back into ovphysx_get_global_config, which takes that same mutex.
+struct DeferredCarbLog
+{
+    enum class Level
+    {
+        eInfo,
+        eWarn,
+    };
+
+    struct Item
+    {
+        Level level;
+        std::string text;
+    };
+
+    std::vector<Item> items;
+
+    void info(const std::string& text) { items.push_back({Level::eInfo, text}); }
+    void warn(const std::string& text) { items.push_back({Level::eWarn, text}); }
+
+    void emit() const
+    {
+        for (const Item& item : items)
+        {
+            if (item.level == Level::eWarn)
+                CARB_LOG_WARN("%s", item.text.c_str());
+            else
+                CARB_LOG_INFO("%s", item.text.c_str());
+        }
+    }
+};
+
+std::string formatCarbLog(const char* text)
+{
+    return std::string(text);
+}
+
+template <typename... Args>
+std::string formatCarbLog(const char* fmt, Args... args)
+{
+    char buffer[768];
+    // The format string is a literal at every call site. It is a parameter
+    // here only so the formatted text can be stored until the profiler mutex
+    // is released.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
+#endif
+    std::snprintf(buffer, sizeof(buffer), fmt, args...);
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+    return std::string(buffer);
+}
+
+// Every registered plugin that offers carb::profiler::IProfiler, by name. Logged when
+// the binding did not come out as intended, since the name a static plugin registers
+// under is the thing most likely to be wrong and is otherwise invisible.
+void logProfilerProviders(carb::Framework* framework, DeferredCarbLog& logs)
+{
+    const size_t count = framework->getPluginCount();
+    if (count == 0)
+        return;
+
+    std::vector<carb::PluginDesc> plugins(count);
+    framework->getPlugins(plugins.data());
+
+    const carb::InterfaceDesc wanted = carb::profiler::IProfiler::getInterfaceDesc();
+    for (const carb::PluginDesc& plugin : plugins)
+    {
+        for (size_t i = 0; i < plugin.interfaceCount; ++i)
+        {
+            if (plugin.interfaces[i].name && std::strcmp(plugin.interfaces[i].name, wanted.name) == 0)
+            {
+                logs.warn(formatCarbLog(
+                    "[CarboniteLoader]   carb::profiler::IProfiler provider: %s (provides v%u.%u, "
+                    "this build requests v%u.%u)",
+                    plugin.impl.name ? plugin.impl.name : "(unnamed)",
+                    plugin.interfaces[i].version.major, plugin.interfaces[i].version.minor,
+                    wanted.version.major, wanted.version.minor));
+            }
+        }
+    }
+}
+
+// Makes the selected backend's plugin available for acquisition. Returns false only
+// when the request cannot be honoured at all; the acquire in the caller is what proves
+// the plugin actually provides IProfiler.
+bool registerProfilerBackendPlugin(carb::Framework* framework,
+                                   const std::vector<const char*>& searchPaths,
+                                   int32_t backend,
+                                   DeferredCarbLog& logs)
+{
+    if (backend == OVPHYSX_PROFILER_BACKEND_TRACE)
+    {
+        // A shared plugin rather than a static one -- the carb package builds a static
+        // library for the NVTX backend only. Carbonite skips a plugin whose name is
+        // already loaded, so this is safe even if a host loaded it first.
+        const char* wildcards[] = { kCarbTracePlugin };
+        carb::PluginLoadingDesc desc = carb::PluginLoadingDesc::getDefault();
+        desc.loadedFileWildcards = wildcards;
+        desc.loadedFileWildcardCount = 1;
+        desc.searchPaths = searchPaths.data();
+        desc.searchPathCount = static_cast<uint32_t>(searchPaths.size());
+        framework->loadPlugins(desc);
+        return true;
+    }
+
+#if OVPHYSX_CARB_NVTX_BACKEND
+    CarboniteLoaderState& loaderState = globalState().carboniteLoader;
+    // At most once per framework: see nvtxPluginRegistered. A later loader epoch
+    // reuses the registration; Linux owned-framework shutdown resets the flag.
+    if (loaderState.nvtxPluginRegistered)
+    {
+        return true;
+    }
+
+    if (!carb_profiler_nvtx_plugin_registerPlugin(framework))
+    {
+        // Not fatal: the zones stay unpublished, which is no reason to fail instance
+        // creation. A profiling opt-in that quietly does nothing would be worse, hence
+        // the warning.
+        logs.warn(formatCarbLog(
+            "[CarboniteLoader] Could not register %s; the profile zones will not "
+            "appear in an NVTX capture",
+            kCarbNvtxPlugin));
+        return false;
+    }
+    loaderState.nvtxPluginRegistered = true;
+    return true;
+#else
+    CARB_UNUSED(framework);
+    CARB_UNUSED(searchPaths);
+    logs.warn(formatCarbLog(
+        "[CarboniteLoader] This build has no NVTX profiler backend (carb.profiler-nvtx.static "
+        "was absent at configure time); select the trace backend instead"));
+    return false;
+#endif
+}
+
+// Points carb.profiler-cpu at its destination. Must run before CARB_PROFILE_STARTUP():
+// the plugin reads these when the profiler starts.
+void configureTraceBackend(carb::settings::ISettings* settings, DeferredCarbLog& logs)
+{
+    settings->setBool(kTraceSaveProfile, true);
+
+    // Plain JSON, not the plugin's gzip. The point of this backend is an artifact a
+    // script can read without a decompression step; a caller who wants the space back
+    // can compress the file afterwards.
+    settings->setBool(kTraceCompressProfile, false);
+
+    const char* outputPath = settings->getStringBuffer(ovphysx::profiling::kSettingProfilerOutputPath);
+    if (outputPath && outputPath[0] != '\0')
+    {
+        settings->setString(kTraceFilePath, outputPath);
+        logs.info(formatCarbLog(
+            "[CarboniteLoader] Chrome trace will be written to '%s'", outputPath));
+    }
+    else
+    {
+        // Drop any destination an earlier epoch set. The plugin setting is process-global
+        // and outlives a loader epoch, so leaving it would send this run's trace to the
+        // previous run's file -- overwriting it, while the log below promises the
+        // default.
+        settings->destroyItem(kTraceFilePath);
+
+        // The plugin's own default is a timestamped ct-profile file in the working
+        // directory. Named in the log because an unconfigured run otherwise leaves the
+        // caller hunting for where the trace went.
+        logs.info(formatCarbLog(
+            "[CarboniteLoader] Chrome trace will be written to the plugin default "
+            "(ct-profile <date> <time>.json in the working directory); set "
+            "PhysXConfig.profiler_output_path or OVPHYSX_PROFILER_OUTPUT to choose"));
+    }
+}
+
+void enableProfilerBackendIfRequested(carb::Framework* framework, const std::vector<const char*>& searchPaths)
+{
+    CarboniteLoaderState& loaderState = globalState().carboniteLoader;
+    DeferredCarbLog logs;
+    std::unique_lock<std::mutex> guard(loaderState.profilerMutex);
+    // Declared after the lock so it runs first on every return: unlock, then log,
+    // then refresh. A handler that reads the bound profiler must not find this
+    // mutex still held, and refresh itself can log.
+    struct Flush
+    {
+        DeferredCarbLog& logs;
+        std::unique_lock<std::mutex>& guard;
+        bool refresh;
+        ~Flush()
+        {
+            if (guard.owns_lock())
+                guard.unlock();
+            logs.emit();
+            if (refresh)
+                omni::physx::runtime::refreshProfilerCallback();
+        }
+    } flush{logs, guard, false};
+
+    carb::settings::ISettings* settings = framework->tryAcquireInterface<carb::settings::ISettings>();
+    if (!settings)
+        return;
+
+    const int32_t selected = settings->getAsInt(ovphysx::profiling::kSettingProfilerBackend);
+    if (selected == OVPHYSX_PROFILER_BACKEND_NONE)
+    {
+        if (loaderState.profilerBackendActive)
+        {
+            // Asking for none while a backend is bound is the same case as asking for a
+            // different one: the bound backend keeps publishing until the last loader
+            // shuts down, because releasing it here would silence an instance that is
+            // still simulating.
+            logs.warn(formatCarbLog(
+                "[CarboniteLoader] Profiler backend '%s' is already bound process-wide; this "
+                "instance asked for none and the zones keep publishing to the bound one "
+                "until the last instance shuts down",
+                ovphysx::profiling::backendName(
+                    static_cast<ovphysx_profiler_backend_t>(loaderState.profilerBackendBound))));
+        }
+
+        // Tell the runtime either way. It caches the installed SDK callback from
+        // whenever it was last resolved, and the PhysX SDK is created once per direct-runtime lifecycle:
+        // returning without a refresh would leave the callback as the first instance
+        // left it. Flush runs the refresh after the mutex is released.
+        flush.refresh = true;
+        return;
+    }
+
+    const char* pluginName = profilerPluginName(selected);
+    carb::profiler::IProfiler* backend = nullptr;
+
+    if (!loaderState.profilerBackendActive)
+    {
+        loaderState.profilerBindFailed = false;
+        if (!registerProfilerBackendPlugin(framework, searchPaths, selected, logs))
+        {
+            loaderState.profilerBindFailed = true;
+            return;
+        }
+
+        if (selected == OVPHYSX_PROFILER_BACKEND_TRACE)
+            configureTraceBackend(settings, logs);
+
+        // Name it as this client's IProfiler, so the unqualified acquire inside
+        // registerProfilerForClient() resolves to this backend and not to whichever
+        // other one Carbonite finds -- the install tree ships more than one plugin
+        // providing this interface. Per-client, so a host tenant's own choice is
+        // untouched.
+        framework->setDefaultPlugin<carb::profiler::IProfiler>(pluginName);
+
+        // Then acquire it once through the *non-optional* entry point, which is what
+        // initializes a freshly registered plugin. registerProfilerForClient() acquires
+        // optionally, and an optional acquire returns null for a plugin that has not
+        // been initialized rather than initializing it -- so registering and binding
+        // without this call leaves the profiler unbound and every zone dropped, with
+        // no error anywhere.
+        backend = framework->acquireInterface<carb::profiler::IProfiler>(pluginName);
+        if (!backend)
+        {
+            logs.warn(formatCarbLog(
+                "[CarboniteLoader] %s did not provide carb::profiler::IProfiler; the "
+                "profile zones cannot reach it",
+                pluginName));
+            logProfilerProviders(framework, logs);
+            loaderState.profilerBindFailed = true;
+            return;
+        }
+
+        // Rebind rather than just register. registerProfilerForClient() is a one-shot
+        // per module, and this module's profiler may already be bound: its load hook
+        // binds whichever backend Carbonite loaded first. Deregistering first makes the
+        // re-registration resolve through the default just set, instead of keeping a
+        // binding that predates it.
+        carb::profiler::deregisterProfilerForClient();
+        carb::profiler::registerProfilerForClient();
+
+        // Zone masks in the runtime are mixed: most zones pass 0, which resolves to
+        // kCaptureMaskDefault (bit 1), while the PhysX SDK bridge uses 1 << 8. Capture
+        // everything rather than track that set. Set before startup, not after:
+        // IProfiler documents changing the mask on a started profiler as undefined.
+        CARB_PROFILE_SET_CAPTURE_MASK(carb::profiler::kCaptureMaskAll);
+        CARB_PROFILE_STARTUP();
+        loaderState.profilerBackendActive = true;
+        loaderState.profilerBackendBound = selected;
+        loaderState.profilerBindFailed = false;
+        loaderState.profilerHostOwned = false;
+        loaderState.profilerOutputPathCaptured = false;
+        loaderState.profilerBoundOutputPath.clear();
+        if (selected == OVPHYSX_PROFILER_BACKEND_TRACE)
+        {
+            const char* configured = settings->getStringBuffer(kTraceFilePath);
+            if (configured && configured[0] != '\0')
+            {
+                loaderState.profilerBoundOutputPath = configured;
+                loaderState.profilerOutputPathCaptured = true;
+            }
+        }
+
+        // The runtime installs the SDK profiler callback when it creates the PhysX
+        // SDK, which happens once per direct-runtime lifecycle: an
+        // instance that asks for profiling after an earlier one ran without it would
+        // otherwise find no callback installed, and every SDK zone would be dropped
+        // before reaching this backend. Flush runs it after the mutex is released.
+        flush.refresh = true;
+    }
+    else
+    {
+        // The first selection wins for the rest of the loader epoch, because the profiler
+        // is bound once and started once. Say so rather than let the caller conclude the
+        // setting was ignored when a capture comes back in the other format.
+        if (selected != loaderState.profilerBackendBound)
+        {
+            logs.warn(formatCarbLog(
+                "[CarboniteLoader] Profiler backend '%s' is already bound process-wide; this "
+                "instance asked for '%s' and will publish to the bound one",
+                ovphysx::profiling::backendName(
+                    static_cast<ovphysx_profiler_backend_t>(loaderState.profilerBackendBound)),
+                ovphysx::profiling::backendName(static_cast<ovphysx_profiler_backend_t>(selected))));
+        }
+        else if (selected == OVPHYSX_PROFILER_BACKEND_TRACE)
+        {
+            // The destination is configured on the plugin once, before it starts, so a
+            // later instance asking for a different file does not get one -- and would
+            // otherwise go looking for a trace that was never going to be written there.
+            const char* requested = settings->getStringBuffer(ovphysx::profiling::kSettingProfilerOutputPath);
+            const char* configured = settings->getStringBuffer(kTraceFilePath);
+            const bool configuredIsDefault = !configured || configured[0] == '\0';
+            if (requested && requested[0] != '\0' && (configuredIsDefault || std::strcmp(requested, configured) != 0))
+            {
+                logs.warn(formatCarbLog(
+                    "[CarboniteLoader] The chrome trace destination is already set to %s for this "
+                    "process; this instance asked for '%s', which is ignored. The trace is written "
+                    "to the bound destination when the last instance shuts down.",
+                    configuredIsDefault ? "the plugin default" : configured, requested));
+            }
+        }
+        backend = framework->tryAcquireInterface<carb::profiler::IProfiler>(
+            profilerPluginName(loaderState.profilerBackendBound));
+    }
+
+    // Reported on every creation that asks for profiling, not just the one that bound
+    // the backend: the binding is a process-wide fact decided once, but the instance
+    // asking now is the one whose capture depends on the answer. The alternative is not
+    // "nothing" -- a host that bound its own backend keeps the zones, and the only
+    // symptom is a capture missing rows, with nothing to explain why.
+    carb::profiler::IProfiler* active = carb::profiler::getProfiler();
+    if (loaderState.profilerBackendActive)
+        loaderState.profilerHostOwned = active == nullptr || active != backend;
+    if (active && active == backend)
+    {
+        logs.info(formatCarbLog(
+            "[CarboniteLoader] Profile zones are publishing to the '%s' backend",
+            ovphysx::profiling::backendName(
+                static_cast<ovphysx_profiler_backend_t>(loaderState.profilerBackendBound))));
+    }
+    else
+    {
+        if (!active)
+            logs.warn(formatCarbLog(
+                "[CarboniteLoader] No Carbonite profiler is bound for this module; the "
+                "profile zones reach no consumer"));
+        else
+            logs.warn(formatCarbLog(
+                "[CarboniteLoader] Another Carbonite profiler backend owns this process; the "
+                "profile zones go there rather than to the selected backend"));
+
+        // Which plugins can provide the interface at all. Only on the unhappy path,
+        // where the alternative is guessing from an empty capture.
+        logProfilerProviders(framework, logs);
+    }
+}
+
+void disableProfilerBackend()
+{
+    CarboniteLoaderState& loaderState = globalState().carboniteLoader;
+    std::lock_guard<std::mutex> guard(loaderState.profilerMutex);
+    if (!loaderState.profilerBackendActive)
+    {
+        loaderState.profilerBindFailed = false;
+        loaderState.profilerHostOwned = false;
+        loaderState.profilerOutputPathCaptured = false;
+        loaderState.profilerBoundOutputPath.clear();
+        return;
+    }
+
+    // Order matters for the trace backend: CARB_PROFILE_SHUTDOWN() is what makes
+    // carb.profiler-cpu finalize its JSON; the file may already exist.
+    // Deregistering first would drop the interface pointer that finalizes it.
+    CARB_PROFILE_SHUTDOWN();
+    carb::profiler::deregisterProfilerForClient();
+    loaderState.profilerBackendActive = false;
+    loaderState.profilerBackendBound = OVPHYSX_PROFILER_BACKEND_NONE;
+    loaderState.profilerBindFailed = false;
+    loaderState.profilerHostOwned = false;
+    loaderState.profilerOutputPathCaptured = false;
+    loaderState.profilerBoundOutputPath.clear();
+}
+
 } // namespace
+
+BoundProfilerState boundProfilerState()
+{
+    CarboniteLoaderState& loaderState = globalState().carboniteLoader;
+    std::lock_guard<std::mutex> guard(loaderState.profilerMutex);
+    BoundProfilerState state;
+    state.active = loaderState.profilerBackendActive;
+    state.bindFailed = loaderState.profilerBindFailed;
+    state.hostOwned = loaderState.profilerHostOwned;
+    state.backend = loaderState.profilerBackendBound;
+    state.outputPathCaptured = loaderState.profilerOutputPathCaptured;
+    state.outputPath = loaderState.profilerBoundOutputPath;
+    return state;
+}
+
+// @implements REQ-CAPI-COMPILED-CACHE-001
+// @covers AC-4
+bool usesConfiguredCookedColliderCache()
+{
+    CarboniteLoaderState& loaderState = globalState().carboniteLoader;
+    // An atomic rather than processCacheDir: attach must not take bootstrapMutex.
+    if (loaderState.processCacheDirInUse.load(std::memory_order_acquire))
+        return false;
+    carb::Framework* framework = carb::getFramework();
+    carb::settings::ISettings* settings =
+        framework ? framework->tryAcquireInterface<carb::settings::ISettings>() : nullptr;
+    // An application that turned UJITSO collision cooking off opted out of this datastore.
+    if (!settings || !settings->getAsBool("/UJITSO/datastore/allowLocalDataStore") ||
+        !settings->getAsBool(omni::physx::kSettingUjitsoCollisionCooking))
+        return false;
+    const char* configured = settings->getStringBuffer("/UJITSO/datastore/localCachePath");
+    if (!configured || configured[0] == '\0')
+        return false;
+    std::string directory;
+    uint64_t device = 0;
+    uint64_t inode = 0;
+    {
+        std::lock_guard<std::mutex> guard(loaderState.datastoreDirectoryMutex);
+        directory = loaderState.datastoreDirectory;
+        device = loaderState.datastoreDirectoryDevice;
+        inode = loaderState.datastoreDirectoryInode;
+    }
+    // The datastore reads the directory it was built from, which a later instance's
+    // configuration or a host's setting does not change.
+    if (directory != configured)
+    {
+        CARB_LOG_INFO(
+            "[ovphysx] attach_ovstage: AUTOMATIC leaves the compiled stage cache off, because the "
+            "datastore was not built from the cooked-collider cache directory '%s': it keeps the "
+            "directory it started with until it stops; READ_WRITE uses that datastore anyway.",
+            configured);
+        return false;
+    }
+    // A hit deserializes PhysX binary data from the directory, which a checksum guards
+    // against corruption but nothing authenticates: use only one no other user can change.
+    if (isPrivateDirectory(directory, device, inode))
+        return true;
+    CARB_LOG_INFO(
+        "[ovphysx] attach_ovstage: AUTOMATIC leaves the compiled stage cache off, because the "
+        "cooked-collider cache directory '%s' is not private: it must be the directory it was when "
+        "the datastore started, not a symlink, owned by this user and closed to its group and "
+        "others, and no directory above it may let another user replace it; READ_WRITE uses it "
+        "anyway.",
+        configured);
+    return false;
+}
+
+bool compiledStageCacheUnavailable()
+{
+    return globalState().carboniteLoader.compiledCacheUnavailable.load(std::memory_order_acquire);
+}
 
 // Load the Carbonite dependencies, then start the linked PhysX runtime.
 // IPhysxSimulation is provided directly by the runtime, not acquired from Carbonite.
@@ -1385,6 +1583,15 @@ bool CarboniteLoader::loadPhysxPlugins()
         return false;
     }
 
+    // Before the reuse path below: the backend selection is resolved per instance
+    // creation, so an instance that turns profiling on in a process where an earlier
+    // one left it off still gets its zones published. Search paths are needed because
+    // the trace backend is a shared plugin that has to be found on disk.
+    {
+        auto [profilerSearchPathStrings, profilerSearchPaths] = buildSearchPaths();
+        enableProfilerBackendIfRequested(framework, profilerSearchPaths);
+    }
+
     // The linked PhysX runtime is process-wide. Repeated ovphysx instances use
     // its existing function table without repeating dependency setup.
     if (!m->physxSim)
@@ -1397,47 +1604,138 @@ bool CarboniteLoader::loadPhysxPlugins()
 
     auto [searchPathStrings, searchPaths] = buildSearchPaths();
 
-    // Cubric is GPU-only -- skip explicit loading on CPU-only machines.
-    // On Linux this avoids dlopen failure (cubric has DT_NEEDED libcuda.so.1).
-    // On Windows, cubric's carbOnPluginStartupEx calls CUDA which crashes with
-    // FAST_FAIL_INVALID_ARG when nvcuda64.dll has no device context.
-    // The DLL is also isolated to plugins/gpu/ (see install.cmake) to prevent
-    // carb's lazy plugin discovery from loading it during populateFromUsd.
-    const char* disableReason = nullptr;
-    const bool gpuDisabled = isGpuDisabled(&disableReason);
-
-    static const char* kDependencyPluginsGpu[] = {
-        "omni.cubric.plugin",
-    };
-
-    if (gpuDisabled)
+    // Tasking and TBB establish their process-wide worker limits when their
+    // interfaces are acquired. initialize() therefore registers but deliberately
+    // does not acquire either interface, and ovphysx_create_instance() applies
+    // its config entries between initialize() and this call, so an
+    // application-supplied worker count is in place before either pool starts.
+    //
+    // ovphysx supplies no default of its own: an unconfigured pool keeps
+    // Carbonite's machine-sized default. A bounded default was measured on
+    // GPU-heavy replicated scenes and was slower than the machine-sized pool,
+    // so the count is left to the application.
+    carb::settings::ISettings* workerSettings =
+        framework->tryAcquireInterface<carb::settings::ISettings>();
+    if (!workerSettings)
     {
-        CARB_LOG_INFO("[CarboniteLoader] Skipping PhysX non-USD dependency plugins (GPU disabled, skipping cubric)");
+        m->lastError = "Cannot configure worker pools because Carbonite ISettings is unavailable";
+        CARB_LOG_ERROR("[CarboniteLoader] %s", m->lastError.c_str());
+        return false;
+    }
+
+    // An unset tasking count reads as zero and means "size to the machine".
+    // TBB distinguishes an absent setting from explicit zero; zero is invalid
+    // when present because tbb::global_control requires a positive limit.
+    const int32_t configuredTaskingThreads = workerSettings->getAsInt(kTaskingThreadCountPath);
+    const int32_t configuredTbbThreads = workerSettings->getAsInt(kTbbThreadCountPath);
+    const bool hasConfiguredTbbThreads =
+        workerSettings->isAccessibleAs(carb::dictionary::ItemType::eInt, kTbbThreadCountPath);
+    if (configuredTaskingThreads < 0 || configuredTbbThreads < 0 ||
+        (hasConfiguredTbbThreads && configuredTbbThreads == 0))
+    {
+        m->lastError =
+            "Worker thread counts are invalid: /plugins/carb.tasking.plugin/threadCount and "
+            "/plugins/omni.tbb.globalcontrol/maxThreadCount must be >= 0 and an explicit TBB limit must be > 0";
+        CARB_LOG_ERROR(
+            "[CarboniteLoader] %s (tasking=%d, TBB=%d)",
+            m->lastError.c_str(),
+            configuredTaskingThreads,
+            configuredTbbThreads);
+        return false;
+    }
+
+    carb::tasking::ITasking* existingTasking =
+        framework->tryAcquireExistingInterface<carb::tasking::ITasking>();
+    if (existingTasking)
+    {
+        CARB_LOG_INFO(
+            "[CarboniteLoader] Reusing pre-started carb.tasking pool with %u workers; "
+            "startup setting is %d and cannot resize it",
+            existingTasking->getDesc().threadCount,
+            configuredTaskingThreads);
     }
     else
     {
-        CARB_LOG_INFO("[CarboniteLoader] Loading PhysX non-USD dependencies");
-        carb::PluginLoadingDesc depDesc = carb::PluginLoadingDesc::getDefault();
-        depDesc.loadedFileWildcards = kDependencyPluginsGpu;
-        depDesc.loadedFileWildcardCount = static_cast<uint32_t>(sizeof(kDependencyPluginsGpu) / sizeof(kDependencyPluginsGpu[0]));
-        depDesc.searchPaths = searchPaths.data();
-        depDesc.searchPathCount = static_cast<uint32_t>(searchPaths.size());
-        framework->loadPlugins(depDesc);
+        CARB_LOG_INFO(
+            "[CarboniteLoader] Starting carb.tasking with configured threadCount=%d "
+            "(0 means size to the machine; available logical CPUs=%u)",
+            configuredTaskingThreads,
+            carb::thread::hardware_concurrency());
     }
 
-    // ------------------------------------------------------------------
-    // UJITSO local in-process cooked-collider cache (NVBugs 6262606). The kitless
-    // loader historically never loaded the UJITSO plugins, so the cooking service
-    // found no carb::ujitso::IRegistry and silently cooked uncached -- re-cooking
-    // every collider on every IsaacLab launch. Seed the local-only datastore +
-    // collision-cooking settings, then load the UJITSO plugins HERE, before
-    // omni.physx.cooking constructs its service. No Hub/Nucleus/GRPC (see
-    // configureUjitsoLocalCache).
-    // ------------------------------------------------------------------
+    if (!verifyLoadedInterfaces(
+            framework, kTaskingProbes, sizeof(kTaskingProbes) / sizeof(kTaskingProbes[0]), "Tasking"))
+    {
+        m->lastError = "Carbonite tasking failed to start after worker configuration";
+        return false;
+    }
+
+    carb::tasking::ITasking* tasking =
+        framework->tryAcquireExistingInterface<carb::tasking::ITasking>();
+    CARB_LOG_INFO(
+        "[CarboniteLoader] Worker pools configured: carb.tasking effective=%u, TBB configured=%d",
+        tasking ? tasking->getDesc().threadCount : 0,
+        configuredTbbThreads);
+
+    if (!verifyLoadedInterfaces(
+            framework,
+            kPostTaskingProbes,
+            sizeof(kPostTaskingProbes) / sizeof(kPostTaskingProbes[0]),
+            "Post-tasking foundation"))
+    {
+        m->lastError = "Carbonite foundation interfaces failed after tasking startup";
+        return false;
+    }
+
+    // Establish TBB's process-wide cap before the PhysX runtime or cooking
+    // plugins can start TBB workers.
+    static const char* const kInfrastructurePlugins[] = {
+        "omni.tbb.globalcontrol.plugin",
+    };
+    carb::PluginLoadingDesc infrastructureDesc = carb::PluginLoadingDesc::getDefault();
+    infrastructureDesc.loadedFileWildcards = kInfrastructurePlugins;
+    infrastructureDesc.loadedFileWildcardCount =
+        sizeof(kInfrastructurePlugins) / sizeof(kInfrastructurePlugins[0]);
+    infrastructureDesc.searchPaths = searchPaths.data();
+    infrastructureDesc.searchPathCount = static_cast<uint32_t>(searchPaths.size());
+    framework->loadPlugins(infrastructureDesc);
+    TbbGlobalControl* tbbGlobalControl =
+        framework->tryAcquireInterface<TbbGlobalControl>("omni.tbb.globalcontrol.plugin");
+    if (!tbbGlobalControl)
+    {
+        m->lastError = "TBB global control failed to start after worker configuration";
+        CARB_LOG_ERROR("[CarboniteLoader] %s", m->lastError.c_str());
+        return false;
+    }
+    CARB_LOG_INFO(
+        "[CarboniteLoader] TBB global control started with configured maxThreadCount=%d",
+        configuredTbbThreads);
+
+    // Monitoring plugins may depend on tasking, so load them only after the
+    // configured tasking pool is running.
+    static const char* const kMonitoringPlugins[] = {
+        "omni.platforminfo.plugin",
+    };
+    carb::PluginLoadingDesc monitoringDesc = carb::PluginLoadingDesc::getDefault();
+    monitoringDesc.loadedFileWildcards = kMonitoringPlugins;
+    monitoringDesc.loadedFileWildcardCount =
+        sizeof(kMonitoringPlugins) / sizeof(kMonitoringPlugins[0]);
+    monitoringDesc.searchPaths = searchPaths.data();
+    monitoringDesc.searchPathCount = static_cast<uint32_t>(searchPaths.size());
+    framework->loadPlugins(monitoringDesc);
+
+    // UJITSO local in-process cooked-collider cache (NVBugs 6262606). Without the UJITSO
+    // plugins the cooking service finds no carb::ujitso::IRegistry and silently cooks
+    // uncached, re-cooking every collider on every launch. Seed the local-only datastore
+    // and collision-cooking settings, then load the UJITSO plugins before
+    // omni.physx.cooking constructs its service (see configureUjitsoLocalCache).
+    // carb.ujitso.default builds its datastore as it starts; one a host already started
+    // was built from settings ovphysx did not configure.
+    const bool datastoreBuiltHere = !pluginRegistered(framework, "carb.ujitsodefault.plugin");
     if (auto* ujitsoSettings = framework->tryAcquireInterface<carb::settings::ISettings>())
         configureUjitsoLocalCache(ujitsoSettings);
 
-    static const char* kUjitsoPlugins[] = {
+    static const char* const kUjitsoPlugins[] = {
         "omni.blobkey.plugin",        // IBlobKey (no deps)
         "carb.datastore.plugin",      // datastore factories (needs IBlobKey)
         "carb.ujitsoagent.plugin",    // IFactory/IAgent/IService/IRegistry (carb.datasource-file is static)
@@ -1482,9 +1780,10 @@ bool CarboniteLoader::loadPhysxPlugins()
         }
         if (registryUp && defaultUp)
             CARB_LOG_INFO("[CarboniteLoader] UJITSO cooked-collider cache active (local, in-process)");
+        recordDatastoreDirectory(datastoreBuiltHere && defaultUp ? ujitsoSettings : nullptr);
     }
 
-    static const char* kRuntimeDependentPlugins[] = {
+    static const char* const kRuntimeDependentPlugins[] = {
         "omni.localcache.plugin",
         "omni.kvdb.plugin",
     };
@@ -1531,103 +1830,17 @@ bool CarboniteLoader::loadPhysxPlugins()
         return false;
     }
 
+    std::atexit(&releaseProcessCacheDirAtExit);
     return true;
 }
 
-// Ensure USD symbols resolve to one namespaced USD runtime in this process.
-// On Linux, an already-loaded namespaced USD monolith is promoted to global
-// visibility; otherwise the monolith from the ovphysx package is loaded.
-// On Windows, DLL resolution already gives process-wide reuse, so detection is
-// logged and no explicit preload is needed.
-bool CarboniteLoader::preloadUsdLibraries()
+void shutdownCarbonite()
 {
-#ifdef _WIN32
-    const std::string loadedNamespacedUsd = omni::sdk::internal::findLoadedNamespacedUsdLibrary();
-    if (!loadedNamespacedUsd.empty())
-    {
-        CARB_LOG_INFO("[CarboniteLoader] Reusing already-loaded namespaced USD: %s",
-                      loadedNamespacedUsd.c_str());
-    }
-    return true;
-#else
-    if (g_usdPreloadDone)
-    {
-        return true;
-    }
-    if (shouldSkipUsdPreload())
-    {
-        CARB_LOG_INFO("[CarboniteLoader] Skipping USD preload (setting /ovphysx/skipUsdLibPreload=true)");
-        g_usdPreloadDone = true;
-        return true;
-    }
-    if (m->pluginsDir.empty())
-    {
-        CARB_LOG_WARN("[CarboniteLoader] USD preload skipped: plugins directory not set");
-        return false;
-    }
-    const std::string& usdLibDir = m->usdLibDir.empty() ? m->pluginsDir : m->usdLibDir;
-
-    const std::string loadedNamespacedUsd = omni::sdk::internal::findLoadedNamespacedUsdLibrary();
-    if (!loadedNamespacedUsd.empty())
-    {
-        // If another OV library already loaded the same namespaced USD runtime,
-        // promote that handle to RTLD_GLOBAL visibility so ovphysx plugins and
-        // the clone library bind to the existing image instead of loading a
-        // second copy from this package.
-        //
-        // TOCTOU note: there is a narrow window between findLoadedNamespacedUsdLibrary()
-        // returning a hit above and the RTLD_NOLOAD promotion below. If a peer dlclose's
-        // the library in that gap, the dlopen here returns null and we fail this
-        // initialization. We accept the gap: ovphysx initialization runs early in the
-        // process, and OV peers that load USD do not unload it during the same call
-        // chain. If this assumption ever breaks, the failure mode is a clean
-        // initialization error, not a corrupt load.
-        void* existing = dlopen(loadedNamespacedUsd.c_str(), RTLD_NOW | RTLD_NOLOAD | RTLD_GLOBAL);
-        if (!existing)
-        {
-            CARB_LOG_WARN("[CarboniteLoader] Failed to promote already-loaded namespaced USD %s: %s",
-                          loadedNamespacedUsd.c_str(), dlerror());
-            return false;
-        }
-
-        CARB_LOG_INFO("[CarboniteLoader] Reusing already-loaded namespaced USD: %s",
-                      loadedNamespacedUsd.c_str());
-        g_usdPreloadDone = true;
-        return true;
-    }
-
-    std::string monolithicLib;
-    {
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        for (auto& entry : fs::directory_iterator(usdLibDir, ec))
-        {
-            auto name = entry.path().filename().string();
-            if (name.find("usd_ms.so") != std::string::npos && name.substr(0, 3) == "lib")
-            {
-                monolithicLib = entry.path().string();
-                break;
-            }
-        }
-    }
-
-    if (monolithicLib.empty())
-    {
-        CARB_LOG_WARN("[CarboniteLoader] Namespaced USD monolith (*usd_ms.so) not found in: %s", usdLibDir.c_str());
-        return false;
-    }
-
-    void* h = dlopen(monolithicLib.c_str(), RTLD_NOW | RTLD_GLOBAL);
-    if (!h)
-    {
-        CARB_LOG_WARN("[CarboniteLoader] %s not loaded: %s", monolithicLib.c_str(), dlerror());
-        return false;
-    }
-
-    CARB_LOG_INFO("[CarboniteLoader] Preloaded namespaced USD: %s", monolithicLib.c_str());
-    g_usdPreloadDone = true;
-    return true;
-#endif
+    // Drain before taking bootstrapMutex: callbacks can query loader state. This API
+    // also updates the thread-local last error, so never call it from native atexit,
+    // which runs after C++ thread-local destructors on Linux.
+    ovphysx::shutdownLogCallback();
+    releaseProcessCacheDirAtExit();
 }
 
 void CarboniteLoader::shutdown()
@@ -1635,14 +1848,26 @@ void CarboniteLoader::shutdown()
     if (!m || !m->frameworkAcquired)
         return;
 
+    CarboniteLoaderState& loaderState = globalState().carboniteLoader;
     CARB_LOG_INFO("[CarboniteLoader] Shutdown starting (framework=%p)", static_cast<void*>(carb::getFramework()));
     m->physxSim = nullptr;
     m->frameworkAcquired = false;
-    // The process-private cooked-collider cache is process-wide, like the runtime and the
-    // datastore, so only the LAST loader may remove it -- an earlier one would pull it out from
-    // under an instance still cooking.
-    if (g_activeLoaders.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        releaseProcessCacheDir();
+    // The datastore outlives individual loaders. Keep its cache until SDK shutdown has
+    // stopped its background writers. The last-loader transition still releases profiling.
+    {
+        std::lock_guard<std::mutex> guard(loaderState.bootstrapMutex);
+        if (loaderState.activeLoaders.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        {
+            // Register after any lazy plugin startup during this lifecycle, so a C host
+            // that omits SDK shutdown can release Carbonite before its terminating hook.
+            std::atexit(&releaseProcessCacheDirAtExit);
+            // Same last-loader rule, and for the same reason: the profiler is
+            // process-wide, so dropping it on an arbitrary per-instance shutdown
+            // would silence the zones of an instance still running -- and, for the
+            // trace backend, would write the file while work was still being recorded.
+            disableProfilerBackend();
+        }
+    }
     CARB_LOG_INFO("[CarboniteLoader] Shutdown complete");
 }
 

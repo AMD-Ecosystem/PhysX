@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-#
+# SPDX-License-Identifier: Apache-2.0
+
 from enum import IntEnum, auto
 import math
 try:
@@ -43,11 +43,6 @@ def get_attribute_unit_exponents(attribute_name, prim=None) -> tuple[int, int, i
                 return exponents["RevoluteJoint"]
             else:
                 return exponents["PrismaticJoint"]
-        case "physxJoint:maxJointVelocity" | "physxJoint:armature":
-            if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.SphericalJoint):
-                return exponents["Angular joint"]
-            else:
-                return exponents["Linear joint"]
         case "physxMaterial:compliantContactStiffness" | "physxMaterial:compliantContactDamping":
             if prim.HasAPI(UsdPhysics.MaterialAPI):
                 if prim.GetAttribute("physxMaterial:compliantContactAccelerationSpring").Get() == True:

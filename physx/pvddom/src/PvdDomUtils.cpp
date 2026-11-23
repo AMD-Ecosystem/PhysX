@@ -1,38 +1,12 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
-// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
 // Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
+// Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
-
-// SPDX-FileCopyrightText: Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
-//
 
 #include "PvdDomUtils.h"
 #include "PvdDomLog.h"
+#include <memory>
 
 OmniPvdClass* findOmniPvdClass(OmniPvdClassHandle omniPvdClassHandle, std::unordered_map<OmniPvdClassHandle, OmniPvdClass*> &classHandleToClassMap)
 {
@@ -60,43 +34,57 @@ uint64_t getInternalHandle(OmniPvdObjectHandle externalHandle, std::unordered_ma
 
 OmniPvdClass* createInternalClass(const char *className, OmniPvdPhysXClassEnum physXClass)
 {
-    OmniPvdClass *internalClass = new OmniPvdClass();
+    std::unique_ptr<OmniPvdClass> internalClass(new OmniPvdClass());
     internalClass->mOmniClassHandle = 0;
     internalClass->mClassName = std::string(className);
     internalClass->mPhysXBaseProcessingClassId = physXClass;
     internalClass->mIsDefaultParsed = false; // If the class is explicitly created by the user, it's not default parsed
-    return internalClass;
+    return internalClass.release();
 }
 
 OmniPvdObject* createInternalObject(OmniPvdClass* internalCass, uint64_t objectHandle)
 {
-    OmniPvdObject *refObject = new OmniPvdObject();
+    return createInternalObject(internalCass, objectHandle, 0);
+}
+
+OmniPvdObject* createInternalObject(OmniPvdClass* internalCass, uint64_t objectHandle,
+                                    uint64_t recordingSegmentId)
+{
+    std::unique_ptr<OmniPvdObject> refObject(new OmniPvdObject());
     refObject->mOmniObjectHandle = objectHandle;
     refObject->mOmniPvdClass = internalCass;
-    return refObject;
+    refObject->mRecordingSegmentId = recordingSegmentId;
+    return refObject.release();
 }
 
 OmniPvdObject* createNamedObject(OmniPvdClass* internalCass, const std::string& objectName)
 {
-    OmniPvdObject *refObject = new OmniPvdObject();
+    return createNamedObject(internalCass, objectName, 0);
+}
+
+OmniPvdObject* createNamedObject(OmniPvdClass* internalCass, const std::string& objectName,
+                                 uint64_t recordingSegmentId)
+{
+    std::unique_ptr<OmniPvdObject> refObject(new OmniPvdObject());
     refObject->mOmniObjectHandle = 0;
     refObject->mOmniPvdClass = internalCass;
     refObject->mObjectName = objectName;
-    return refObject;
+    refObject->mRecordingSegmentId = recordingSegmentId;
+    return refObject.release();
 }
 
 OmniPvdObject* createInternalNode(std::list<OmniPvdObject*> &objectCreations, OmniPvdObject* ancestor, OmniPvdClass* internalCass, OmniPvdObjectHandle objectHandle,uint8_t isShared, uint8_t isVisible)
 {
-    OmniPvdObject *node = createInternalObject(internalCass, objectHandle);
+    std::unique_ptr<OmniPvdObject> node(createInternalObject(internalCass, objectHandle));
     node->mIsShared = isShared;
     node->mIsStaticVisibility = 1;
     node->mIsStaticVisible = isVisible;
+    objectCreations.push_back(node.get());
     if (ancestor)
     {
-        ancestor->appendChild(node);
+        ancestor->appendChild(node.get());
     }
-    objectCreations.push_back(node);
-    return node;
+    return node.release();
 }
 
 OmniPvdObject* findChildObject(uint64_t *data, std::unordered_map<OmniPvdObjectHandle, OmniPvdObjectHandle> &externalToInternalHandleMap, std::unordered_map<OmniPvdObjectHandle, OmniPvdObject*> &objectHandleToObjectMap)
@@ -129,15 +117,17 @@ OmniPvdObject* findClassNodeObject(OmniPvdClass* classNode, std::unordered_map<O
 
 OmniPvdObject* createOmniPvdBranchObject(const OmniPvdContextHandle contextHandle, OmniPvdClass* branchClass, OmniPvdObjectHandle branchHandle, OmniPvdObject* branchAncestor, std::list<OmniPvdObject*> &objectCreations, std::unordered_map<OmniPvdContextHandle, OmniPvdObject*> &contextHandleTobranchMap)
 {
-    OmniPvdObject* branch = new OmniPvdObject();
+    std::unique_ptr<OmniPvdObject> branch(new OmniPvdObject());
     branch->mOmniObjectHandle = branchHandle; // Uses as display integer : branchName + _ + branchHandle
     branch->mOmniPvdClass = branchClass;
+    branch->mRecordingSegmentId = branchAncestor ? branchAncestor->mRecordingSegmentId : 0;
     branch->mIsStaticVisibility = 1;
     branch->mIsStaticVisible = 1;
-    if (branchAncestor) branchAncestor->appendChild(branch); // The Branchestor, thirst mutilator!
-    objectCreations.push_back(branch);
-    contextHandleTobranchMap[contextHandle] = branch;
-    return branch;
+    objectCreations.push_back(branch.get());
+    if (branchAncestor) branchAncestor->appendChild(branch.get()); // The Branchestor, thirst mutilator!
+    branch.release();
+    contextHandleTobranchMap[contextHandle] = objectCreations.back();
+    return objectCreations.back();
 }
 
 // Set the internal reference object (omniPvdObject->mReferenceObject) to point to the shared mesh data (childObject)
@@ -268,12 +258,42 @@ void getAttribIndex(int32_t& attribIndex, int32_t& classIndex, const char* attri
     }
 }
 
+static bool cachedAttribIndexMatches(int32_t attribIndex, int32_t classIndex, const char* attribName,
+                                     OmniPvdObject* omniPvdObject)
+{
+    if (attribIndex < 0 || classIndex < 0)
+    {
+        return false;
+    }
+
+    const std::vector<OmniPvdClass*>& inheritanceChain = omniPvdObject->mOmniPvdClass->mInheritanceChain;
+    // The class and attribute bounds checks below are memory-safety guards, not
+    // redundant validation. Removing either makes the following vector access
+    // undefined behavior; release-mode behavioral tests cannot catch that
+    // reliably without ASan or checked STL iterators.
+    if (classIndex >= static_cast<int>(inheritanceChain.size()))
+    {
+        return false;
+    }
+
+    const OmniPvdClass* inheritedClass = inheritanceChain[classIndex];
+    if (attribIndex >= static_cast<int>(inheritedClass->mAttributeDefinitions.size()))
+    {
+        return false;
+    }
+
+    const OmniPvdAttributeDef* attribDef = inheritedClass->mAttributeDefinitions[attribIndex];
+    return !attribDef->mIsUniqueList && isSameString(attribDef->mAttributeName.c_str(), attribName);
+}
+
 uint8_t* getAttribData(int32_t& attribIndex, int32_t& classIndex, const char* attribName, OmniPvdObject* omniPvdObject)
 {
     // Is the class even in the inheritance chain of the object?
 
-    if (attribIndex < 0 || classIndex < 0)
+    if (!cachedAttribIndexMatches(attribIndex, classIndex, attribName, omniPvdObject))
     {
+        attribIndex = -1;
+        classIndex = -1;
         getAttribIndex(attribIndex, classIndex, attribName, omniPvdObject);
         if (attribIndex < 0 || classIndex < 0)
         {
@@ -315,8 +335,10 @@ uint8_t* getAttribData(int32_t& attribIndex, int32_t& classIndex, const char* at
 
 OmniPvdAttributeInstList* getAttribList(int32_t& attribIndex, int32_t& classIndex , const char* attribName, OmniPvdObject* omniPvdObject)
 {
-    if (attribIndex < 0 || classIndex < 0)
+    if (!cachedAttribIndexMatches(attribIndex, classIndex, attribName, omniPvdObject))
     {
+        attribIndex = -1;
+        classIndex = -1;
         getAttribIndex(attribIndex, classIndex, attribName, omniPvdObject);
         if (attribIndex < 0 || classIndex < 0)
         {
@@ -344,40 +366,82 @@ OmniPvdAttributeInstList* getAttribList(int32_t& attribIndex, int32_t& classInde
     return NULL;
 }
 
+// Resolve the nearest scene frame.
+static bool resolveSceneFrameId(OmniPvdObject* object, uint64_t& frameId)
+{
+    if (object->mOmniPvdClass && object->mOmniPvdClass->mIsSceneClass)
+    {
+        frameId = object->mFrameId;
+        return true;
+    }
+    int depth = 0;
+    for (OmniPvdObject* ancestor = object->mAncestor; ancestor && depth < 4096; ancestor = ancestor->mAncestor, ++depth)
+    {
+        if (ancestor->mOmniPvdClass && ancestor->mOmniPvdClass->mIsSceneClass)
+        {
+            frameId = ancestor->mFrameId;
+            return true;
+        }
+    }
+    return false;
+}
+
 uint64_t getFrameIdFromScene(OmniPvdObject* object, OmniPvdDOMState* domState)
 {
-    // Does the DOM have a PxScene/context class registered?
-    if (domState->mPxSceneClass == nullptr)
+    uint64_t frameId = 0;
+    if (resolveSceneFrameId(object, frameId))
+    {
+        return frameId;
+    }
+    // Recreated scene-less samples start at frame 0.
+    if (object && object->mIsSupersedeRecreate)
     {
         return 0;
     }
-    // Is this object itself considered a context class?
-    if (object->mOmniPvdClass == domState->mPxSceneClass)
+    // Other scene-less samples use the current stream frame.
+    return domState->mLatestStartedFrame;
+}
+
+uint64_t getLifespanOpenFrameId(OmniPvdObject* object, OmniPvdDOMState*)
+{
+    uint64_t frameId = 0;
+    if (resolveSceneFrameId(object, frameId))
     {
-        return object->mFrameId;
+        return frameId;
     }
-    OmniPvdObject* ancestorContext = object->findAncestorWithClass(domState->mPxSceneClass);
-    if (ancestorContext)
-    {
-        return ancestorContext->mFrameId;
-    }
-    // Is there at least one PxScene? Then use the last created one's frameId
-    if (domState->mSceneCreations.size()>0) {
-        return domState->mSceneCreations.back()->mFrameId;
-    }
+    // Scene-less objects open at frame 0.
     return 0;
+}
+
+uint64_t getLifespanCloseFrameId(OmniPvdObject* object, OmniPvdDOMState* domState)
+{
+    uint64_t frameId = 0;
+    if (!resolveSceneFrameId(object, frameId))
+    {
+        // Scene-less objects close at the current stream frame.
+        frameId = domState->mLatestStartedFrame;
+    }
+    // Zero is the open-ended lifespan sentinel.
+    return frameId ? frameId : 1;
+}
+
+uint64_t getSupersedeCloseFrameId(OmniPvdObject* object, OmniPvdDOMState* domState)
+{
+    uint64_t frameId = 0;
+    if (resolveSceneFrameId(object, frameId))
+    {
+        return frameId + 1;
+    }
+    if (object && object->mRecordingSegmentId < domState->mRecordingSegmentMaxFrames.size())
+    {
+        return domState->mRecordingSegmentMaxFrames[object->mRecordingSegmentId] + 1;
+    }
+    return domState->mMaxFrame + 1;
 }
 
 uint64_t getLastFrameIdFromScene(OmniPvdDOMState* domState)
 {
-    // Is there at least one PxScene? Then use the last created one's frameId
-    if (domState->mSceneCreations.size() > 0)
-    {
-        OmniPvdObject* lastObject = domState->mSceneCreations.back();
-        return lastObject->mFrameId;
-    }
-
-    return 0;
+    return domState->mLatestStartedFrame;
 }
 
 bool isSameString(const char* str, const char* str1)

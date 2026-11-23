@@ -1,18 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
-// clang-format off
-#include <UsdPCH.h>
-#include <pxr/base/tf/patternMatcher.h>
-#include <pxr/base/tf/stringUtils.h>
-// clang-format on
+/**
+ * @implements REQ-PARSE-SUBTREE-001
+ * @covers AC-1 AC-2 AC-3 AC-4 AC-5 AC-6
+ */
+
+/**
+ * @implements REQ-PUBLICAPI-001
+ * @covers AC-32 AC-33 AC-34 AC-40 AC-49
+ */
 
 #include "tensors/base/PathPatternMatcher.h"
 
+#include <carb/logging/Log.h>
+
+#include <cctype>
 #include <set>
 #include <utility>
-
-using namespace PXR_NS;
 
 namespace omni
 {
@@ -21,85 +26,37 @@ namespace physx
 namespace tensors
 {
 
+using omni::physics::parse::IPhysicsSource;
+using omni::physics::parse::ObjectKey;
+
 namespace
 {
 
-void findMatchingChildren(UsdPrim root, const std::string& pattern, std::vector<UsdPrim>& primsRet)
+// Applies TfPatternMatcher's own glob pre-transform: three independent whole-string
+// passes, in this exact order and no other -- '.' -> '\.', then '*' -> '.*', then
+// '?' -> '.'. Each pass sees only the input state left by the previous one, so a '.'
+// introduced by the '*' or '?' passes is never re-escaped by the (already-completed)
+// first pass -- matching TfPatternMatcher::SetIsGlobPattern's documented behavior.
+std::string applyGlobTransform(const std::string& pattern)
 {
-    if (!root)
+    auto replaceAll = [](const std::string& s, char from, const char* to) -> std::string
     {
-        return;
-    }
-
-    TfPatternMatcher matcher(pattern, true, true);
-    UsdPrimSiblingRange range = root.GetAllChildren();
-    for (auto child : range)
-    {
-        if (matcher.Match(child.GetName()))
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s)
         {
-            primsRet.push_back(child);
+            if (c == from)
+                out += to;
+            else
+                out += c;
         }
-    }
+        return out;
+    };
+    std::string result = replaceAll(pattern, '.', "\\.");
+    result = replaceAll(result, '*', ".*");
+    result = replaceAll(result, '?', ".");
+    return result;
 }
-
-void collectSelfAndDescendants(UsdPrim prim, std::vector<UsdPrim>& out)
-{
-    if (!prim)
-    {
-        return;
-    }
-    std::vector<UsdPrim> stack;
-    stack.push_back(prim);
-    while (!stack.empty())
-    {
-        UsdPrim current = stack.back();
-        stack.pop_back();
-        out.push_back(current);
-        // Push children in reverse so pop order matches declaration order.
-        auto children = current.GetAllChildren();
-        std::vector<UsdPrim> childVec(children.begin(), children.end());
-        for (auto it = childVec.rbegin(); it != childVec.rend(); ++it)
-        {
-            stack.push_back(*it);
-        }
-    }
-}
-
-// Collects every descendant of `prim` (not prim itself) whose name matches
-// `matcher`, at ANY depth -- leaf-recursive matching, so a named leaf token
-// reaches bodies nested below the pattern level (e.g. Isaac Sim URDF converter
-// output: /Robot/link_0 finds link_0 wherever the converter nested it). The
-// pre-leaf tokens are matched strictly by the caller, so intermediate structure
-// is respected -- a buried pivot (Group/Robot) needs an explicit '**'.
-// Suppresses a match whose name already matched an ancestor on the current path:
-// the same name nested inside its own match (robot/Disc001/robot/Disc001, or
-// base_link under base_link) is a spurious overlap. Distinct alternatives at
-// different depths are kept (base_link|link_0). `matchedOnPath` carries the
-// matched names on the root-to-node path.
-void collectMatchingDescendants(UsdPrim prim, TfPatternMatcher& matcher,
-                                std::set<std::string>& matchedOnPath, std::vector<UsdPrim>& out)
-{
-    if (!prim)
-    {
-        return;
-    }
-    for (auto child : prim.GetAllChildren())
-    {
-        const std::string name = child.GetName().GetString();
-        if (matcher.Match(name) && matchedOnPath.insert(name).second)
-        {
-            out.push_back(child);
-            collectMatchingDescendants(child, matcher, matchedOnPath, out);
-            matchedOnPath.erase(name);
-        }
-        else
-        {
-            collectMatchingDescendants(child, matcher, matchedOnPath, out);
-        }
-    }
-}
-
-} // namespace
 
 std::string makeAnchoredTokenPattern(const std::string& token)
 {
@@ -107,6 +64,164 @@ std::string makeAnchoredTokenPattern(const std::string& token)
     // mode, so "^a|b$" parses as (^a)|(b$) and would match prefixes/suffixes
     // (base_link_extra, prefix_link_0). "^(a|b)$" anchors each alternative.
     return "^(" + token + ")$";
+}
+
+// Simple globs need no regex state. Retry the most recent star iteratively, so
+// stack use does not depend on the name length, including for a failed match.
+bool matchSimpleGlob(std::string_view pattern, std::string_view name)
+{
+    if (pattern.find_first_of("*?") == std::string_view::npos)
+        return pattern == name;
+    if (pattern == "*")
+        return name.find('\0') == std::string_view::npos;
+
+    size_t p = 0;
+    size_t n = 0;
+    size_t star = std::string_view::npos;
+    size_t retry = 0;
+    while (n < name.size())
+    {
+        if (p < pattern.size() && pattern[p] == '*')
+        {
+            star = p++;
+            retry = n;
+        }
+        else if (p < pattern.size() &&
+                 ((pattern[p] == '?' && name[n] != '\0') || pattern[p] == name[n]))
+        {
+            ++p;
+            ++n;
+        }
+        else if (star != std::string_view::npos && retry < name.size() && name[retry] != '\0')
+        {
+            p = star + 1;
+            n = ++retry;
+        }
+        else
+            return false;
+    }
+    while (p < pattern.size() && pattern[p] == '*')
+        ++p;
+    return p == pattern.size();
+}
+
+// Derives a path segment's name from the source's display string for `key`, since
+// IPhysicsSource has no getName -- the trailing component after the last slash.
+std::string lastPathComponent(const IPhysicsSource& source, ObjectKey key)
+{
+    const std::string_view full = source.sourceKeyToString(key);
+    const size_t pos = full.rfind('/');
+    return std::string(pos == std::string_view::npos ? full : full.substr(pos + 1));
+}
+
+// Collects every descendant of `key` (not `key` itself) whose name matches `matcher`,
+// at ANY depth beneath it -- leaf-recursive matching. Suppresses a match whose name
+// already matched an ancestor on the current path (a spurious self-nested overlap);
+// distinct alternatives at different depths are kept. `matchedOnPath` carries the
+// matched names on the root-to-node path. Structurally identical to the pre-ADR-0019
+// UsdPrim-walking version, just routed through IPhysicsSource::forEachChild.
+void collectMatchingDescendants(const IPhysicsSource& source, ObjectKey key, const GlobRegex& matcher,
+                                std::set<std::string>& matchedOnPath, std::vector<ObjectKey>& out)
+{
+    source.forEachChild(key,
+        [&](ObjectKey child)
+        {
+            const std::string name = lastPathComponent(source, child);
+            if (matcher.match(name) && matchedOnPath.insert(name).second)
+            {
+                out.push_back(child);
+                collectMatchingDescendants(source, child, matcher, matchedOnPath, out);
+                matchedOnPath.erase(name);
+            }
+            else
+            {
+                collectMatchingDescendants(source, child, matcher, matchedOnPath, out);
+            }
+        });
+}
+
+} // namespace
+
+GlobRegex::GlobRegex(const std::string& token)
+{
+    // The compile itself can overflow the stack (see the class comment), which no catch
+    // below can intercept; an over-long token is refused up front and never matches.
+    // Callers are expected to reject such input earlier (ovphysx does at its public
+    // boundary), so getting here is reported at error level.
+    if (token.size() > omni::physics::tensors::kMaxPathPatternComponentLength)
+    {
+        CARB_LOG_ERROR("Path pattern component of %zu characters exceeds the %zu-character limit and cannot match "
+                       "any object",
+                       token.size(), omni::physics::tensors::kMaxPathPatternComponentLength);
+        return;
+    }
+    try
+    {
+        std::regex::flag_type flags = std::regex::extended;
+#if defined(__GLIBCXX__)
+        // Keep common literals/globs out of the more expensive safe regex executor.
+        // The whitelist excludes ERE operators and escapes; '.' stays a literal.
+        if (token.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.?*") ==
+            std::string::npos)
+        {
+            mSimplePattern = token;
+            mSimple = true;
+            mValid = true;
+            return;
+        }
+        // Use libstdc++'s breadth-first executor: the default recurses per name character.
+        // POSIX extended patterns do not support the back-references this mode rejects.
+        flags |= std::regex_constants::__polynomial;
+#endif
+        mRegex = std::regex(applyGlobTransform(makeAnchoredTokenPattern(token)), flags);
+        mValid = true;
+    }
+    catch (const std::regex_error&)
+    {
+        mValid = false;
+    }
+}
+
+bool GlobRegex::match(const std::string& name) const
+{
+    return mValid && (mSimple ? matchSimpleGlob(mSimplePattern, name) : std::regex_match(name, mRegex));
+}
+
+std::string trimSlashes(const std::string& s)
+{
+    const size_t begin = s.find_first_not_of('/');
+    if (begin == std::string::npos)
+    {
+        return std::string();
+    }
+    const size_t end = s.find_last_not_of('/');
+    return s.substr(begin, end - begin + 1);
+}
+
+bool looksLikePathString(std::string_view s)
+{
+    // Rejects the glob metacharacters this matcher's own token grammar uses ('*', '?',
+    // '(', ')', '|', '[', ']', '{', '}') and whitespace -- the same "is this even
+    // path-shaped" gate SdfPath's own parser would balk at a glob-laden string on.
+    // Deliberately permissive rather than a full SdfPath grammar re-implementation (see
+    // PhysX.cpp's isValidClonePath for a stricter absolute-prim-path variant used
+    // elsewhere): a false positive here just costs one findByPath() miss before falling
+    // through to the glob path below, and a false negative costs one avoidable glob
+    // traversal for an already-literal path -- neither changes the result, only which
+    // path gets there.
+    if (s.empty())
+    {
+        return false;
+    }
+    for (const char c : s)
+    {
+        if (c == '*' || c == '?' || c == '(' || c == ')' || c == '|' || c == '[' || c == ']' || c == '{' ||
+            c == '}' || std::isspace(static_cast<unsigned char>(c)))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Splits a pattern on '/' but ignores separators that appear inside a
@@ -152,34 +267,29 @@ std::vector<std::string> splitPatternRespectingGroups(const std::string& pattern
     return tokens;
 }
 
-void findMatchingUsdPaths(UsdStageWeakPtr stage,
-                          const std::string& pattern_,
-                          bool recursiveLeafPatternMatch,
-                          std::vector<SdfPath>& pathsRet)
+namespace
 {
-    if (!stage)
+
+// The glob/wildcard-matching body of findMatchingObjectKeys, factored out so
+// findMatchingObjectKeysBatch can skip repeating the literal-path fast-path check
+// (which it resolves once for the WHOLE pattern list via a single existsBatch call)
+// while sharing the traversal/matching logic byte-for-byte with the single-pattern
+// entry point below.
+void matchPatternKeys(const IPhysicsSource& source,
+                      const std::string& pattern_,
+                      bool recursiveLeafPatternMatch,
+                      std::vector<ObjectKey>& keysRet)
+{
+    const std::string pattern = trimSlashes(pattern_);
+    const std::vector<std::string> tokens = splitPatternRespectingGroups(pattern);
+    if (tokens.empty())
     {
         return;
     }
 
-    // First try if the pattern_ is an actual prim path itself; if so, do not
-    // try to pattern match for performance reasons.
-    if (SdfPath::IsValidPathString(pattern_))
-    {
-        if (stage->GetPrimAtPath(SdfPath(pattern_)))
-        {
-            pathsRet.push_back(SdfPath(pattern_));
-            return;
-        }
-    }
-
-    std::string pattern = TfStringTrim(pattern_, "/");
-    std::vector<std::string> tokens = splitPatternRespectingGroups(pattern);
-
-    std::vector<UsdPrim> roots;
-    std::vector<UsdPrim> matches;
-
-    roots.push_back(stage->GetPseudoRoot());
+    std::vector<ObjectKey> roots;
+    std::vector<ObjectKey> matches;
+    roots.push_back(source.getRootKey());
 
     const int numTokens = int(tokens.size());
 
@@ -197,55 +307,172 @@ void findMatchingUsdPaths(UsdStageWeakPtr stage,
         }
     }
 
-    for (int i = 0; i < numTokens; i++)
+    auto matchTokens = [&](auto&& self, int first, bool scoped) -> void
     {
-        matches.clear();
-
-        const bool isLeaf = (i == numTokens - 1);
-        const bool isRecursiveDescent = (tokens[i] == kRecursiveDescentToken);
-        // A bare `*` leaf stays strict (direct children only); only a *named*
-        // or glob leaf is searched at any depth. Callers who want a bare
-        // recursive descent must use `**`.
-        const bool isBareWildcard = (tokens[i] == "*");
-
-        if (isRecursiveDescent)
+        for (int i = first; i < numTokens; i++)
         {
-            for (auto& prim : roots)
+            // Scope before intermediate wildcards fan out into many roots. Keep one
+            // fresh common-ancestor snapshot for the rest of this pattern evaluation.
+            const bool recursiveLeaf = i == numTokens - 1 && recursiveLeafPatternMatch &&
+                                       tokens[i] != "*" && !patternHasRecursiveDescent;
+            const bool branches = tokens[i].find_first_of("*?()|[]{}^$+\\") != std::string::npos;
+            if (!scoped && !roots.empty() && (branches || recursiveLeaf) &&
+                (patternHasRecursiveDescent || (recursiveLeafPatternMatch && tokens.back() != "*")))
             {
-                collectSelfAndDescendants(prim, matches);
+                const ObjectKey scopeRoot = roots.size() == 1 ? roots.front() : source.getRootKey();
+                source.withSubtreeHierarchy(scopeRoot, [&]() { self(self, i, true); });
+                return;
+            }
+            matches.clear();
+
+            const bool isLeaf = (i == numTokens - 1);
+            const bool isRecursiveDescent = (tokens[i] == kRecursiveDescentToken);
+            // A bare `*` leaf stays strict (direct children only); only a *named*
+            // or glob leaf is searched at any depth. Callers who want a bare
+            // recursive descent must use `**`.
+            const bool isBareWildcard = (tokens[i] == "*");
+
+            if (isRecursiveDescent)
+            {
+                for (ObjectKey root : roots)
+                {
+                    source.forEachDescendant(root, [&](ObjectKey key) { matches.push_back(key); });
+                }
+            }
+            else if (isLeaf && recursiveLeafPatternMatch && !isBareWildcard && !patternHasRecursiveDescent)
+            {
+                // Leaf-recursive: the final named/glob token is searched at any depth
+                // beneath the strictly-matched ancestor chain (with same-name
+                // suppression). Pre-leaf tokens above were matched strictly, so
+                // intermediate structure is respected.
+                const GlobRegex matcher(tokens[i]);
+                for (ObjectKey root : roots)
+                {
+                    std::set<std::string> matchedOnPath;
+                    collectMatchingDescendants(source, root, matcher, matchedOnPath, matches);
+                }
+            }
+            else
+            {
+                const GlobRegex matcher(tokens[i]);
+                for (ObjectKey root : roots)
+                {
+                    source.forEachChild(root,
+                        [&](ObjectKey child)
+                        {
+                            if (matcher.match(lastPathComponent(source, child)))
+                            {
+                                matches.push_back(child);
+                            }
+                        });
+                }
+            }
+
+            if (i < numTokens - 1)
+            {
+                std::swap(roots, matches);
             }
         }
-        else if (isLeaf && recursiveLeafPatternMatch && !isBareWildcard && !patternHasRecursiveDescent)
-        {
-            // Leaf-recursive: the final named/glob token is searched at any depth
-            // beneath the strictly-matched ancestor chain (with same-name
-            // suppression). Pre-leaf tokens above were matched strictly, so
-            // intermediate structure is respected.
-            TfPatternMatcher matcher(makeAnchoredTokenPattern(tokens[i]), true, true);
-            for (auto& prim : roots)
-            {
-                std::set<std::string> matchedOnPath;
-                collectMatchingDescendants(prim, matcher, matchedOnPath, matches);
-            }
-        }
-        else
-        {
-            const std::string tokPattern = makeAnchoredTokenPattern(tokens[i]);
-            for (auto& prim : roots)
-            {
-                findMatchingChildren(prim, tokPattern, matches);
-            }
-        }
 
-        if (i < numTokens - 1)
+        for (ObjectKey key : matches)
         {
-            std::swap(roots, matches);
+            keysRet.push_back(key);
+        }
+    };
+    matchTokens(matchTokens, 0, false);
+}
+
+} // namespace
+
+void findMatchingObjectKeys(const IPhysicsSource& source,
+                            const std::string& pattern_,
+                            bool recursiveLeafPatternMatch,
+                            std::vector<ObjectKey>& keysRet)
+{
+    // First try if the pattern_ is an actual object path itself; if so, do not try to
+    // pattern match for performance reasons. Guard with IsValidPathString first (as
+    // before) so a glob-laden pattern never reaches findByPath's path parser -- USD's
+    // parser emits a diagnostic for syntactically invalid path characters like '*'.
+    // Gate the resolved key on exists(): unlike UsdSource, OvstageSource::findByPath
+    // interns any syntactically valid path string without checking whether it names a
+    // live object (a pre-existing, documented backend gap -- ADR-0019 increment 1's
+    // resolveObjectKey finding), so exists() is required here to preserve the
+    // "literal path must actually resolve" contract on both backends.
+    if (looksLikePathString(pattern_))
+    {
+        const ObjectKey direct = source.findByPath(pattern_);
+        if (direct.valid() && source.exists(direct))
+        {
+            keysRet.push_back(direct);
+            return;
         }
     }
 
-    for (auto& prim : matches)
+    matchPatternKeys(source, pattern_, recursiveLeafPatternMatch, keysRet);
+}
+
+void findMatchingObjectKeysBatch(const IPhysicsSource& source,
+                                 const std::vector<std::string>& patterns,
+                                 bool recursiveLeafPatternMatch,
+                                 std::vector<std::vector<ObjectKey>>& keysRet)
+{
+    keysRet.clear();
+    keysRet.resize(patterns.size());
+
+    // Same literal-path fast path as findMatchingObjectKeys (see its comment), but
+    // resolved for the WHOLE pattern list in one existsBatch call instead of one
+    // exists() call per pattern -- the fix for the O(N) live round trips a caller
+    // holding a large literal-path candidate list (e.g. thousands of per-index
+    // sensor/filter paths) would otherwise issue one at a time.
+    std::vector<bool> isLiteralCandidate(patterns.size(), false);
+    std::vector<size_t> literalPatternIndex;
+    std::vector<ObjectKey> literalKeys;
+    literalPatternIndex.reserve(patterns.size());
+    literalKeys.reserve(patterns.size());
+    for (size_t i = 0; i < patterns.size(); ++i)
     {
-        pathsRet.push_back(prim.GetPath());
+        if (looksLikePathString(patterns[i]))
+        {
+            const ObjectKey direct = source.findByPath(patterns[i]);
+            if (direct.valid())
+            {
+                isLiteralCandidate[i] = true;
+                literalPatternIndex.push_back(i);
+                literalKeys.push_back(direct);
+            }
+        }
+    }
+
+    std::vector<bool> literalExists;
+    if (!literalKeys.empty())
+    {
+        source.existsBatch(literalKeys, literalExists);
+    }
+
+    for (size_t li = 0; li < literalPatternIndex.size(); ++li)
+    {
+        const size_t patternIdx = literalPatternIndex[li];
+        if (literalExists[li])
+        {
+            keysRet[patternIdx].push_back(literalKeys[li]);
+        }
+        else
+        {
+            // Same fallback findMatchingObjectKeys takes when a literal-shaped
+            // path does not resolve to a live object: fall through to glob
+            // matching on that same pattern string.
+            matchPatternKeys(source, patterns[patternIdx], recursiveLeafPatternMatch, keysRet[patternIdx]);
+        }
+    }
+
+    // Every pattern that was never a syntactically valid literal path skips the
+    // fast path entirely, exactly like findMatchingObjectKeys does.
+    for (size_t i = 0; i < patterns.size(); ++i)
+    {
+        if (!isLiteralCandidate[i])
+        {
+            matchPatternKeys(source, patterns[i], recursiveLeafPatternMatch, keysRet[i]);
+        }
     }
 }
 

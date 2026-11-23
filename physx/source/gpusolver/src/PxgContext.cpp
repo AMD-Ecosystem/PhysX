@@ -1,30 +1,7 @@
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions
-// are met:
-//  * Redistributions of source code must retain the above copyright
-//    notice, this list of conditions and the following disclaimer.
-//  * Redistributions in binary form must reproduce the above copyright
-//    notice, this list of conditions and the following disclaimer in the
-//    documentation and/or other materials provided with the distribution.
-//  * Neither the name of NVIDIA CORPORATION nor the names of its
-//    contributors may be used to endorse or promote products derived
-//    from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
-// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
-// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
-// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
-// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
-// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-//
-// Copyright (c) 2008-2026 NVIDIA Corporation. All rights reserved.
+// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.
 // Copyright (c) 2004-2008 AGEIA Technologies, Inc. All rights reserved.
-// Copyright (c) 2001-2004 NovodeX AG. All rights reserved.  
+// SPDX-FileCopyrightText: Copyright (c) 2008-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 #include "PxgContext.h"
 #include "PxgNarrowphaseCore.h"
@@ -391,6 +368,9 @@ namespace physx
 		mGpuTask			(*this),
 		mPostSolveTask		(*this)
 	{
+#if PX_SUPPORT_OMNI_PVD
+		PxMemZero(&mOvdContactStreams, sizeof(mOvdContactStreams));
+#endif
 		mGpuArticulationCore = NULL;
 		mGpuBp = NULL;
 		mGpuNpCore = NULL;
@@ -440,6 +420,14 @@ namespace physx
 	
 	void PxgGpuContext::mergeResults()
 	{
+#if PX_SUPPORT_OMNI_PVD
+		// Fetch-time contact iteration still refers to this completed frame. Preserve its host
+		// buffer bases and active ranges before swapping points/patches and resetting allocation.
+		mOvdContactStreams.points = mContactStreamPool;
+		mOvdContactStreams.patches = mPatchStreamPool;
+		mOvdContactStreams.forces = mForceStreamPool;
+		mOvdContactStreams.friction = mFrictionPatchStreamPool;
+#endif
 		//Flip the current contact stream
 		mCurrentContactStream = 1 - mCurrentContactStream;
 		mContactStreamPool.mDataStream = mContactStreamAllocators[mCurrentContactStream]->mStart;
@@ -604,13 +592,13 @@ namespace physx
 
 		mSimulationController->update(changedHandleMap);
 
-		if (!mEnableDirectGPUAPI || getSimulationController()->getEnableOVDReadback())
+		if (!mEnableDirectGPUAPI || getSimulationController()->getOVDReadbackMode() == PxsOVDReadbackMode::eFULL)
 		{
 			mGpuArticulationCore->gpuMemDMAbackArticulation(mLinkAndJointAndRootStateDataPool, mArticulationSleepDataPool);
 		}
 
 		mGpuSolverCore->gpuMemDMAbackSolverBodies(reinterpret_cast<float4*>(mSolverBodyPool.begin()), mSolverBodyPool.size(), mBody2WorldPool,
-			mSolverBodySleepDataPool, mEnableDirectGPUAPI && (!getSimulationController()->getEnableOVDReadback()));
+			mSolverBodySleepDataPool, mEnableDirectGPUAPI && (getSimulationController()->getOVDReadbackMode() != PxsOVDReadbackMode::eFULL));
 	}
 
 	class PxgPostSolveWorkerTask : public Cm::Task
@@ -664,7 +652,8 @@ namespace physx
 				// PT: set sleeping flags but preserve other non-sleeping-related flags (see similar code in DySleep.cpp)
 				PxU16 flags = originalBody.mInternalFlags;
 				flags &= ~PxsRigidBody::eSLEEPING_FLAGS;
-				flags |= sleepData.internalFlags;
+				flags |= (sleepData.internalFlags & PxsRigidBody::eSLEEPING_FLAGS);  // masking with PxsRigidBody::eSLEEPING_FLAGS because
+				                                                                     // sleepData.internalFlags can hold other flags too
 				originalBody.mInternalFlags = flags;
 
 				PX_ASSERT(bodyCore.linearVelocity.isFinite());
@@ -869,7 +858,7 @@ namespace physx
 		getNarrowphaseCore()->drawFrictionAnchors();
 		mForceChangedThresholdStream.forceSize_Unsafe(nbThresholdElems); 
 
-		if (!mEnableDirectGPUAPI || getSimulationController()->getEnableOVDReadback())
+		if (!mEnableDirectGPUAPI || getSimulationController()->getOVDReadbackMode() == PxsOVDReadbackMode::eFULL)
 		{
 			//TODO - multi-thread this!
 			const PxU32 offset = 1 + mKinematicCount;
@@ -1245,7 +1234,7 @@ namespace physx
 				const PxU16 solverIterationCounts = dyFEMCloth->getIterationCounts();
 
 				maxPosIters = PxMax(PxI32(solverIterationCounts & 0xff), maxPosIters);
-				//maxVelIters = PxMax(PxI32(solverIterationCounts >> 8), maxVelIters);
+				maxVelIters = PxMax(PxI32(solverIterationCounts >> 8), maxVelIters);
 			}
 		}
 
@@ -2438,6 +2427,11 @@ void PxgGpuContext::updatePostPartitioning(PxBaseTask* lostTouchTask, PxvNphaseI
 		// required to happen even if we early-out here?
 		if (!needsSolve(islandSim, bodyCount, articulationCount))
 		{
+			// Without a solve, the kinematic targets of the direct GPU API are applied here instead of after the solver.
+			if (mEnableDirectGPUAPI)
+			{
+				getSimulationController()->getSimulationCore()->applyKinematicTargets();
+			}
 			mGpuSolverCore->releaseContext();
 			return;
 		}
