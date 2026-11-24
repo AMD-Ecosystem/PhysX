@@ -47,6 +47,10 @@ Compile errors on unsupported compilers or platforms are frequently caused by ad
 * Running GPU-accelerated simulations requires a CUDA toolkit 12.8 compatible display driver. The corresponding driver version can be found [here](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html#cuda-major-component-versions__table-cuda-toolkit-driver-versions).
 * Volta, CUDA ARCH 7.0 GPU or higher
 
+## PhysX GPU Acceleration on AMD GPUs:
+
+* The GPU projects can be built for AMD GPUs with HIP and ROCm instead of CUDA: generate with the `linux-gcc-rocm` preset (`./generate_projects.sh linux-gcc-rocm`). No CUDA Toolkit is needed. See `INSTALL_ROCm.md` in the repository root.
+
 ## Required Packages for Building and Running PhysX Snippets:
 
 * freeglut3

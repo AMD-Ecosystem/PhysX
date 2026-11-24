@@ -42,50 +42,6 @@ This repo contains:
 | [`ovphysx/`](ovphysx/) | ovphysx — C API with Python bindings for USD physics simulation with DLPack tensor interop (`pip install ovphysx`) |
 | [`physx/`](physx/) | PhysX SDK — real-time physics simulation engine |
 
-## Runs on AMD Instinct (ROCm/HIP)
-
-This branch adds an **AMD ROCm/HIP GPU backend** for the PhysX 5.6 GPU simulation
-stack, so PhysX GPU physics runs on **AMD Instinct** data-center GPUs, not only on
-CUDA. The entire GPU stack (61 device translation units, 490 kernels) builds and
-links into `libPhysXGpu_64.so` and is validated on real silicon.
-
-| AMD Instinct GPU | Arch | ROCm | Status |
-|---|---|---|---|
-| MI300X | gfx942 | 10.0.0 | Validated (build + on-GPU module-load/dispatch) |
-| MI355X / MI350X | gfx950 | 10.0.0 | Validated (build + on-GPU module-load/dispatch) |
-| MI450 | gfx1250 | 10.0.0 | Functional simulator (cross-compile) |
-
-The AMD path is guarded behind the `PX_USE_HIP` CMake option; the upstream CUDA
-and CPU build paths are preserved unchanged. Build it against **public ROCm 10.0.0**
-(installed from the public AMD pip index, no internal registry):
-
-```bash
-# 1. Public ROCm 10.0.0 base + a supported Python
-python3.12 -m venv .venv && source .venv/bin/activate
-python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,devel,device-gfx942]"
-rocm-sdk init # expand the devel tree (run once)
-export MERGED="$(rocm-sdk path --root)"
-
-# 2. Build the GPU stack with the HIP backend (see INSTALL_ROCm.md for details + gfx950/gfx1250)
-cmake -S physx/source/compiler/cmakegpu -B build-hip \
- -DPX_USE_HIP=ON -DPX_BUILDGPU=ON -DTARGET_BUILD_PLATFORM=linux \
- -DCMAKE_HIP_ARCHITECTURES=gfx942 -DCMAKE_CXX_COMPILER=/usr/bin/c++ \
- -DCMAKE_HIP_COMPILER="$MERGED/lib/llvm/bin/amdclang++" \
- -DCMAKE_HIP_COMPILER_ROCM_ROOT="$MERGED" \
- -DPHYSX_ROOT_DIR="$PWD/physx" \
- -DPX_OUTPUT_LIB_DIR="$PWD/build-hip/lib" -DPX_OUTPUT_BIN_DIR="$PWD/build-hip/bin"
-cmake --build build-hip -j"$(nproc)" --target PhysXGpu
-```
-
-Full step-by-step build, verify (with expected output), and known-limitation
-notes are in **[`INSTALL_ROCm.md`](INSTALL_ROCm.md)**.
-
-> **Known limitation on CDNA (gfx942/gfx950):** SDF (Signed Distance Field) mesh
-> collision is gated off -- CDNA data-center GPUs have no hardware 3D-texture
-> sampling unit. All other GPU physics (rigid bodies, articulations, the solver,
-> broadphase/narrowphase, PBD particles/fluids, FEM cloth and soft bodies) is
-> unaffected. See `INSTALL_ROCm.md`.
-
 ### ovphysx
 
 | Release | Compatibility |
@@ -113,6 +69,10 @@ Additional simulation libraries:
 |---|---|
 | [`blast/`](blast/) | Blast SDK — destruction and fracture simulation |
 | [`flow/`](flow/) | Flow SDK — fluid and fire simulation |
+
+## AMD GPUs (ROCm)
+
+The PhysX SDK's GPU simulation also builds for AMD GPUs with HIP (CMake option `PX_USE_HIP`, preset `linux-gcc-rocm`) on Linux. See [`INSTALL_ROCm.md`](INSTALL_ROCm.md) for requirements, build steps and what was tested.
 
 ## Support
 
