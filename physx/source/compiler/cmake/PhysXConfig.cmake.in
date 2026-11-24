@@ -8,8 +8,9 @@
 
 include(CMakeFindDependencyMacro)
 
-# Find dependencies that PhysX requires
-if(@PX_GENERATE_GPU_PROJECTS@ OR @PX_GENERATE_GPU_PROJECTS_ONLY@)
+# Find dependencies that PhysX requires. A ROCm/HIP GPU build links the HIP runtime
+# by path and needs no CUDA toolkit.
+if((@PX_GENERATE_GPU_PROJECTS@ OR @PX_GENERATE_GPU_PROJECTS_ONLY@) AND NOT "@PX_USE_HIP@")
     find_dependency(CUDAToolkit REQUIRED)
 endif()
 
