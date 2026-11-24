@@ -524,17 +524,22 @@ __device__ __forceinline__ int allSync(unsigned long long mask, int pred)
 
 // __syncwarp: PhysX calls both __syncwarp() and __syncwarp(mask) with a
 // 32-bit FULL_MASK. HIP's native __syncwarp requires a 64-bit mask and only
-// exists on newer ROCm. On CDNA a wave executes in lockstep, so a warp-level
-// convergence point is a wave barrier; use __builtin_amdgcn_wave_barrier(),
-// which is correct (and conservatively stronger) for the 32-lane logical
-// warps that share a wave64. Overloads cover the 0-arg and masked forms.
+// exists on newer ROCm. A wave executes in lockstep, so the convergence point
+// is a wave barrier, which is correct (and conservatively stronger) for the
+// 32-lane logical warps that share a wave64. The barrier alone only stops the
+// compiler from moving code across it; PhysX also relies on __syncwarp to make
+// one lane's shared-memory writes visible to the other lanes, so wrap it in
+// wavefront-scope release and acquire fences (as HIP's own __syncwarp does).
+// Overloads cover the 0-arg and masked forms.
 __device__ __forceinline__ void syncWarp()
 {
+	__builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
 	__builtin_amdgcn_wave_barrier();
+	__builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
 }
 __device__ __forceinline__ void syncWarp(unsigned long long)
 {
-	__builtin_amdgcn_wave_barrier();
+	syncWarp();
 }
 
 }} // namespace physx::hipcompat
