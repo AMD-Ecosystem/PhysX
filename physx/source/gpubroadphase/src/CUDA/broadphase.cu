@@ -2622,5 +2622,11 @@ extern "C" __global__ void copyReports(PxgBroadPhaseDesc* bpDesc)	// BP_COPY_REP
 extern "C" __global__ void bpSignalComplete(PxU32* signal)	// BP_SIGNAL_COMPLETE
 {
 	assert(signal);
+#if defined(__HIP_PLATFORM_AMD__)
+	// The host reads what earlier copies on this stream wrote as soon as it sees the signal.
+	// HIP can still hold a small device-to-host copy in the GPU's L2 cache when this kernel
+	// starts, so write it back to memory before signalling.
+	__threadfence_system();
+#endif
 	*signal = 1;
 }
