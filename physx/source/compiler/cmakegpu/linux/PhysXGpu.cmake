@@ -106,4 +106,4 @@ ELSEIF(PX_USE_HIP)
 	# dl (for dlsym(RTLD_NEXT)) used by the __hipRegisterFatBinary interceptors
 	# in CudaKernelWrangler.cpp to forward to the real HIP runtime.
 	LIST(APPEND PHYSXGPU_PRIVATE_PLATFORM_LINKED_LIBS dl)
-ENDIF(PX_USE_HIP)
+ENDIF()
