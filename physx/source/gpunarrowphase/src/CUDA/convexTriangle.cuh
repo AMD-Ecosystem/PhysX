@@ -1869,7 +1869,7 @@ static __device__ void convexTriangleContactGen(
 
 			nbOutputContacts = __popc(mask);
 
-			PxU32 startIndex;
+			PxU32 startIndex = 0;
 			
 			if (threadIdx.x == 0)
 			{
