@@ -146,6 +146,15 @@ IF(PX_USE_HIP)
 	SET(CMAKE_HIP_ARCHITECTURES "${_PX_HIP_ARCHITECTURES}" CACHE STRING "HIP architectures" FORCE)
 	MESSAGE(STATUS "PX_USE_HIP: HIP language enabled, arch=${CMAKE_HIP_ARCHITECTURES}")
 
+	# CMake has no flags for the checked and profile configurations, so their device code would
+	# build unoptimized. The CUDA build optimizes device code in both (nvcc's default is -O3).
+	IF(NOT CMAKE_HIP_FLAGS_CHECKED)
+		SET(CMAKE_HIP_FLAGS_CHECKED "-O3")
+	ENDIF()
+	IF(NOT CMAKE_HIP_FLAGS_PROFILE)
+		SET(CMAKE_HIP_FLAGS_PROFILE "-O3")
+	ENDIF()
+
 	# ---------------------------------------------------------------------------
 	# ROCm include directory for the HOST-seam .cpp files.
 	# The .cu TUs (LANGUAGE HIP) automatically receive the ROCm headers via the
