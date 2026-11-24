@@ -108,8 +108,13 @@ IF(PX_USE_HIP)
 		SET(_PX_HIP_FLAGS_INIT "--rocm-path=${_PX_DETECT_ROCM_ROOT}")
 	ENDIF()
 	# Put the ROCm paths in front of the caller's CMAKE_HIP_FLAGS; CMake's own HIP compiler
-	# check needs them too.
-	SET(CMAKE_HIP_FLAGS "${_PX_HIP_FLAGS_INIT} ${CMAKE_HIP_FLAGS}")
+	# check needs them too. Before enable_language(HIP) has created the cache entry, the
+	# caller's value is the HIPFLAGS environment variable, as CMake itself would use it.
+	IF(DEFINED CMAKE_HIP_FLAGS)
+		SET(CMAKE_HIP_FLAGS "${_PX_HIP_FLAGS_INIT} ${CMAKE_HIP_FLAGS}")
+	ELSE()
+		SET(CMAKE_HIP_FLAGS "${_PX_HIP_FLAGS_INIT} $ENV{HIPFLAGS}")
+	ENDIF()
 	MESSAGE(STATUS "PX_USE_HIP: ROCm root = ${_PX_DETECT_ROCM_ROOT}, bitcode = ${_PX_DETECT_BITCODE_DIR}")
 	# Also export ROCM_PATH so hipconfig and rocm_agent_enumerator can find libs
 	SET(ENV{ROCM_PATH} "${_PX_DETECT_ROCM_ROOT}")
