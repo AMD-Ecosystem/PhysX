@@ -14,48 +14,63 @@
 #include "GuTriangleRefinement.h"
 #include "triangleMesh.cuh"
 #include "utils.cuh"
+#if defined(__HIP_PLATFORM_AMD__)
+#include "PxgSdfLinearGrid.h"
+#include "foundation/PxMathUtils.h"
+#endif
 
 namespace physx
 {
 
-// ---------------------------------------------------------------------------
-// SDF 3D-texture sampling seam (HIP/ROCm deviation).
-//
-// On CUDA the signed-distance-field grids are sampled with hardware trilinear
-// filtering via `tex3D<float>(texObj, x, y, z)` off a cudaArray-backed texture
-// object (createTextureObject in PxgGeometryManager.cpp).
-//
-// The CDNA data-center architectures (gfx942/gfx950) have no texture-sampling
-// image hardware, so the HIP device texture API is compiled out entirely
-// (`__HIP_NO_IMAGE_SUPPORT` -> tex3D marked
-// __attribute__((unavailable("The image/texture API not supported on the
-// device")))). Faithfully supporting SDF collision on CDNA therefore requires
-// a software-trilinear sampler reading a LINEAR device copy of the SDF grid
-// (dense + the uint8/uint16/float sparse-subgrid quantized formats), threaded
-// through PxgGeometryManager instead of the cudaArray/texture-object path.
-//
-// TODO(ROCm SDF): implement the linear-memory software-trilinear SDF sampler
-// with texel-center + clamp-to-edge parity, and re-enable the GPU SDF-collision
-// midphase on CDNA. Tracked as a documented deviation for this port; the SDF
-// collision GPU path is the only narrowphase feature gated off on HIP -- the
-// rest of the GPU stack (broadphase, solver, articulation, non-SDF
-// narrowphase) is fully ported.
-//
-// Until that lands, the HIP build compiles the sampler as an explicit,
-// loud device abort (never a silently-wrong value) so no caller can mistake
-// an unfiltered/zero read for a real distance.
-// ---------------------------------------------------------------------------
+#if defined(__HIP_PLATFORM_AMD__)
+// ROCm: the SDF grids are not texture objects but linear device copies described by a
+// PxgSdfLinearGrid (see createTextureObject in PxgGeometryManager.cpp), sampled here with the
+// same addressing the CUDA texture uses: unnormalized coordinates with texel centres at i + 0.5,
+// clamp-to-edge on all three axes, trilinear filtering, and 8/16-bit texels read as normalized
+// floats. CUDA's filtering hardware rounds the interpolation weights to 8 fractional bits, so
+// results agree with CUDA to within that rounding rather than bit for bit.
+PX_FORCE_INLINE __device__ PxReal pxgSdfLinearGridTexel(const PxgSdfLinearGrid& grid, PxI32 x, PxI32 y, PxI32 z)
+{
+	x = PxClamp(x, 0, PxI32(grid.width) - 1);
+	y = PxClamp(y, 0, PxI32(grid.height) - 1);
+	z = PxClamp(z, 0, PxI32(grid.depth) - 1);
+	const PxU32 i = (PxU32(z) * grid.height + PxU32(y)) * grid.width + PxU32(x);
+	switch (grid.format)
+	{
+	case PxgSdfLinearGrid::eUNORM8:
+		return PxReal(static_cast<const PxU8*>(grid.data)[i]) * (1.0f / 255.0f);
+	case PxgSdfLinearGrid::eUNORM16:
+		return PxReal(static_cast<const PxU16*>(grid.data)[i]) * (1.0f / 65535.0f);
+	default:
+		return static_cast<const PxReal*>(grid.data)[i];
+	}
+}
+#endif
+
 PX_INLINE __device__ PxReal pxgSampleSdfTexture3D(CUtexObject texObj, float x, float y, float z)
 {
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-	(void)texObj; (void)x; (void)y; (void)z;
-	// CDNA has no hardware 3D-texture sampling; the software-trilinear fallback
-	// is not yet wired (see TODO above). Abort loudly rather than return a
-	// wrong distance.
-	printf("PhysX ROCm: GPU SDF-collision (tex3D) is not yet supported on CDNA "
-	       "(gfx942/gfx950); needs the software-trilinear SDF sampler.\n");
-	__builtin_trap();
-	return 0.0f;
+#if defined(__HIP_PLATFORM_AMD__)
+	const PxgSdfLinearGrid grid = *reinterpret_cast<const PxgSdfLinearGrid*>(texObj);
+
+	x -= 0.5f;
+	y -= 0.5f;
+	z -= 0.5f;
+	const PxReal fx = floorf(x);
+	const PxReal fy = floorf(y);
+	const PxReal fz = floorf(z);
+	const PxReal ax = x - fx;
+	const PxReal ay = y - fy;
+	const PxReal az = z - fz;
+	const PxI32 ix = PxI32(fx);
+	const PxI32 iy = PxI32(fy);
+	const PxI32 iz = PxI32(fz);
+
+	return PxTriLerp(
+		pxgSdfLinearGridTexel(grid, ix, iy, iz), pxgSdfLinearGridTexel(grid, ix + 1, iy, iz),
+		pxgSdfLinearGridTexel(grid, ix, iy + 1, iz), pxgSdfLinearGridTexel(grid, ix + 1, iy + 1, iz),
+		pxgSdfLinearGridTexel(grid, ix, iy, iz + 1), pxgSdfLinearGridTexel(grid, ix + 1, iy, iz + 1),
+		pxgSdfLinearGridTexel(grid, ix, iy + 1, iz + 1), pxgSdfLinearGridTexel(grid, ix + 1, iy + 1, iz + 1),
+		ax, ay, az);
 #else
 	return tex3D<float>(texObj, x, y, z);
 #endif

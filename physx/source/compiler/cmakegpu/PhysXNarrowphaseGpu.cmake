@@ -23,6 +23,7 @@ SET(PHYXGPU_NARROWPHASE_HEADERS
 	${PHYSX_SOURCE_DIR}/gpunarrowphase/include/PxgContactManager.h
 	${PHYSX_SOURCE_DIR}/gpunarrowphase/include/PxgConvexConvexShape.h
 	${PHYSX_SOURCE_DIR}/gpunarrowphase/include/PxgGeometryManager.h
+	${PHYSX_SOURCE_DIR}/gpunarrowphase/include/PxgSdfLinearGrid.h
 	${PHYSX_SOURCE_DIR}/gpunarrowphase/include/PxgNarrowphaseCore.h
 	${PHYSX_SOURCE_DIR}/gpunarrowphase/include/PxgNphaseImplementationContext.h
 	${PHYSX_SOURCE_DIR}/gpunarrowphase/include/PxgNpKernelIndices.h

@@ -22,6 +22,9 @@
 #include "hf/GuHeightField.h"
 #include "GuSDF.h"
 #include "cudaNpCommon.h"
+#if defined(__HIP_PLATFORM_AMD__)
+#include "PxgSdfLinearGrid.h"
+#endif
 
 #include "cudamanager/PxCudaContextManager.h"
 #include "cudamanager/PxCudaContext.h"
@@ -195,10 +198,17 @@ void PxgGeometryManager::removeGeometry(PxU32 idx)
 
 	if (pair)
 	{
-#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
-		// On HIP the SDF cudaArray/texture-object path is not created (CDNA has
-		// no image hardware; see createTextureObject) so there is nothing to
-		// destroy -- the handles are always null.
+#if defined(__HIP_PLATFORM_AMD__)
+		// ROCm: the grid and its descriptor are plain device allocations (see createTextureObject).
+		cuMemFree(reinterpret_cast<CUdeviceptr>(pair->second.cuArray));
+		cuMemFree(reinterpret_cast<CUdeviceptr>(pair->second.cuTexRef));
+
+		if (pair->second.cuArraySubgrids)
+		{
+			cuMemFree(reinterpret_cast<CUdeviceptr>(pair->second.cuArraySubgrids));
+			cuMemFree(reinterpret_cast<CUdeviceptr>(pair->second.cuTexRefSubgrids));
+		}
+#else
 		cuArrayDestroy(pair->second.cuArray);
 		cuTexObjectDestroy(pair->second.cuTexRef);
 
@@ -208,6 +218,7 @@ void PxgGeometryManager::removeGeometry(PxU32 idx)
 			cuTexObjectDestroy(pair->second.cuTexRefSubgrids);
 		}
 #endif
+
 		mMeshToTextureMap.erase(geometryToRemove.mDeviceMemPointer);
 	}
 
@@ -804,18 +815,40 @@ static void createTextureObject(CUarray_format format, CUtexObject*& texture, CU
 		return;
 	}
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-	// HIP/ROCm deviation: the CDNA data-center arches have no texture-sampling
-	// image hardware, so the device-side tex3D SDF sampler is compiled out and
-	// GPU SDF collision is a documented-unsupported feature on this port (see
-	// sdfCollision.cuh). Skip creating the
-	// cudaArray/texture-object (no HIP array/texture-desc mapping needed) --
-	// SDF meshes simply carry a null texture handle on HIP; any attempt to
-	// sample it device-side aborts loudly rather than reading garbage.
-	(void)format; (void)data; (void)stream;
-	texture = 0;
-	cuArray = 0;
-	return;
+#if defined(__HIP_PLATFORM_AMD__)
+	// ROCm: no texture object. Copy the grid to linear device memory and give the software
+	// sampler (pxgSampleSdfTexture3D in sdfCollision.cuh) a descriptor of it. The texture slot
+	// carries the descriptor's device address and cuArray the grid allocation; removeGeometry
+	// frees both.
+	PX_UNUSED(format);
+	const size_t gridBytes = size_t(width) * height * depth * sizeof(T);
+	CUdeviceptr gridMem = 0;
+	CUdeviceptr descMem = 0;
+	CUresult r = cuMemAlloc(&gridMem, gridBytes);
+	PX_UNUSED(r);
+	PX_ASSERT(r == CUDA_SUCCESS);
+	r = cuMemAlloc(&descMem, sizeof(PxgSdfLinearGrid));
+	PX_ASSERT(r == CUDA_SUCCESS);
+
+	PxgSdfLinearGrid desc;
+	desc.data = reinterpret_cast<const void*>(gridMem);
+	desc.width = width;
+	desc.height = height;
+	desc.depth = depth;
+	desc.format = sizeof(T) == 1 ? PxgSdfLinearGrid::eUNORM8 : (sizeof(T) == 2 ? PxgSdfLinearGrid::eUNORM16 : PxgSdfLinearGrid::eFLOAT32);
+
+	r = cuMemcpyHtoDAsync(gridMem, data, gridBytes, stream);
+	PX_ASSERT(r == CUDA_SUCCESS);
+	r = cuMemcpyHtoDAsync(descMem, &desc, sizeof(desc), stream);
+	PX_ASSERT(r == CUDA_SUCCESS);
+
+	*texture = reinterpret_cast<CUtexObject>(descMem);
+	cuArray = reinterpret_cast<CUarray>(gridMem);
+
+	// The source texels are pageable mesh memory and desc lives on this stack frame, and later
+	// consumers of the grid are not all ordered against this stream, so wait before returning.
+	r = cuStreamSynchronize(stream);
+	PX_ASSERT(r == CUDA_SUCCESS);
 #else
 	CUDA_ARRAY3D_DESCRIPTOR_st arrDesc;
 	arrDesc.Format = format;
