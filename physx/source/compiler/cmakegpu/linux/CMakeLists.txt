@@ -250,6 +250,12 @@ IF(PX_USE_HIP)
 
 	ENDIF(PX_THEROCK) # end TheRock vs standalone-venv HIP setup split
 
+	# The GPU code reads structures through pointers to other types and passes values that only
+	# some lanes of a warp have set to warp shuffles, as the CUDA compiler allows. Clang's
+	# type-based aliasing analysis and its rule that an argument may not be undefined miscompile
+	# both (contacts against triangle meshes come out empty), so turn them off.
+	ADD_COMPILE_OPTIONS("$<$<COMPILE_LANGUAGE:HIP>:-fno-strict-aliasing;SHELL:-Xclang -no-enable-noundef-analysis>")
+
 ELSE()
 
 IF(NOT DEFINED PHYSX_LINUX_COMPILE_DEFS)
