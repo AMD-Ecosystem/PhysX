@@ -471,10 +471,10 @@ CudaCtxMgr::CudaCtxMgr(const PxCudaContextManagerDesc& desc, PxErrorCallback& er
 		mCuModules.resize(moduleTableSize, NULL);
 		for (PxU32 i = 0 ; i < moduleTableSize ; ++i)
 		{
+#if defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
 			// Make sure that moduleTable[i] is not null
 			if (!moduleTable[i]) continue;
 
-#if defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
 			// ROCm/HIP module loading.
 			//
 			// moduleTable[i] is the __hip_fatbin_wrapper pointer that amdclang
@@ -518,12 +518,20 @@ CudaCtxMgr::CudaCtxMgr(const PxCudaContextManagerDesc& desc, PxErrorCallback& er
 				mCuModules[i] = NULL;
 			}
 #else
-			CUresult ret = mCudaCtx->moduleLoadDataEx(&mCuModules[i], moduleTable[i], 0, NULL, NULL);
+			CUresult ret = CUDA_ERROR_UNKNOWN;
+
+			// Make sure that moduleTable[i] is not null
+			if (moduleTable[i])
+			{
+				ret = mCudaCtx->moduleLoadDataEx(&mCuModules[i], moduleTable[i], 0, NULL, NULL);
+			}
+
 			if (ret != CUDA_SUCCESS && ret != CUDA_ERROR_NO_BINARY_FOR_GPU)
 			{
 				const size_t bufferSize = 256;
 				char errorMsg[bufferSize];
 				physx::Pxsnprintf(errorMsg, bufferSize, "Failed to load CUDA module data. Cuda error code %i.\n", ret);
+
 				PxGetErrorCallback()->reportError(PxErrorCode::eINTERNAL_ERROR, errorMsg, PX_FL);
 				mCuModules[i] = NULL;
 			}
