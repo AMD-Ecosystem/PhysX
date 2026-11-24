@@ -368,38 +368,6 @@ if(PX_GENERATE_GPU_PROJECTS)
     add_subdirectory(${PHYSX_ROOT_DIR}/source/compiler/cmakegpu ${CMAKE_CURRENT_BINARY_DIR}/sdk_gpu_source_bin EXCLUDE_FROM_ALL)
   endif()
 
-  # Link PhysXGpu against the GPU runtime library.
-  # ROCm/HIP: link amdhip64 (the HIP runtime, which is also the driver on ROCm).
-  if(TARGET PhysXGpu AND PX_USE_HIP)
-    message(STATUS "=== Configuring PhysXGpu HIP linking ===")
-    if(PX_GENERATE_GPU_STATIC_LIBRARIES)
-      set(HIP_LINK_SCOPE PUBLIC)
-    else()
-      set(HIP_LINK_SCOPE PRIVATE)
-    endif()
-    # amdhip64 ships in the ROCm SDK lib dir. Locate it next to the HIP compiler
-    # (the venv _rocm_sdk_core/lib) or under ROCM_PATH.
-    get_filename_component(_HIP_BIN_DIR "${CMAKE_HIP_COMPILER}" DIRECTORY)
-    get_filename_component(_HIP_LLVM_DIR "${_HIP_BIN_DIR}" DIRECTORY) # .../lib/llvm
-    get_filename_component(_HIP_LIB_DIR "${_HIP_LLVM_DIR}" DIRECTORY) # .../lib
-    find_library(HIP_RUNTIME_LIBRARY
-      NAMES amdhip64
-      PATHS "${_HIP_LIB_DIR}" "$ENV{ROCM_PATH}/lib" /opt/rocm/lib
-      NO_DEFAULT_PATH)
-    if(NOT HIP_RUNTIME_LIBRARY)
-      find_library(HIP_RUNTIME_LIBRARY NAMES amdhip64)
-    endif()
-    if(HIP_RUNTIME_LIBRARY)
-      message(STATUS "[OK] Linking PhysXGpu with HIP runtime: ${HIP_RUNTIME_LIBRARY}")
-      target_link_libraries(PhysXGpu ${HIP_LINK_SCOPE} ${HIP_RUNTIME_LIBRARY})
-    else()
-      message(FATAL_ERROR
-        "[ERROR] HIP runtime library (amdhip64) not found - required for PX_USE_HIP builds.\n"
-        "  Searched: ${_HIP_LIB_DIR}, $ENV{ROCM_PATH}/lib, /opt/rocm/lib")
-    endif()
-    message(STATUS "=== PhysXGpu HIP linking complete ===")
-  endif()
-
   # Link PhysXGpu against CUDA driver library
   if(TARGET PhysXGpu AND NOT PX_USE_HIP)
     message(STATUS "=== Configuring PhysXGpu CUDA linking ===")
