@@ -185,7 +185,7 @@ namespace physx
 #if PX_CUDA_COMPILER
 	PX_FORCE_INLINE __device__ void atomicAddSpatialVector(PxgSpatialVectorBlock& block, const Cm::UnAlignedSpatialVector& v, const PxU32 threadIndexInWarp)
 	{
-#if __CUDA_ARCH__ >= 200
+#if __CUDA_ARCH__ >= 200 || defined(__HIP_DEVICE_COMPILE__)
 		atomicAdd(&block.mTopxyz_bx[threadIndexInWarp].x, v.top.x);
 		atomicAdd(&block.mTopxyz_bx[threadIndexInWarp].y, v.top.y);
 		atomicAdd(&block.mTopxyz_bx[threadIndexInWarp].z, v.top.z);

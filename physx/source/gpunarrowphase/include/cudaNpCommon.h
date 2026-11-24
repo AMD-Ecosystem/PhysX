@@ -81,7 +81,7 @@ struct PX_ALIGN_PREFIX(16) PxgPatchAndContactCounters
 	void setOverflowError(const OverflowError& err)
 	{
 		PX_UNUSED(err);
-#if __CUDA_ARCH__
+#if __CUDA_ARCH__ || defined(__HIP_DEVICE_COMPILE__)
 		atomicOr(&overflowError, PxU32(err));
 #endif
 	}
