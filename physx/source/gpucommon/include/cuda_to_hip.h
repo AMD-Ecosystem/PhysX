@@ -266,7 +266,9 @@ typedef hipArray_Format   CUarray_format;
 #define cuCtxGetDevice               hipCtxGetDevice
 #define cuCtxPushCurrent             hipCtxPushCurrent
 #define cuCtxPopCurrent              hipCtxPopCurrent
-#define cuCtxSynchronize             hipCtxSynchronize
+// hipCtxSynchronize is a stub that returns hipErrorNotSupported without waiting; PhysX's
+// contexts are the device's primary context, so a device-wide wait is the equivalent.
+#define cuCtxSynchronize             hipDeviceSynchronize
 #define cuModuleLoadDataEx           hipModuleLoadDataEx
 #define cuModuleGetFunction          hipModuleGetFunction
 #define cuModuleUnload               hipModuleUnload
