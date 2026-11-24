@@ -56,7 +56,7 @@ LIST(APPEND SNIPPETS_LIST ${PLATFORM_SNIPPETS_LIST})
 SET(GPU_SNIPPET_LIST
 	HelloGRB DeformableSurface DeformableVolume DeformableVolumeAttachment DeformableVolumeKinematic DeformableSurfaceSkinning DeformableVolumeSkinning SDF PBF PBFMultiMat Isosurface
 	OmniPvdMultiGeom
-	RBDirectGPUAPI DirectGPUAPIArticulation)
+	RBDirectGPUAPI DirectGPUAPIArticulation GpuParity)
 
 #TODO, create a propper define for whether GPU features are enabled or not!
 IF (PX_GENERATE_GPU_PROJECTS AND 
