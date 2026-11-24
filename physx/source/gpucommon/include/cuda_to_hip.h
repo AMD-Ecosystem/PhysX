@@ -71,6 +71,10 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
 
+// CUDA_VERSION is defined below, so PxCudaTypes.h skips its own declarations, including the
+// PxSimpleTypes.h include that host seam files rely on.
+#include "foundation/PxSimpleTypes.h"
+
 // ---------------------------------------------------------------------------
 // 1. Driver-API type + enum aliases (host seam).
 // PhysX loads every kernel as a runtime module image via the CUDA driver API
