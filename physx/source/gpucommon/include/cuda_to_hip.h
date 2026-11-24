@@ -57,16 +57,9 @@
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
 
 // PhysX ships its own float2/3/4, int2/3/4 arithmetic operator overloads in
-// cutil_math.h (67 of them, "since these are not provided as standard by
-// CUDA"). HIP's HIP_vector_type provides its OWN member operator+=/+/*/...,
-// so both a member and a non-member overload become viable for the same type
-// and every vec += vec is "ambiguous". Disabling HIP's NATIVE vector member
-// operators (__HIP_USE_NATIVE_VECTOR__ 0) keeps float4 a plain aggregate and
-// lets PhysX's own operators be the single set -- matching the CUDA build's
-// behaviour exactly. Must be set BEFORE hip_runtime.h / hip_vector_types.h.
-#ifndef __HIP_USE_NATIVE_VECTOR__
-#define __HIP_USE_NATIVE_VECTOR__ 0
-#endif
+// cutil_math.h ("since these are not provided as standard by CUDA"). HIP's
+// HIP_vector_type already provides the member operators, so cutil_math.h leaves
+// out the ones that would be ambiguous with them on HIP.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
@@ -109,9 +102,9 @@ typedef hipArray_t       CUarray;
 typedef hipGraphicsResource_t CUgraphicsResource;
 typedef hipArray_Format   CUarray_format;
 
-// cudaArray-format enum values (SDF texture upload path in PxgGeometryManager;
-// on HIP the SDF texture path itself is compiled out -- CDNA has no image hw --
-// but the enum names must still resolve so the surrounding code compiles).
+// cudaArray-format enum values (SDF upload path in PxgGeometryManager; on HIP
+// the SDF grids are plain device allocations sampled in software, but that code
+// still names the formats).
 #ifndef CU_AD_FORMAT_FLOAT
 #define CU_AD_FORMAT_FLOAT           HIP_AD_FORMAT_FLOAT
 #endif

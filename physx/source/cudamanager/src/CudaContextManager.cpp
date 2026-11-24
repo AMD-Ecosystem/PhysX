@@ -485,7 +485,7 @@ CudaCtxMgr::CudaCtxMgr(const PxCudaContextManagerDesc& desc, PxErrorCallback& er
 			// in the .hip_fatbin section.
 			//
 			// hipModuleLoadData() accepts a __CLANG_OFFLOAD_BUNDLE__ offload
-			// bundle and extracts the gfx942 HSACO to load -- the HIP analogue
+			// bundle and extracts the code object for the current GPU -- the HIP analogue
 			// of cuModuleLoadDataEx on CUDA. We must unwrap the outer wrapper
 			// to get the inner bundle pointer before calling it.
 			struct PxHipFatbinWrapper {
@@ -531,7 +531,7 @@ CudaCtxMgr::CudaCtxMgr(const PxCudaContextManagerDesc& desc, PxErrorCallback& er
 		}
 #if defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
 		// ROCm/HIP: a TOLERATED module-load failure above (hipErrorNoBinaryForGpu
-		// -- a TU that shipped no gfx942 code object) leaves a STICKY error
+		// -- a TU that shipped no code object for this GPU) leaves a STICKY error
 		// latched on the HIP runtime. If left undrained, the very next unrelated
 		// hip* call would (mis)report it. Drain it here so a tolerated startup
 		// skip never masquerades as a later runtime error.

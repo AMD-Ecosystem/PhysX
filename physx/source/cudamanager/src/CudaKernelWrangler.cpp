@@ -157,7 +157,7 @@ KernelWrangler::KernelWrangler(PxCudaContextManager& cudaContextManager, PxError
 // / __cudaPopCallConfiguration / ...). On ROCm the GPU objects are produced by
 // amdclang, do NOT emit calls to these NVIDIA cudart symbols, and PhysX
 // populates its module table explicitly via the HIP driver API
-// (hipModuleLoadDataEx in CudaContextManager). So the whole cudart-intercept
+// (hipModuleLoadData in CudaContextManager). So the whole cudart-intercept
 // block is dead code on HIP and is compiled out (it would otherwise need the
 // full cudart type set: cudaError_t, cudaChannelFormatDesc, CUDARTAPI, ...).
 #if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
@@ -269,7 +269,7 @@ cudaError_t CUDARTAPI __cudaPopCallConfiguration(
 // calls go directly into libamdhip64's internal tables; PhysX's tables remain
 // empty.  The HIP runtime manages kernel dispatch via those internal tables
 // (through the hipLaunchKernel host-stub ABI), but PhysX drives kernels via
-// the *driver* API (hipModuleLoadDataEx / hipModuleGetFunction /
+// the *driver* API (hipModuleLoadData / hipModuleGetFunction /
 // hipModuleLaunchKernel) -- for which it needs its own module handles.
 //
 // APPROACH: define OUR OWN __hipRegisterFatBinary / __hipRegisterFunction
@@ -278,7 +278,7 @@ cudaError_t CUDARTAPI __cudaPopCallConfiguration(
 //   1. Forward to the real HIP runtime implementation (via dlsym RTLD_NEXT) so
 //      the HIP runtime still tracks the kernels for its own dispatch path.
 //   2. Also populate PhysX's s_moduleTable so CudaContextManager can load the
-//      fatbins with hipModuleLoadDataEx for the driver-API path.
+//      fatbins with hipModuleLoadData for the driver-API path.
 //
 // IMPORTANT: this file is compiled as PLAIN C++ (NOT -x hip) so __HIPCC__ is
 // NOT defined.  The HIP path guard is __HIP_PLATFORM_AMD__ which IS set by the
@@ -301,7 +301,7 @@ cudaError_t CUDARTAPI __cudaPopCallConfiguration(
 // HSACO image depending on the compilation mode.
 
 // ROCm/HIP: store the fatbin image pointers in s_moduleTable so
-// CudaContextManager can call hipModuleLoadDataEx on each one.
+// CudaContextManager can call hipModuleLoadData on each one.
 // Call the real runtime's __hipRegisterFatBinary via dlsym(RTLD_NEXT) so the
 // HIP runtime also tracks the kernels for its host-stub dispatch path.
 extern "C" __attribute__((visibility("protected")))
@@ -325,7 +325,7 @@ void** __hipRegisterFatBinary(const void* data)
 	// where `binary` points to the actual __CLANG_OFFLOAD_BUNDLE__ data.
 	// CudaContextManager.cpp unwraps the struct (checks the magic, takes the
 	// inner `binary` pointer) and calls hipModuleLoadData(&hipMod, binary_ptr),
-	// which parses the bundle and extracts the gfx942 HSACO -- analogous to
+	// which parses the bundle and extracts the code object for the current GPU -- analogous to
 	// cuModuleLoadDataEx for CUDA fatbins on NVIDIA.
 	//
 	// NOTE: we do NOT store the hipHandle here because the HIP runtime loads
