@@ -170,6 +170,12 @@ namespace physx
 
 		if (s_library == NULL)
 		{
+#if defined(PX_USE_HIP) && PX_USE_HIP
+			// The ROCm build of the GPU library links the HIP runtime itself, so there is no
+			// driver library to preload. Do not make the HIP runtime global here either: the
+			// GPU library defines its own fat-binary registration entry points.
+			s_library = dlopen(gPhysXGpuLibraryName, RTLD_NOW);
+#else
 			// load libcuda.so.1 here since gcc configured with --as-needed won't link to it
 			// if there is no call from the binary to it.
 			void* hLibCuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
@@ -183,6 +189,7 @@ namespace physx
 				reportError(PX_FL, "Could not load libcuda.so.1: %s\n", error);
 				return;
 			}
+#endif
 		}
 
 		// no UpdateLoader
