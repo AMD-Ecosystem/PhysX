@@ -98,9 +98,10 @@ IF(PX_USE_HIP)
 
 	ELSE()
 	# ---------------------------------------------------------------------------
-	# Standalone pip-venv HIP compiler discovery (UNCHANGED).
-	# Prefer an explicit -DCMAKE_HIP_COMPILER=<path>; fall back to the venv
-	# ROCm SDK (_rocm_sdk_core) or a ROCM_PATH environment variable.
+	# Standalone HIP compiler discovery.
+	# Prefer an explicit -DCMAKE_HIP_COMPILER=<path>; fall back to a ROCM_PATH
+	# environment variable, the ROCm Python packages (rocm-sdk on PATH), then
+	# a system install in /opt/rocm.
 	# DO NOT call find_package(HIP) here -- the venv SDK has no HIPConfig.cmake.
 	# ---------------------------------------------------------------------------
 	IF(NOT DEFINED CMAKE_HIP_COMPILER)
@@ -108,17 +109,21 @@ IF(PX_USE_HIP)
 		IF(DEFINED ENV{ROCM_PATH})
 			SET(_HIP_COMPILER_CANDIDATE "$ENV{ROCM_PATH}/lib/llvm/bin/amdclang++")
 		ENDIF()
-		# Try to find amdclang++ next to the active Python interpreter (venv pattern)
+		# Then the ROCm Python packages: rocm-sdk reports the SDK root.
 		IF(NOT EXISTS "${_HIP_COMPILER_CANDIDATE}")
-			FIND_PROGRAM(_PYTHON_BIN python3 python HINTS "${CMAKE_BINARY_DIR}" NO_DEFAULT_PATH)
-			IF(_PYTHON_BIN)
+			FIND_PROGRAM(_PX_ROCM_SDK_BIN rocm-sdk)
+			IF(_PX_ROCM_SDK_BIN)
 				EXECUTE_PROCESS(
-					COMMAND ${_PYTHON_BIN} -c
-						"import _rocm_sdk_core, os; print(os.path.join(os.path.dirname(_rocm_sdk_core.__file__), 'lib', 'llvm', 'bin', 'amdclang++'))"
-					OUTPUT_VARIABLE _HIP_COMPILER_CANDIDATE
+					COMMAND ${_PX_ROCM_SDK_BIN} path --root
+					OUTPUT_VARIABLE _PX_ROCM_SDK_ROOT
 					OUTPUT_STRIP_TRAILING_WHITESPACE
 					ERROR_QUIET)
+				SET(_HIP_COMPILER_CANDIDATE "${_PX_ROCM_SDK_ROOT}/lib/llvm/bin/amdclang++")
 			ENDIF()
+		ENDIF()
+		# Then a system install.
+		IF(NOT EXISTS "${_HIP_COMPILER_CANDIDATE}")
+			SET(_HIP_COMPILER_CANDIDATE "/opt/rocm/lib/llvm/bin/amdclang++")
 		ENDIF()
 		IF(EXISTS "${_HIP_COMPILER_CANDIDATE}")
 			SET(CMAKE_HIP_COMPILER "${_HIP_COMPILER_CANDIDATE}" CACHE FILEPATH "HIP compiler (amdclang++)")
@@ -126,7 +131,7 @@ IF(PX_USE_HIP)
 		ELSE()
 			MESSAGE(FATAL_ERROR
 				"PX_USE_HIP=ON but could not find amdclang++.\n"
-				"Pass -DCMAKE_HIP_COMPILER=<path/to/amdclang++> or set ROCM_PATH.")
+				"Pass -DCMAKE_HIP_COMPILER=<path/to/amdclang++>, set ROCM_PATH, or put rocm-sdk on PATH.")
 		ENDIF()
 	ELSE()
 		MESSAGE(STATUS "PX_USE_HIP: using caller-supplied CMAKE_HIP_COMPILER=${CMAKE_HIP_COMPILER}")
