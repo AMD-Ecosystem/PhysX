@@ -41,63 +41,6 @@
 # Here we complete the HIP setup: locate the compiler and call enable_language(HIP).
 IF(PX_USE_HIP)
 	# ---------------------------------------------------------------------------
-	# TheRock super-project detection.
-	#
-	# When PhysX is built as a component of the ROCm super-project TheRock
-	# (github.com/ROCm/TheRock), the AMD clang toolchain and a resolvable ROCm
-	# CMake package (hip-lang / hip::host) are ALREADY supplied to this configure
-	# via the injected _toolchain.cmake + _init.cmake dependency provider. In that
-	# case NONE of the venv-specific compiler/bitcode probing below is needed (or
-	# correct): enable_language(HIP) finds the compiler through the toolchain, and
-	# find_package(hip) resolves the runtime + include dirs canonically. We detect
-	# the super-project either by an explicit -DPX_THEROCK=ON, by the standard
-	# THEROCK_AMDGPU_* arch vars, or by a caller-supplied CMAKE_HIP_COMPILER (the
-	# TheRock toolchain sets this). This keeps the standalone pip-venv build path
-	# (the ELSE branch) working UNCHANGED while letting TheRock drive the build the
-	# canonical way.
-	# ---------------------------------------------------------------------------
-	OPTION(PX_THEROCK "PhysX is being built inside the ROCm TheRock super-project (skip venv-specific HIP discovery, resolve via find_package(hip))" OFF)
-	IF(DEFINED THEROCK_AMDGPU_FAMILIES OR DEFINED THEROCK_AMDGPU_TARGETS OR DEFINED ENV{THEROCK_BINARY_DIR})
-		SET(PX_THEROCK ON)
-	ENDIF()
-
-	IF(PX_THEROCK)
-		# --- Canonical TheRock / ROCm-CMake resolution path ---------------------
-		# The toolchain already selected the AMD clang compiler; just enable HIP.
-		# Arch comes from CMAKE_HIP_ARCHITECTURES, which TheRock populates from
-		# THEROCK_AMDGPU_FAMILIES/TARGETS -- do NOT pin gfx here.
-		ENABLE_LANGUAGE(HIP)
-		# Resolve the HIP runtime + include dirs the canonical way. TheRock's
-		# _init.cmake rewrites this find_package to the super-project-supplied
-		# package; hip::host carries the include dirs the host-seam .cpp need.
-		FIND_PACKAGE(hip CONFIG REQUIRED)
-		SET(PX_HIP_RUNTIME_TARGET hip::host CACHE INTERNAL "canonical HIP runtime target under TheRock")
-		# host-seam .cpp pull HIP headers transitively through hip::host; leave
-		# PX_HIP_INCLUDE_DIR empty (the include dir is on the imported target).
-		SET(PX_HIP_INCLUDE_DIR "" CACHE INTERNAL "ROCm include dir (empty under TheRock; carried by hip::host)")
-		MESSAGE(STATUS "PX_USE_HIP: TheRock super-project build; HIP language enabled, arch=${CMAKE_HIP_ARCHITECTURES}, runtime target=hip::host")
-
-		# Provide defaults for the PhysX compile-def cache vars for a standalone
-		# GPU-only configure (mirrors the ELSE branch below).
-		SET(ARCH_CODE_LIST "" CACHE INTERNAL "ARCH_CODE_LIST (empty for HIP builds)")
-		IF(NOT DEFINED PHYSX_LINUX_COMPILE_DEFS)
-			SET(PHYSX_LINUX_COMPILE_DEFS "" CACHE INTERNAL "Base PhysX preprocessor definitions (HIP standalone)")
-		ENDIF()
-		IF(NOT DEFINED PHYSX_LINUX_DEBUG_COMPILE_DEFS)
-			SET(PHYSX_LINUX_DEBUG_COMPILE_DEFS "PX_DEBUG=1;PX_CHECKED=1;PX_SUPPORT_PVD=1" CACHE INTERNAL "Debug PhysX preprocessor definitions")
-		ENDIF()
-		IF(NOT DEFINED PHYSX_LINUX_CHECKED_COMPILE_DEFS)
-			SET(PHYSX_LINUX_CHECKED_COMPILE_DEFS "NDEBUG;PX_CHECKED=1;PX_SUPPORT_PVD=1" CACHE INTERNAL "Checked PhysX preprocessor definitions")
-		ENDIF()
-		IF(NOT DEFINED PHYSX_LINUX_PROFILE_COMPILE_DEFS)
-			SET(PHYSX_LINUX_PROFILE_COMPILE_DEFS "NDEBUG;PX_PROFILE=1;PX_SUPPORT_PVD=1" CACHE INTERNAL "Profile PhysX preprocessor definitions")
-		ENDIF()
-		IF(NOT DEFINED PHYSX_LINUX_RELEASE_COMPILE_DEFS)
-			SET(PHYSX_LINUX_RELEASE_COMPILE_DEFS "NDEBUG;PX_SUPPORT_PVD=0;PX_SUPPORT_OMNI_PVD=0" CACHE INTERNAL "Release PhysX preprocessor definitions")
-		ENDIF()
-
-	ELSE()
-	# ---------------------------------------------------------------------------
 	# Standalone HIP compiler discovery.
 	# Prefer an explicit -DCMAKE_HIP_COMPILER=<path>; fall back to a ROCM_PATH
 	# environment variable, the ROCm Python packages (rocm-sdk on PATH), then
@@ -246,8 +189,6 @@ IF(PX_USE_HIP)
 	IF(NOT DEFINED PHYSX_LINUX_RELEASE_COMPILE_DEFS)
 		SET(PHYSX_LINUX_RELEASE_COMPILE_DEFS "NDEBUG;PX_SUPPORT_PVD=0;PX_SUPPORT_OMNI_PVD=0" CACHE INTERNAL "Release PhysX preprocessor definitions")
 	ENDIF()
-
-	ENDIF(PX_THEROCK) # end TheRock vs standalone-venv HIP setup split
 
 	# The GPU code reads structures through pointers to other types and passes values that only
 	# some lanes of a warp have set to warp shuffles, as the CUDA compiler allows. Clang's

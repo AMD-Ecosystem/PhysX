@@ -63,15 +63,7 @@ SET(PHYSXGPU_PLATFORM_SOURCES
 )
 
 # ROCm/HIP: link amdhip64 (the HIP runtime, which is also the GPU driver on ROCm).
-IF(PX_USE_HIP AND PX_THEROCK)
-	# --- Canonical TheRock resolution: link the imported hip::host target -------
-	# find_package(hip) (done in the platform CMakeLists) provides hip::host, whose
-	# INTERFACE carries the amdhip64 link + the ROCm include dirs and RPATH. No
-	# GLOB / FIND_LIBRARY of libamdhip64.so.* is needed; the super-project resolves
-	# it. dl is still needed by the __hipRegisterFatBinary interceptors in
-	# CudaKernelWrangler.cpp.
-	LIST(APPEND PHYSXGPU_PRIVATE_PLATFORM_LINKED_LIBS ${PX_HIP_RUNTIME_TARGET} dl)
-ELSEIF(PX_USE_HIP)
+IF(PX_USE_HIP)
 	# Derive the ROCm lib dir from CMAKE_HIP_COMPILER:
 	#   amdclang++ lives in <rocm>/lib/llvm/bin; amdhip64 lives in <rocm>/lib.
 	# The pip venv layout ships libamdhip64.so.7 (versioned, NO unversioned symlink).
