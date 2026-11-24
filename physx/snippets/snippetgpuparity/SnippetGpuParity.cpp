@@ -598,6 +598,164 @@ PxU32 contactOverflowReports()
 	return gErrorCallback.mOverflowReports;
 }
 
+// ---------------------------------------------------------------------------
+PxTriangleMesh* gridMesh(PxU32 n, PxReal half)
+{
+	PxArray<PxVec3> verts;
+	PxArray<PxU32> indices;
+	for (PxU32 j = 0; j <= n; j++)
+		for (PxU32 i = 0; i <= n; i++)
+			verts.pushBack(PxVec3(-half + 2.0f * half * PxReal(i) / PxReal(n), 0.0f, -half + 2.0f * half * PxReal(j) / PxReal(n)));
+	for (PxU32 j = 0; j < n; j++)
+		for (PxU32 i = 0; i < n; i++)
+		{
+			const PxU32 a = j * (n + 1) + i, b = a + 1, c = a + n + 1, d = c + 1;
+			indices.pushBack(a); indices.pushBack(c); indices.pushBack(b);
+			indices.pushBack(b); indices.pushBack(c); indices.pushBack(d);
+		}
+	PxTriangleMeshDesc meshDesc;
+	meshDesc.points.count = verts.size();
+	meshDesc.points.stride = sizeof(PxVec3);
+	meshDesc.points.data = verts.begin();
+	meshDesc.triangles.count = indices.size() / 3;
+	meshDesc.triangles.stride = 3 * sizeof(PxU32);
+	meshDesc.triangles.data = indices.begin();
+	PxCookingParams params(gPhysics->getTolerancesScale());
+	params.buildGPUData = true;
+	return PxCreateTriangleMesh(params, meshDesc, gPhysics->getPhysicsInsertionCallback());
+}
+
+// Prism with an n-gon cross-section along y, so its caps are faces with n vertices.
+PxConvexMesh* prism(PxU32 n, PxReal radius, PxReal halfHeight, PxU32& largestFace)
+{
+	PxArray<PxVec3> points;
+	for (PxU32 i = 0; i < n; i++)
+	{
+		const PxReal a = PxTwoPi * PxReal(i) / PxReal(n);
+		points.pushBack(PxVec3(radius * PxCos(a), -halfHeight, radius * PxSin(a)));
+		points.pushBack(PxVec3(radius * PxCos(a), halfHeight, radius * PxSin(a)));
+	}
+	PxConvexMeshDesc convexDesc;
+	convexDesc.points.count = points.size();
+	convexDesc.points.stride = sizeof(PxVec3);
+	convexDesc.points.data = points.begin();
+	convexDesc.flags = PxConvexFlag::eCOMPUTE_CONVEX;
+	PxCookingParams params(gPhysics->getTolerancesScale());
+	params.buildGPUData = true;
+	PxConvexMesh* mesh = PxCreateConvexMesh(params, convexDesc, gPhysics->getPhysicsInsertionCallback());
+	largestFace = 0;
+	for (PxU32 i = 0; mesh && i < mesh->getNbPolygons(); i++)
+	{
+		PxHullPolygon polygon;
+		mesh->getPolygonData(i, polygon);
+		largestFace = PxMax(largestFace, PxU32(polygon.mNbVerts));
+	}
+	return mesh;
+}
+
+// A box, a convex cube, a sphere and a capsule (all 0.25 m half size) resting on a static triangle mesh.
+void primitivesOnMesh(bool gpu, PxArray<PxVec3>& positions)
+{
+	PxScene* scene = createScene(gpu);
+	PxTriangleMesh* mesh = gridMesh(8, 5.0f);
+	scene->addActor(*PxCreateStatic(*gPhysics, PxTransform(PxIdentity), PxTriangleMeshGeometry(mesh), *gMaterial));
+	mesh->release();
+	PxVec3 cubePoints[8];
+	for (PxU32 i = 0; i < 8; i++)
+		cubePoints[i] = PxVec3(i & 1 ? 0.25f : -0.25f, i & 2 ? 0.25f : -0.25f, i & 4 ? 0.25f : -0.25f);
+	PxConvexMeshDesc convexDesc;
+	convexDesc.points.count = 8;
+	convexDesc.points.stride = sizeof(PxVec3);
+	convexDesc.points.data = cubePoints;
+	convexDesc.flags = PxConvexFlag::eCOMPUTE_CONVEX;
+	PxCookingParams params(gPhysics->getTolerancesScale());
+	params.buildGPUData = true;
+	PxConvexMesh* cube = PxCreateConvexMesh(params, convexDesc, gPhysics->getPhysicsInsertionCallback());
+	const PxGeometry* geometries[4];
+	PxBoxGeometry box(PxVec3(0.25f));
+	PxConvexMeshGeometry convex(cube);
+	PxSphereGeometry sphere(0.25f);
+	PxCapsuleGeometry capsule(0.25f, 0.25f);
+	geometries[0] = &box; geometries[1] = &convex; geometries[2] = &sphere; geometries[3] = &capsule;
+	PxArray<PxRigidDynamic*> bodies;
+	for (PxU32 i = 0; i < 4; i++)
+	{
+		PxRigidDynamic* body = PxCreateDynamic(*gPhysics, PxTransform(PxVec3(-1.9f + 1.3f * PxReal(i), 0.5f, 0.3f)), *geometries[i], *gMaterial, 1000.0f);
+		body->setSolverIterationCounts(16, 1);
+		scene->addActor(*body);
+		bodies.pushBack(body);
+	}
+	cube->release();
+	simulate(scene, 120);
+	for (PxU32 i = 0; i < bodies.size(); i++)
+		positions.pushBack(bodies[i]->getGlobalPose().p);
+	scene->release();
+}
+
+// Twelve boxes dropped with gaps and staggered sideways, inside one aggregate with self collision
+// (aggregate broadphase). The column topples, so the checks are invariants rather than positions.
+void aggregatePile(bool gpu, PxArray<PxVec3>& positions)
+{
+	PxScene* scene = createScene(gpu);
+	addGround(scene);
+	const PxU32 count = 12;
+	PxAggregate* aggregate = gPhysics->createAggregate(count, count, true);
+	PxArray<PxRigidDynamic*> bodies;
+	for (PxU32 i = 0; i < count; i++)
+	{
+		PxRigidDynamic* body = PxCreateDynamic(*gPhysics, PxTransform(PxVec3(0.3f * PxReal(i % 3), 0.5f + 1.05f * PxReal(i), 0.0f)), PxBoxGeometry(PxVec3(0.5f)), *gMaterial, 1000.0f);
+		body->setSolverIterationCounts(16, 1);
+		aggregate->addActor(*body);
+		bodies.pushBack(body);
+	}
+	scene->addAggregate(*aggregate);
+	simulate(scene, 180);
+	for (PxU32 i = 0; i < bodies.size(); i++)
+		positions.pushBack(bodies[i]->getGlobalPose().p);
+	scene->release();
+}
+
+// A prism whose caps have 31 vertices, resting on a static box and with a second one, turned by half a
+// vertex step, stacked on top (convex-box and convex-convex contacts with many clipped points).
+void largeFaceConvexes(bool gpu, PxArray<PxVec3>& positions, PxU32& largestFace)
+{
+	PxScene* scene = createScene(gpu);
+	scene->addActor(*PxCreateStatic(*gPhysics, PxTransform(PxVec3(0.0f, -0.5f, 0.0f)), PxBoxGeometry(5.0f, 0.5f, 5.0f), *gMaterial));
+	PxConvexMesh* mesh = prism(31, 0.5f, 0.25f, largestFace);
+	PxArray<PxRigidDynamic*> bodies;
+	for (PxU32 i = 0; i < 2; i++)
+	{
+		const PxQuat turn(PxPi / 31.0f * PxReal(i), PxVec3(0.0f, 1.0f, 0.0f));
+		PxRigidDynamic* body = PxCreateDynamic(*gPhysics, PxTransform(PxVec3(0.0f, 0.3f + 0.55f * PxReal(i), 0.0f), turn), PxConvexMeshGeometry(mesh), *gMaterial, 1000.0f);
+		body->setSolverIterationCounts(16, 1);
+		scene->addActor(*body);
+		bodies.pushBack(body);
+	}
+	mesh->release();
+	simulate(scene, 120);
+	for (PxU32 i = 0; i < bodies.size(); i++)
+		positions.pushBack(bodies[i]->getGlobalPose().p);
+	scene->release();
+}
+
+// A dynamic plate on the ground carrying a 13 x 13 grid of boxes. Every box contact involves the plate, so
+// the plate takes part in more than 128 constraint partitions, which the GPU solver handles with more than
+// 16 slabs for one body.
+void manySlabs(bool gpu, PxArray<PxVec3>& positions)
+{
+	PxScene* scene = createScene(gpu);
+	addGround(scene);
+	PxArray<PxRigidDynamic*> bodies;
+	bodies.pushBack(addBox(scene, PxTransform(PxVec3(0.0f, 0.1f, 0.0f)), PxVec3(4.0f, 0.1f, 4.0f)));
+	for (PxU32 j = 0; j < 13; j++)
+		for (PxU32 i = 0; i < 13; i++)
+			bodies.pushBack(addBox(scene, PxTransform(PxVec3(-3.6f + 0.6f * PxReal(i), 0.4f, -3.6f + 0.6f * PxReal(j))), PxVec3(0.2f)));
+	simulate(scene, 120);
+	for (PxU32 i = 0; i < bodies.size(); i++)
+		positions.pushBack(bodies[i]->getGlobalPose().p);
+	scene->release();
+}
+
 } // namespace
 
 int snippetMain(int, const char*const*)
@@ -682,6 +840,48 @@ int snippetMain(int, const char*const*)
 		const PxReal bend = unloaded - loaded;
 		check(bend > 0.06f && bend < 0.5f, "articulation lever", "extra bend under deformable load (rad)", bend, 0.06f);
 		check(loadHeight > 0.8f, "articulation lever", "deformable load stays on the arm (m)", loadHeight, 0.8f);
+
+		pc.clear(); pg.clear();
+		primitivesOnMesh(false, pc);
+		primitivesOnMesh(true, pg);
+		const char* primitives[4] = { "box", "convex", "sphere", "capsule" };
+		for (PxU32 i = 0; i < pg.size() && i < pc.size(); i++)
+		{
+			char what[64];
+			snprintf(what, sizeof(what), "%s: GPU vs CPU position difference (m)", primitives[i]);
+			check((pg[i] - pc[i]).magnitude() < 0.01f, "primitives on mesh", what, (pg[i] - pc[i]).magnitude(), 0.01f);
+			snprintf(what, sizeof(what), "%s: GPU rest height error (m)", primitives[i]);
+			check(PxAbs(pg[i].y - 0.25f) < 0.01f, "primitives on mesh", what, PxAbs(pg[i].y - 0.25f), 0.01f);
+		}
+
+		pc.clear(); pg.clear();
+		aggregatePile(false, pc);
+		aggregatePile(true, pg);
+		PxReal lowC = PX_MAX_F32, lowG = PX_MAX_F32, highG = -PX_MAX_F32;
+		for (PxU32 i = 0; i < pc.size(); i++)
+			lowC = PxMin(lowC, pc[i].y);
+		for (PxU32 i = 0; i < pg.size(); i++)
+			lowG = PxMin(lowG, pg[i].y), highG = PxMax(highG, pg[i].y);
+		check(allFinite(pg), "aggregate pile", "GPU positions finite", 0.0f, 0.0f);
+		check(PxAbs(lowG - lowC) < 0.01f, "aggregate pile", "GPU vs CPU lowest box height difference (m)", PxAbs(lowG - lowC), 0.01f);
+		check(lowG > 0.49f, "aggregate pile", "GPU lowest box height (m), on the ground", lowG, 0.49f);
+		check(highG < 0.5f + 1.05f * 11.0f, "aggregate pile", "GPU highest box height (m), below start", highG, 0.5f + 1.05f * 11.0f);
+
+		PxU32 largestFace;
+		pc.clear(); pg.clear();
+		largeFaceConvexes(false, pc, largestFace);
+		largeFaceConvexes(true, pg, largestFace);
+		printf("large-face prism: largest face has %u vertices\n", largestFace);
+		check(allFinite(pg), "large-face convex", "GPU positions finite", 0.0f, 0.0f);
+		check(maxDistance(pc, pg) < 0.01f, "large-face convex", "GPU vs CPU max position difference (m)", maxDistance(pc, pg), 0.01f);
+		check(pg.size() == 2 && PxAbs(pg[1].y - 0.75f) < 0.01f, "large-face convex", "GPU upper prism height error (m)", pg.size() == 2 ? PxAbs(pg[1].y - 0.75f) : PX_MAX_F32, 0.01f);
+
+		pc.clear(); pg.clear();
+		manySlabs(false, pc);
+		manySlabs(true, pg);
+		check(allFinite(pg), "many slabs", "GPU positions finite", 0.0f, 0.0f);
+		check(maxDistance(pc, pg) < 0.01f, "many slabs", "GPU vs CPU max position difference (m)", maxDistance(pc, pg), 0.01f);
+		check(PxAbs(pg[0].y - 0.1f) < 0.01f, "many slabs", "GPU plate height error (m)", PxAbs(pg[0].y - 0.1f), 0.01f);
 
 		const PxU32 overflows = contactOverflowReports();
 		check(overflows > 0, "contact overflow", "buffer overflow reports", PxReal(overflows), 1.0f);
