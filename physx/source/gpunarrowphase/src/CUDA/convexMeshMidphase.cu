@@ -1440,11 +1440,13 @@ void triangleTriangleOverlaps(PxU32 numWorkItems,
 
 	PxVec3 min0 = mesh0.bv32PackedNodes[0].mMin[threadIndexInWarp].getXYZ();
 	PxVec3 max0 = mesh0.bv32PackedNodes[0].mMax[threadIndexInWarp].getXYZ();
-	PxU32 mask0 = (1 << mesh0.bv32PackedNodes[0].mNbNodes) - 1;
+	const PxU32 nbNodes0 = mesh0.bv32PackedNodes[0].mNbNodes;
+	PxU32 mask0 = nbNodes0 < 32 ? (1u << nbNodes0) - 1 : 0xffffffff;
 
 	PxVec3 min1 = mesh1.bv32PackedNodes[0].mMin[threadIndexInWarp].getXYZ();
 	PxVec3 max1 = mesh1.bv32PackedNodes[0].mMax[threadIndexInWarp].getXYZ();
-	PxU32 mask1 = (1 << mesh1.bv32PackedNodes[0].mNbNodes) - 1;
+	const PxU32 nbNodes1 = mesh1.bv32PackedNodes[0].mNbNodes;
+	PxU32 mask1 = nbNodes1 < 32 ? (1u << nbNodes1) - 1 : 0xffffffff;
 
 	minIndex(min0.x, mask0, min0.x);
 	minIndex(min0.y, mask0, min0.y);
