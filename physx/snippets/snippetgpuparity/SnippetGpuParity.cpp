@@ -656,8 +656,13 @@ PxConvexMesh* prism(PxU32 n, PxReal radius, PxReal halfHeight, PxU32& largestFac
 // A box, a convex cube, a sphere and a capsule (all 0.25 m half size) resting on a static triangle mesh.
 void primitivesOnMesh(bool gpu, PxArray<PxVec3>& positions)
 {
-	PxScene* scene = createScene(gpu);
 	PxTriangleMesh* mesh = gridMesh(8, 5.0f);
+	if (!mesh)
+	{
+		check(false, "primitives on mesh", "triangle mesh cooked", 0.0f, 0.0f);
+		return;
+	}
+	PxScene* scene = createScene(gpu);
 	scene->addActor(*PxCreateStatic(*gPhysics, PxTransform(PxIdentity), PxTriangleMeshGeometry(mesh), *gMaterial));
 	mesh->release();
 	PxVec3 cubePoints[8];
@@ -671,6 +676,12 @@ void primitivesOnMesh(bool gpu, PxArray<PxVec3>& positions)
 	PxCookingParams params(gPhysics->getTolerancesScale());
 	params.buildGPUData = true;
 	PxConvexMesh* cube = PxCreateConvexMesh(params, convexDesc, gPhysics->getPhysicsInsertionCallback());
+	if (!cube)
+	{
+		check(false, "primitives on mesh", "convex cube cooked", 0.0f, 0.0f);
+		scene->release();
+		return;
+	}
 	const PxGeometry* geometries[4];
 	PxBoxGeometry box(PxVec3(0.25f));
 	PxConvexMeshGeometry convex(cube);
@@ -719,9 +730,14 @@ void aggregatePile(bool gpu, PxArray<PxVec3>& positions)
 // vertex step, stacked on top (convex-box and convex-convex contacts with many clipped points).
 void largeFaceConvexes(bool gpu, PxArray<PxVec3>& positions, PxU32& largestFace)
 {
+	PxConvexMesh* mesh = prism(31, 0.5f, 0.25f, largestFace);
+	if (!mesh)
+	{
+		check(false, "large-face convex", "prism cooked", 0.0f, 0.0f);
+		return;
+	}
 	PxScene* scene = createScene(gpu);
 	scene->addActor(*PxCreateStatic(*gPhysics, PxTransform(PxVec3(0.0f, -0.5f, 0.0f)), PxBoxGeometry(5.0f, 0.5f, 5.0f), *gMaterial));
-	PxConvexMesh* mesh = prism(31, 0.5f, 0.25f, largestFace);
 	PxArray<PxRigidDynamic*> bodies;
 	for (PxU32 i = 0; i < 2; i++)
 	{
@@ -871,7 +887,7 @@ int snippetMain(int, const char*const*)
 		pc.clear(); pg.clear();
 		largeFaceConvexes(false, pc, largestFace);
 		largeFaceConvexes(true, pg, largestFace);
-		printf("large-face prism: largest face has %u vertices\n", largestFace);
+		check(largestFace >= 31, "large-face convex", "vertices in the largest cooked face", PxReal(largestFace), 31.0f);
 		check(allFinite(pg), "large-face convex", "GPU positions finite", 0.0f, 0.0f);
 		check(maxDistance(pc, pg) < 0.01f, "large-face convex", "GPU vs CPU max position difference (m)", maxDistance(pc, pg), 0.01f);
 		check(pg.size() == 2 && PxAbs(pg[1].y - 0.75f) < 0.01f, "large-face convex", "GPU upper prism height error (m)", pg.size() == 2 ? PxAbs(pg[1].y - 0.75f) : PX_MAX_F32, 0.01f);
