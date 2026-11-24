@@ -510,10 +510,10 @@ static __device__ void radixSortPassSingleWarp(const uint4* PX_RESTRICT gInputKe
 			PxU32 radixRankY = (radix.y - i);
 			PxU32 radixRankZ = (radix.z - i);
 			PxU32 radixRankW = (radix.w - i);
-			PxU32 accum0 = (1u << (radixRankX << 3));
-			PxU32 accum1 = (1u << (radixRankY << 3));
-			PxU32 accum2 = (1u << (radixRankZ << 3));
-			PxU32 accum3 = (1u << (radixRankW << 3));
+			PxU32 accum0 = radixShiftLeft(1u, radixRankX << 3);
+			PxU32 accum1 = radixShiftLeft(1u, radixRankY << 3);
+			PxU32 accum2 = radixShiftLeft(1u, radixRankZ << 3);
+			PxU32 accum3 = radixShiftLeft(1u, radixRankW << 3);
 
 			PxU32 accum = accum0 + accum1 + accum2 + accum3;
 
@@ -636,10 +636,10 @@ static __device__ void radixSortPassSingleWarpKeysOnly(const uint4* PX_RESTRICT 
 			PxU32 radixRankY = (radix.y - i);
 			PxU32 radixRankZ = (radix.z - i);
 			PxU32 radixRankW = (radix.w - i);
-			PxU32 accum0 = (1u << (radixRankX << 3));
-			PxU32 accum1 = (1u << (radixRankY << 3));
-			PxU32 accum2 = (1u << (radixRankZ << 3));
-			PxU32 accum3 = (1u << (radixRankW << 3));
+			PxU32 accum0 = radixShiftLeft(1u, radixRankX << 3);
+			PxU32 accum1 = radixShiftLeft(1u, radixRankY << 3);
+			PxU32 accum2 = radixShiftLeft(1u, radixRankZ << 3);
+			PxU32 accum3 = radixShiftLeft(1u, radixRankW << 3);
 
 			PxU32 accum = accum0 + accum1 + accum2 + accum3;
 
