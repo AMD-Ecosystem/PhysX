@@ -284,9 +284,11 @@ cudaError_t CUDARTAPI __cudaPopCallConfiguration(
 // NOT defined.  The HIP path guard is __HIP_PLATFORM_AMD__ which IS set by the
 // host-seam build step via -D__HIP_PLATFORM_AMD__ on the C++ compiler.
 //
-// The interception works because ld.lld resolves __hipRegisterFatBinary to the
-// FIRST strong definition -- ours (in the shared library being built) wins over
-// libamdhip64's exported weak/versioned one when both are visible.
+// The wrappers have protected visibility, so the static linker binds the
+// module constructors' calls in this library to them. With default visibility
+// the calls would be resolved at load time through the global scope first, and
+// a HIP runtime the host application had already loaded globally (any process
+// that uses HIP itself) would take them, leaving PhysX's module table empty.
 // ---------------------------------------------------------------------------
 #if defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
 
@@ -302,7 +304,7 @@ cudaError_t CUDARTAPI __cudaPopCallConfiguration(
 // CudaContextManager can call hipModuleLoadDataEx on each one.
 // Call the real runtime's __hipRegisterFatBinary via dlsym(RTLD_NEXT) so the
 // HIP runtime also tracks the kernels for its host-stub dispatch path.
-extern "C"
+extern "C" __attribute__((visibility("protected")))
 void** __hipRegisterFatBinary(const void* data)
 {
 	// Forward to the real HIP runtime first so the HIP runtime's own
@@ -336,7 +338,7 @@ void** __hipRegisterFatBinary(const void* data)
 	return hipHandle;
 }
 
-extern "C"
+extern "C" __attribute__((visibility("protected")))
 void __hipRegisterFunction(
     void** fatCubinHandle,
     const void* hostFunction,
@@ -377,7 +379,7 @@ void __hipRegisterFunction(
 	PxGpuCudaRegisterFunction(-1, deviceName);
 }
 
-extern "C"
+extern "C" __attribute__((visibility("protected")))
 void __hipRegisterVar(
     void** fatCubinHandle,
     void* hostVar,
@@ -394,7 +396,7 @@ void __hipRegisterVar(
 	if (realFn) realFn(fatCubinHandle, hostVar, deviceAddress, deviceName, ext, size, constant, global);
 }
 
-extern "C"
+extern "C" __attribute__((visibility("protected")))
 void __hipUnregisterFatBinary(void** fatCubinHandle)
 {
 	// Forward to the real HIP runtime.
