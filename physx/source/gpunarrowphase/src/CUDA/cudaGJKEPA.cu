@@ -127,7 +127,11 @@ int polyClip(const PxPlane plane0, PxVec3 v0, PxU32 nbVerts0,
 	b &= __shfl_xor_sync(FULL_MASK, b,2);
 	b &= __shfl_xor_sync(FULL_MASK, b,1);
 
-	addContacts(b&((1<<nbVerts1)-1), v1-s1*axis, s1, contactDist, contacts, nbContacts);
+	// A face can have 32 vertices, and a shift by 32 is undefined
+	const int vertMask0 = nbVerts0 < 32 ? (1 << nbVerts0) - 1 : -1;
+	const int vertMask1 = nbVerts1 < 32 ? (1 << nbVerts1) - 1 : -1;
+
+	addContacts(b&vertMask1, v1-s1*axis, s1, contactDist, contacts, nbContacts);
 
 	if(!__any_sync(FULL_MASK, out1))										// all poly1 points inside poly0, so done
 		return nbContacts;
@@ -149,8 +153,8 @@ int polyClip(const PxPlane plane0, PxVec3 v0, PxU32 nbVerts0,
 			in0 = in, out0 = out;
 	}
 
-	in0 &= (1<<nbVerts1)-1, out0  &= (1<<nbVerts1)-1;
-	addContacts(__ballot_sync(FULL_MASK, !out0) & ((1<<nbVerts0)-1), v0, s0, contactDist, contacts, nbContacts);
+	in0 &= vertMask1, out0  &= vertMask1;
+	addContacts(__ballot_sync(FULL_MASK, !out0) & vertMask0, v0, s0, contactDist, contacts, nbContacts);
 
 	if(!__any_sync(FULL_MASK, out0))										// all poly0 points inside poly1, so done
 		return nbContacts;
@@ -476,7 +480,7 @@ static __device__ int reduce(PxVec3 point, PxReal separation, PxVec3 normal, int
 template<bool TClustering, bool TKeepAnotherDeepestForPCM, int TMaxPoints> __device__ __forceinline__
 int reduce(PxVec3 point, PxReal separation, PxVec3 normal, int nbContacts)
 {
-	return reduce<TClustering, TKeepAnotherDeepestForPCM, TMaxPoints>(point, separation, normal, nbContacts, (1 << nbContacts) - 1);
+	return reduce<TClustering, TKeepAnotherDeepestForPCM, TMaxPoints>(point, separation, normal, nbContacts, nbContacts < 32 ? (1 << nbContacts) - 1 : -1);
 }
 
 
@@ -943,7 +947,7 @@ bool generateConvexContacts(EpaAndClipScratch& ss_epa_clip_scratch, CollideScrat
 					if (threadIdx.x < nbContacts)
 						pb = contactsS->pos[threadIdx.x], sep = contactsS->sep[threadIdx.x];
 
-					int mask = (1 << nbContacts) - 1;
+					int mask = nbContacts < 32 ? (1 << nbContacts) - 1 : -1;
 
 					if (nbContacts > 4)
 						mask = reduce<false, false, 4>(pb, sep, referencePolygon_plane.n, nbContacts);
@@ -977,7 +981,7 @@ bool generateConvexContacts(EpaAndClipScratch& ss_epa_clip_scratch, CollideScrat
 					if (threadIdx.x < nbContacts)
 						pa = contactsS->pos[threadIdx.x], sep = contactsS->sep[threadIdx.x];
 
-					int mask = (1 << nbContacts) - 1;
+					int mask = nbContacts < 32 ? (1 << nbContacts) - 1 : -1;
 
 					if (nbContacts > 4)
 						mask = reduce<false, false, 4>(pa, sep, referencePlane.n, nbContacts);
@@ -2990,7 +2994,7 @@ __device__ void convexPlaneNphase_kernel_core(
 
 		if (nbContacts)
 		{
-			mask = (1 << totalContacts) - 1;
+			mask = totalContacts < 32 ? (1 << totalContacts) - 1 : -1;
 
 			if (threadIdx.x < nbContacts)
 			{

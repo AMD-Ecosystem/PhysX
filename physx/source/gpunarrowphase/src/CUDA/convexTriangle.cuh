@@ -1000,7 +1000,7 @@ __device__ static int polyClip(const PxPlane plane0, PxVec3 v0, PxU32 nbVerts0, 
 	}
 
 	in0 &= (1 << 3) - 1, out0 &= (1 << 3) - 1;
-	addContacts(__ballot_sync(FULL_MASK, !out0) & ((1 << nbVerts0) - 1), v0, s0, minSep, maxSep, s_contactsTransposed, nbContacts);
+	addContacts(__ballot_sync(FULL_MASK, !out0) & (nbVerts0 < 32 ? (1 << nbVerts0) - 1 : -1), v0, s0, minSep, maxSep, s_contactsTransposed, nbContacts);
 
 	if (!__any_sync(FULL_MASK, out0))										// all poly0 points inside poly1, so done
 		return nbContacts;
@@ -1852,7 +1852,7 @@ static __device__ void convexTriangleContactGen(
 					sep = s_contactsTransposed[4 * threadIdx.x + 3];
 			}
 
-			int mask = (1 << numContactsGenerated) - 1;
+			int mask = numContactsGenerated < 32 ? (1 << numContactsGenerated) - 1 : -1;
 
 			//unsigned mask_numContactsGeneratedReduce = __ballot_sync(mask_numContactsGenerated, numContactsGenerated > 4);
 			/*if (numContactsGenerated > CVX_TRI_MAX_CONTACTS)

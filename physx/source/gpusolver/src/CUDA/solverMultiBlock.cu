@@ -717,7 +717,9 @@ extern "C" __global__ void computeAverageSolverBodyVelocity(
 
 	const PxU32 bodyInWarp = threadIdx.x / numThreadsPerBody;
 
-	const PxU32 maskHigh = ((1 << ((subWarpIndex + 1) * numThreadsPerBody)) - 1);
+	// The last sub-warp's mask covers all 32 lanes, and a shift by 32 is undefined
+	const PxU32 highShift = (subWarpIndex + 1) * numThreadsPerBody;
+	const PxU32 maskHigh = highShift < 32 ? (1u << highShift) - 1 : 0xffffffff;
 	const PxU32 maskLow = ((1 << ((subWarpIndex)*numThreadsPerBody)) - 1);
 	const PxU32 mask = maskHigh - maskLow;
 
