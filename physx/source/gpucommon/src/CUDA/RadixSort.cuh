@@ -39,6 +39,28 @@ static __device__ PxU32 getRadix(PxU32 input, const PxU32 startBit)
 	return (input >> startBit) & 0xF;
 }
 
+// The bucket counters below shift by amounts that are 32 or more for the radix values outside
+// the current group of buckets and rely on the result being 0, which is what NVIDIA's shift
+// instructions return. C++ leaves such shifts undefined and AMD GPUs use only the low five bits
+// of the amount, so spell the intended result out there.
+static __device__ PX_FORCE_INLINE PxU32 radixShiftLeft(const PxU32 value, const PxU32 shift)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+	return shift < 32 ? (value << shift) : 0u;
+#else
+	return value << shift;
+#endif
+}
+
+static __device__ PX_FORCE_INLINE PxU32 radixShiftRight(const PxU32 value, const PxU32 shift)
+{
+#if defined(__HIP_PLATFORM_AMD__)
+	return shift < 32 ? (value >> shift) : 0u;
+#else
+	return value >> shift;
+#endif
+}
+
 
 //accumulated each individual warps to a responding radix
 //radix0[0, 7] ==> radixSum[7], radix1[8, 15] ==> radixSum[15], radix2[16, 23] ==>radixSum[23], radix3[24, 31] ==> radixSum[31], 
@@ -135,10 +157,10 @@ __device__ inline void radixSortWarp(const uint4* PX_RESTRICT gInputKeys, const 
 #pragma unroll
 		for (PxU32 bit = 0; bit < 16; bit += 2)
 		{
-			PxU32 accum = (1u << ((radix.x - bit) << 4));
-			accum += (1u << ((radix.y - bit) << 4));
-			accum += (1u << ((radix.z - bit) << 4));
-			accum += (1u << ((radix.w - bit) << 4));
+			PxU32 accum = radixShiftLeft(1u, (radix.x - bit) << 4);
+			accum += radixShiftLeft(1u, (radix.y - bit) << 4);
+			accum += radixShiftLeft(1u, (radix.z - bit) << 4);
+			accum += radixShiftLeft(1u, (radix.w - bit) << 4);
 
 			radixAccum.radixAccum[bit / 2] += accum;
 		}
@@ -301,10 +323,10 @@ __device__ inline void radixSortCalculateRanks(const uint4* PX_RESTRICT gInputKe
 		//#pragma unroll
 		for(PxU32 i=0; i<RADIX_SIZE; i+=4)
 		{
-			PxU32 accum = (1u << ((radix.x - i) << 3));
-			accum += (1u << ((radix.y - i) << 3));
-			accum += (1u << ((radix.z - i) << 3));
-			accum += (1u << ((radix.w - i) << 3));
+			PxU32 accum = radixShiftLeft(1u, (radix.x - i) << 3);
+			accum += radixShiftLeft(1u, (radix.y - i) << 3);
+			accum += radixShiftLeft(1u, (radix.z - i) << 3);
+			accum += radixShiftLeft(1u, (radix.w - i) << 3);
 
 			PxU32 val = warpScanAdd<WARP_SIZE, PxU32>(FULL_MASK, idx, threadIndexInWarp, sBuckets, accum, 0);
 
@@ -319,19 +341,19 @@ __device__ inline void radixSortCalculateRanks(const uint4* PX_RESTRICT gInputKe
 
 			//radix offset inside a warp
 			PxU32 shiftBits = (radix.x - i) << 3;
-			PxU32 offset = ((val >> shiftBits) & 0xFF);
+			PxU32 offset = (radixShiftRight(val, shiftBits) & 0xFF);
 			radixOffset.x |= offset;
-			val += (1<<shiftBits);
+			val += radixShiftLeft(1u, shiftBits);
 			shiftBits = (radix.y - i) << 3;
-			offset = ((val >> shiftBits) & 0xFF);
+			offset = (radixShiftRight(val, shiftBits) & 0xFF);
 			radixOffset.y |= offset;
-			val += (1<<shiftBits);
+			val += radixShiftLeft(1u, shiftBits);
 			shiftBits = (radix.z - i) << 3;
-			offset = ((val >> shiftBits) & 0xFF);
+			offset = (radixShiftRight(val, shiftBits) & 0xFF);
 			radixOffset.z |= offset;
-			val += (1<<shiftBits);
+			val += radixShiftLeft(1u, shiftBits);
 			shiftBits = (radix.w - i) << 3;
-			offset = ((val >> shiftBits) & 0xFF);
+			offset = (radixShiftRight(val, shiftBits) & 0xFF);
 			radixOffset.w |= offset;			
 		}
 
